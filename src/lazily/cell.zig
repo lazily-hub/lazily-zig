@@ -42,7 +42,6 @@ pub fn Cell(comptime T: type) type {
             comptime valueFn: *const ValueFn(T),
             comptime deinitCellValue: ?DeinitCellValueFn(T),
         ) !*@This() {
-            // ) !*const @This() {
             const getCell = struct {
                 fn call(_ctx: *Context) anyerror!Cell(T) {
                     const initial_value = try valueFn(_ctx);
@@ -96,6 +95,13 @@ pub fn Cell(comptime T: type) type {
 
         pub fn set(self: *@This(), new_value: T) void {
             self.ctx.mutex.lock();
+
+            // Only emit change if the value actually changed.
+            if (std.meta.eql(self.value, new_value)) {
+                self.ctx.mutex.unlock();
+                return;
+            }
+
             self.value = new_value;
             self.slot.emitChangeUnlocked();
 

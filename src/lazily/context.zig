@@ -177,6 +177,7 @@ pub const Slot = struct {
 
         self.storage = Storage.init(
             switch (comptime Mode(T)) {
+                // TODO: Rename .direct to .literal
                 .direct => switch (comptime Slot.PtrSize(T)) {
                     .slice => Slot.Storage.Payload{
                         .slice = SliceStorage.init(T, stored_value),
@@ -223,6 +224,7 @@ pub const Slot = struct {
         };
     }
 
+    // TODO: Rename CannotGetPtrOfDirectMode to LiteralHasNoPtr
     pub const GetPtrError = error{ CannotGetPtrOfDirectMode, SlotMissingPtr };
 
     pub fn getPtr(self: Slot, comptime T: type) GetPtrError!*T {
