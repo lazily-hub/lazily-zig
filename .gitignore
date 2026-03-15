@@ -4,3 +4,5 @@ zig-out/
 
 .idea
 .local
+*.iml
+
