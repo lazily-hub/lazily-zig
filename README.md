@@ -6,6 +6,18 @@ This project is still in early stages. Will use similar semantics as [lazily-py]
 
 The main use case is Zig libraries for cross-platform logic via FFI. Building dynamic libraries for Native Apps/Flutter + servers and WASM for browsers.
 
+## lazily-spec compliance
+
+`src/lazily/ipc.zig` defines the shared lazily IPC wire types (`IpcMessage`,
+`Snapshot`, `Delta`, `DeltaOp`, `NodeSnapshot`, `NodeState`, shared-blob
+references, and capability handshakes). The module round-trips the canonical
+fixtures from `../lazily-spec/conformance`, using the same externally tagged
+JSON shape as lazily-rs.
+
+Signals do not introduce a separate wire type. A producer-side eager Signal is
+observed as its backing slot node: snapshots carry a materialized `NodeState`,
+and value changes are emitted as `DeltaOp.SlotValue`.
+
 ## Test Build
 
 This project uses mise.
@@ -21,6 +33,9 @@ mise run test
 # mise run test_0_15_2
 # mise run test_master
 ```
+
+The default build does not link libc. Use `zig build -Dlink_libc=true` when an
+embedding artifact needs libc-backed allocator or C runtime symbols.
 
 ## Terminology
 

@@ -2,7 +2,8 @@ const std = @import("std");
 const lazily = @import("lazily");
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try lazily.bufferedPrint();
+    std.debug.print("{s} protocol v{}\n", .{
+        lazily.ipc.protocol_id,
+        lazily.ipc.protocol_major_version,
+    });
 }

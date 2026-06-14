@@ -544,7 +544,10 @@ export fn initContext() FfiResult {
     // TODO: Option to use ArenaAllocator
     // - Purely Additive Caching (Immutable Graphs)
     // - Batch Jobs
-    const allocator = std.heap.c_allocator;
+    const allocator = if (comptime build_options.link_libc)
+        std.heap.c_allocator
+    else
+        std.heap.page_allocator;
 
     const ctx = Context.init(allocator) catch |err| {
         return FfiResult.initError(

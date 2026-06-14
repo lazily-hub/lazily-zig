@@ -25,6 +25,12 @@ pub fn build(b: *std.Build) void {
     ) orelse true;
     const build_options = b.addOptions();
     build_options.addOption(bool, "thread_safe", thread_safe);
+    const link_libc = b.option(
+        bool,
+        "link_libc",
+        "Link libc for artifacts that need C allocator/libc symbols (default: false)",
+    ) orelse false;
+    build_options.addOption(bool, "link_libc", link_libc);
 
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
@@ -47,7 +53,7 @@ pub fn build(b: *std.Build) void {
         // the root file.
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .link_libc = true,
+        .link_libc = link_libc,
     });
     mod.addOptions("build_options", build_options);
 
@@ -58,7 +64,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
+            .link_libc = link_libc,
         }),
     });
     b.installArtifact(lazily_lib);
@@ -102,7 +108,7 @@ pub fn build(b: *std.Build) void {
                 // importing modules from different packages).
                 .{ .name = "lazily", .module = mod },
             },
-            .link_libc = true,
+            .link_libc = link_libc,
         }),
     });
 
@@ -167,6 +173,16 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const ipc_mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lazily/ipc.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = filters,
+    });
+    const run_ipc_mod_tests = b.addRunArtifact(ipc_mod_tests);
+
     const example_auth_mod = b.addModule(
         "lazily_example_auth",
         .{
@@ -175,7 +191,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "lazily", .module = mod },
             },
-            .link_libc = true,
+            .link_libc = link_libc,
         },
     );
     const example_auth_mod_tests = b.addTest(.{
@@ -200,7 +216,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lazily", .module = mod },
         },
-        .link_libc = true,
+        .link_libc = link_libc,
     });
     const example_cells_mod_tests = b.addTest(.{
         .root_module = example_cells_mod,
@@ -222,6 +238,7 @@ pub fn build(b: *std.Build) void {
     const run_test = b.step("test", "Run tests");
     run_test.dependOn(&run_mod_tests.step);
     run_test.dependOn(&run_exe_tests.step);
+    run_test.dependOn(&run_ipc_mod_tests.step);
     run_test.dependOn(&run_example_auth_mod_tests.step);
     run_test.dependOn(&run_example_cells_mod_tests.step);
 
@@ -233,7 +250,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lazily/cell_0_16_test.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
+            .link_libc = link_libc,
         });
         cell_0_16_mod.addOptions("build_options", build_options);
         const cell_0_16_tests = b.addTest(.{
@@ -247,7 +264,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lazily/slot_0_16_test.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
+            .link_libc = link_libc,
         });
         slot_0_16_mod.addOptions("build_options", build_options);
         const slot_0_16_tests = b.addTest(.{
@@ -263,7 +280,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lazily/cell_0_15_test.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
+            .link_libc = link_libc,
         });
         cell_0_15_mod.addOptions("build_options", build_options);
         const cell_0_15_tests = b.addTest(.{

@@ -1,6 +1,26 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
+pub const LazilyFfiBytes = extern struct {
+    ptr: [*]u8,
+    len: usize,
+};
+
+pub const LazilyFfiStatus = enum(u32) {
+    Ok = 0,
+    Empty = 1,
+    NullPointer = 2,
+    InvalidMessage = 3,
+    EncodeFailed = 4,
+    Panic = 5,
+};
+
+pub const LazilyFfiMessageKind = enum(u32) {
+    Unknown = 0,
+    Snapshot = 1,
+    Delta = 2,
+};
+
 pub const AllocatorMode = enum(u32) {
     /// High-performance system allocator (requires linking libc).
     c = 0,

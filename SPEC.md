@@ -106,6 +106,28 @@ pub const StringView = extern struct {
 
 Export functions via `@export` with `.c` calling convention.
 
+## lazily-spec IPC
+
+The cross-language state plane is implemented in `src/lazily/ipc.zig` and uses
+the canonical `lazily-spec` JSON representation:
+
+- `IpcMessage` is externally tagged as `{ "Snapshot": ... }` or `{ "Delta": ... }`
+- `Snapshot` carries `epoch`, `nodes`, `edges`, and `roots`
+- `NodeSnapshot` carries `node`, `type_tag`, and `NodeState`
+- `NodeState` is `Payload`, `SharedBlob`, or `Opaque`
+- `Delta` carries `base_epoch`, `epoch`, and ordered `DeltaOp` values
+- `DeltaOp` includes `CellSet`, `SlotValue`, `Invalidate`, `NodeAdd`,
+  `NodeRemove`, `EdgeAdd`, and `EdgeRemove`
+
+`Delta.isNextAfter(last_epoch)` and `Delta.applyStatus(last_epoch)` enforce the
+spec epoch rule: a delta applies only when `base_epoch == last_epoch` and
+`epoch == base_epoch + 1`; otherwise the receiver must discard it and resync
+from a fresh snapshot.
+
+Signals are not a separate IPC variant. An eager Signal is represented as the
+backing slot node, with snapshots carrying a materialized value and deltas using
+`SlotValue` for changed eager values.
+
 ## Build
 
 ```bash
@@ -113,4 +135,8 @@ zig build        # Build library
 zig build test   # Run tests
 ```
 
-Build options: `-Dthread_safe=false` to disable mutex locking.
+Build options:
+
+- `-Dthread_safe=false` disables mutex locking.
+- `-Dlink_libc=true` links libc for artifacts that need libc-backed allocator or
+  C runtime symbols. The default build avoids libc.
