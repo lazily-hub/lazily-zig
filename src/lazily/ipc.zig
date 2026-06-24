@@ -43,6 +43,203 @@ pub const ShmBlobRef = struct {
     checksum: u64,
 };
 
+/// Bytes reserved before every shared-memory blob payload (matches lazily-rs).
+pub const SHM_BLOB_HEADER_LEN: usize = 40;
+
+const SHM_BLOB_MAGIC: u32 = 0x4c5a5348; // "LZSH"
+const SHM_BLOB_VERSION: u16 = 1;
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+pub const ShmBlobArenaError = error{
+    CapacityTooSmall,
+    BlobTooLarge,
+    DescriptorOutOfBounds,
+    DescriptorMismatch,
+    ChecksumMismatch,
+    GenerationOverflow,
+};
+
+/// Fixed-size blob arena suitable for a shared-memory transport.
+///
+/// Mirrors lazily-rs `ShmBlobArena<B>` (`src/lazily-rs/src/ipc.rs`). Writes a
+/// 40-byte header before each payload; readers validate the header, generation,
+/// epoch, length, and FNV-1a checksum before returning a slice. Append-only
+/// with wraparound; `next_generation` rejects stale descriptors after a wrap.
+///
+/// The backing buffer is owned + freed when allocated via `withCapacity`; an
+/// externally-owned buffer (e.g. an OS mmap region) can be wrapped via
+/// `fromBuffer` and is NOT freed on `deinit`.
+pub const ShmBlobArena = struct {
+    bytes: []u8,
+    write_offset: usize,
+    next_generation: u64,
+    owns_buffer: bool,
+    allocator: std.mem.Allocator,
+
+    pub const min_capacity: usize = SHM_BLOB_HEADER_LEN + 1;
+
+    /// Wrap an externally-owned buffer. The arena will NOT free `buffer`.
+    pub fn fromBuffer(allocator: std.mem.Allocator, buffer: []u8) ShmBlobArenaError!ShmBlobArena {
+        if (buffer.len < min_capacity) return error.CapacityTooSmall;
+        return .{
+            .bytes = buffer,
+            .write_offset = 0,
+            .next_generation = 1,
+            .owns_buffer = false,
+            .allocator = allocator,
+        };
+    }
+
+    /// Allocate a fresh zeroed buffer of `cap_bytes` bytes (arena owns it).
+    pub fn withCapacity(
+        allocator: std.mem.Allocator,
+        cap_bytes: usize,
+    ) (ShmBlobArenaError || error{OutOfMemory})!ShmBlobArena {
+        if (cap_bytes < min_capacity) return error.CapacityTooSmall;
+        const bytes = try allocator.alloc(u8, cap_bytes);
+        @memset(bytes, 0);
+        var arena = try fromBuffer(allocator, bytes);
+        arena.owns_buffer = true;
+        return arena;
+    }
+
+    pub fn deinit(self: *ShmBlobArena) void {
+        if (self.owns_buffer) {
+            self.allocator.free(self.bytes);
+            self.owns_buffer = false;
+        }
+    }
+
+    pub fn capacity(self: *const ShmBlobArena) usize {
+        return self.bytes.len;
+    }
+
+    /// Maximum payload length this arena can hold in one blob.
+    pub fn maxBlobLen(self: *const ShmBlobArena) usize {
+        return self.capacity() - SHM_BLOB_HEADER_LEN;
+    }
+
+    /// Current write cursor offset.
+    pub fn writeOffset(self: *const ShmBlobArena) usize {
+        return self.write_offset;
+    }
+
+    /// Write a payload and return a descriptor suitable for an IPC message.
+    pub fn writeBlob(
+        self: *ShmBlobArena,
+        epoch: u64,
+        payload: []const u8,
+    ) ShmBlobArenaError!ShmBlobRef {
+        const cap = self.capacity();
+        const max_len = self.maxBlobLen();
+        if (payload.len > max_len) return error.BlobTooLarge;
+
+        const total_len = SHM_BLOB_HEADER_LEN + payload.len;
+        if (self.write_offset + total_len > cap) {
+            self.write_offset = 0;
+        }
+
+        const generation = self.next_generation;
+        self.next_generation = std.math.add(u64, self.next_generation, 1) catch
+            return error.GenerationOverflow;
+
+        const offset = self.write_offset;
+        const descriptor = ShmBlobRef{
+            .offset = @intCast(offset),
+            .len = @intCast(payload.len),
+            .generation = generation,
+            .epoch = epoch,
+            .checksum = checksum(payload),
+        };
+
+        const payload_offset = offset + SHM_BLOB_HEADER_LEN;
+        writeHeader(self.bytes, offset, descriptor);
+        @memcpy(self.bytes[payload_offset .. payload_offset + payload.len], payload);
+
+        self.write_offset += total_len;
+        if (self.write_offset == cap) self.write_offset = 0;
+
+        return descriptor;
+    }
+
+    /// Read and validate a previously written blob.
+    pub fn readBlob(
+        self: *const ShmBlobArena,
+        descriptor: ShmBlobRef,
+    ) ShmBlobArenaError![]const u8 {
+        const cap = self.capacity();
+        const offset: usize = @intCast(descriptor.offset);
+        const len: usize = @intCast(descriptor.len);
+        const total_len = SHM_BLOB_HEADER_LEN + len;
+        // Safe OOB check (no overflow): offset + total_len <= cap.
+        if (offset > cap or total_len > cap or offset > cap - total_len) {
+            return error.DescriptorOutOfBounds;
+        }
+
+        const header = try readHeader(self.bytes, offset);
+        if (!std.meta.eql(header, descriptor)) return error.DescriptorMismatch;
+
+        const payload_offset = offset + SHM_BLOB_HEADER_LEN;
+        const payload = self.bytes[payload_offset .. payload_offset + len];
+        if (checksum(payload) != descriptor.checksum) return error.ChecksumMismatch;
+        return payload;
+    }
+};
+
+fn writeHeader(bytes: []u8, offset: usize, descriptor: ShmBlobRef) void {
+    const header = bytes[offset .. offset + SHM_BLOB_HEADER_LEN];
+    writeU32(header, 0, SHM_BLOB_MAGIC);
+    writeU16(header, 4, SHM_BLOB_VERSION);
+    writeU16(header, 6, @intCast(SHM_BLOB_HEADER_LEN));
+    writeU64(header, 8, descriptor.generation);
+    writeU64(header, 16, descriptor.epoch);
+    writeU64(header, 24, descriptor.len);
+    writeU64(header, 32, descriptor.checksum);
+}
+
+fn readHeader(bytes: []const u8, offset: usize) ShmBlobArenaError!ShmBlobRef {
+    const header = bytes[offset .. offset + SHM_BLOB_HEADER_LEN];
+    if (readU32(header, 0) != SHM_BLOB_MAGIC) return error.DescriptorMismatch;
+    if (readU16(header, 4) != SHM_BLOB_VERSION) return error.DescriptorMismatch;
+    if (@as(usize, readU16(header, 6)) != SHM_BLOB_HEADER_LEN) return error.DescriptorMismatch;
+    return ShmBlobRef{
+        .offset = @intCast(offset),
+        .generation = readU64(header, 8),
+        .epoch = readU64(header, 16),
+        .len = readU64(header, 24),
+        .checksum = readU64(header, 32),
+    };
+}
+
+/// FNV-1a (64-bit) non-cryptographic checksum, matching lazily-rs.
+fn checksumFnv(payload: []const u8) u64 {
+    var hash: u64 = FNV_OFFSET_BASIS;
+    for (payload) |b| hash = (hash ^ @as(u64, b)) *% FNV_PRIME;
+    return hash;
+}
+
+const checksum = checksumFnv;
+
+fn writeU16(bytes: []u8, off: usize, value: u16) void {
+    std.mem.writeInt(u16, bytes[off..][0..2], value, .little);
+}
+fn writeU32(bytes: []u8, off: usize, value: u32) void {
+    std.mem.writeInt(u32, bytes[off..][0..4], value, .little);
+}
+fn writeU64(bytes: []u8, off: usize, value: u64) void {
+    std.mem.writeInt(u64, bytes[off..][0..8], value, .little);
+}
+fn readU16(bytes: []const u8, off: usize) u16 {
+    return std.mem.readInt(u16, bytes[off..][0..2], .little);
+}
+fn readU32(bytes: []const u8, off: usize) u32 {
+    return std.mem.readInt(u32, bytes[off..][0..4], .little);
+}
+fn readU64(bytes: []const u8, off: usize) u64 {
+    return std.mem.readInt(u64, bytes[off..][0..8], .little);
+}
+
 pub const IpcValue = union(enum) {
     Inline: []const u8,
     SharedBlob: ShmBlobRef,
@@ -657,4 +854,81 @@ test "lazily/ipc: delta_shared_blob fixture" {
     try std.testing.expectEqual(@as(u64, 40), payload.offset);
     try std.testing.expectEqual(@as(u64, 17), payload.len);
     try std.testing.expectEqual(@as(u64, 9), payload.epoch);
+}
+
+test "lazily/ipc: ShmBlobArena write/read round-trip" {
+    const allocator = std.testing.allocator;
+    var arena = try ShmBlobArena.withCapacity(allocator, 256);
+    defer arena.deinit();
+
+    const payload = "hello lazily";
+    const desc = try arena.writeBlob(7, payload);
+
+    try std.testing.expectEqual(@as(u64, 0), desc.offset);
+    try std.testing.expectEqual(@as(u64, payload.len), desc.len);
+    try std.testing.expectEqual(@as(u64, 7), desc.epoch);
+    try std.testing.expectEqual(@as(u64, 1), desc.generation);
+
+    try std.testing.expectEqualStrings(payload, try arena.readBlob(desc));
+}
+
+test "lazily/ipc: ShmBlobArena rejects oversized blob and tiny capacity" {
+    const allocator = std.testing.allocator;
+    var arena = try ShmBlobArena.withCapacity(allocator, SHM_BLOB_HEADER_LEN + 4);
+    defer arena.deinit();
+
+    try std.testing.expectError(error.BlobTooLarge, arena.writeBlob(0, "abcdef"));
+    try std.testing.expectError(
+        error.CapacityTooSmall,
+        ShmBlobArena.withCapacity(allocator, SHM_BLOB_HEADER_LEN),
+    );
+}
+
+test "lazily/ipc: ShmBlobArena fromBuffer wraps externally-owned storage" {
+    var backing: [128]u8 = undefined;
+    var arena = try ShmBlobArena.fromBuffer(std.testing.allocator, &backing);
+    defer arena.deinit(); // must NOT free `backing`
+
+    const desc = try arena.writeBlob(1, "abc");
+    try std.testing.expectEqualStrings("abc", try arena.readBlob(desc));
+}
+
+test "lazily/ipc: ShmBlobArena wraparound invalidates stale descriptor" {
+    const allocator = std.testing.allocator;
+    // capacity holds exactly one max-len blob (header + 5)
+    var arena = try ShmBlobArena.withCapacity(allocator, SHM_BLOB_HEADER_LEN + 5);
+    defer arena.deinit();
+
+    const first = try arena.writeBlob(1, "first");
+    try std.testing.expectEqualStrings("first", try arena.readBlob(first));
+
+    // next write wraps to offset 0, bumps generation, overwrites first
+    const second = try arena.writeBlob(2, "2nd!!");
+    try std.testing.expectEqual(@as(u64, 0), second.offset);
+    try std.testing.expect(second.generation > first.generation);
+
+    try std.testing.expectError(error.DescriptorMismatch, arena.readBlob(first));
+    try std.testing.expectEqualStrings("2nd!!", try arena.readBlob(second));
+}
+
+test "lazily/ipc: ShmBlobArena checksum mismatch on corrupted payload" {
+    const allocator = std.testing.allocator;
+    var arena = try ShmBlobArena.withCapacity(allocator, 128);
+    defer arena.deinit();
+
+    const desc = try arena.writeBlob(0, "payload");
+    arena.bytes[SHM_BLOB_HEADER_LEN] ^= 0xff; // corrupt first payload byte
+    try std.testing.expectError(error.ChecksumMismatch, arena.readBlob(desc));
+}
+
+test "lazily/ipc: ShmBlobArena descriptor flows through IpcValue.sharedBlob" {
+    const allocator = std.testing.allocator;
+    var arena = try ShmBlobArena.withCapacity(allocator, 128);
+    defer arena.deinit();
+
+    const desc = try arena.writeBlob(3, "blob payload");
+    const value = IpcValue.sharedBlob(desc);
+    try std.testing.expect(value == .SharedBlob);
+    try std.testing.expectEqual(desc, value.SharedBlob);
+    try std.testing.expectEqualStrings("blob payload", try arena.readBlob(value.SharedBlob));
 }
