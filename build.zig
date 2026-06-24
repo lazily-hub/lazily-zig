@@ -140,8 +140,10 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
     }
 
     const cli_filters = b.option(

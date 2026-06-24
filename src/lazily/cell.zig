@@ -114,6 +114,8 @@ pub fn Cell(comptime T: type) type {
                 const cb: ChangeCallback(T) = @ptrFromInt(subscriber_key.cb_ptr);
                 cb(self);
             }
+
+            self.ctx.drainPendingRecompute();
         }
 
         pub fn subscribe(self: *@This(), cb: ChangeCallback(T)) !bool {

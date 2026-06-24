@@ -12,6 +12,10 @@ pub const Context = struct {
         pub fn lock(_: *@This()) void {}
         pub fn unlock(_: *@This()) void {}
     } = .{},
+    // Deferred-recompute queue for eager Signal slots. Drained outside the mutex
+    // so user valueFn can re-acquire the mutex per-slot without deadlock.
+    pending_recompute: std.ArrayList(*Slot),
+    draining_recompute: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !*Context {
         const ctx = try allocator.create(Context);
@@ -21,6 +25,7 @@ pub const Context = struct {
                 usize,
                 *Slot,
             ).init(allocator),
+            .pending_recompute = .{},
         };
         return ctx;
     }
@@ -35,6 +40,7 @@ pub const Context = struct {
             context_slot.destroyUnlocked(false);
         }
         self.cache.deinit();
+        self.pending_recompute.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -44,6 +50,24 @@ pub const Context = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.cache.get(cache_key);
+    }
+
+    /// Drain the pending-recompute queue. Called outside the graph mutex so that
+    /// each slot's `recompute` fn can re-lock per-op (user valueFn re-enters the
+    /// graph via slot()/slotKeyed()). LIFO order (deepest-dependency-first).
+    pub fn drainPendingRecompute(self: *Context) void {
+        if (self.draining_recompute) return;
+        if (self.pending_recompute.items.len == 0) return;
+
+        self.draining_recompute = true;
+        defer self.draining_recompute = false;
+
+        while (self.pending_recompute.pop()) |slot| {
+            slot.stale = false;
+            if (slot.recompute) |recompute_fn| {
+                recompute_fn(slot);
+            }
+        }
     }
 };
 
@@ -107,6 +131,12 @@ pub const Slot = struct {
     parents: std.AutoHashMap(*Slot, void),
     deinitPayload: ?*const fn (*Slot) void,
     free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
+    // Eager-Signal hooks (default null = lazy/destroy-on-invalidate semantics).
+    // on_invalidate: fired instead of destroyUnlocked when a dependency invalidates this slot.
+    // recompute: type-erased re-materialize (re-run valueFn, memo guard, swap, emitChange).
+    on_invalidate: ?*const fn (*Slot) void = null,
+    recompute: ?*const fn (*Slot) void = null,
+    stale: bool = false,
 
     pub fn init(
         comptime T: type,
@@ -273,31 +303,52 @@ pub const Slot = struct {
     /// Thread-safe call to Slot.emitChangeUnlocked.
     pub fn emitChange(self: *Slot) void {
         self.ctx.mutex.lock();
-        defer self.ctx.mutex.unlock();
         self.emitChangeUnlocked();
+        self.ctx.mutex.unlock();
+        self.ctx.drainPendingRecompute();
     }
 
     /// Emits the change event to all change_subscribers. See Slot.subscribeChange.
-    /// The change event will expire all subscribed Slots.
     ///
-    /// The current behavior of expiration is to destroy the Slot instance...
-    /// Where the Slot is reinstantiated the next time the slot function is called.
+    /// Dependents are snapshotted into an allocator-backed slice and the
+    /// `change_subscribers` map is cleared BEFORE iterating, fixing the latent
+    /// iteration-during-mutation bug (destroyUnlocked → unsubscribeChangeUnlocked
+    /// previously removed entries from the map mid-iteration).
     ///
-    /// Future plans include making the Slot instance remain but with its value cleared.
-    /// This plan will allow a Cell to keep any value changes using `Cell.set` and for the Reactor implementation.
-    ///
-    /// Note this function doesn't destroy the Slot itself. See Slot.touch if you want this behavior.
-    ///
-    /// TODO: Slot will remain when expired. Clear value when expired.
-    /// TODO: Provide methods in Cell to track a Slot used to create the value passed into Cell.set.
+    /// For each dependent:
+    /// - If `on_invalidate` is set (Signal-backed slot): call the hook (enqueue
+    ///   for deferred recompute, mark stale). The slot is NOT destroyed.
+    /// - Otherwise: `destroyUnlocked(true)` as before (lazy invalidate).
     pub fn emitChangeUnlocked(self: *Slot) void {
+        const subscriber_count = self.change_subscribers.count();
+        if (subscriber_count == 0) return;
+
+        // Snapshot dependents to avoid iteration-during-mutation.
+        const subscribers = self.ctx.allocator.alloc(*Slot, subscriber_count) catch return;
+        defer self.ctx.allocator.free(subscribers);
+
+        var i: usize = 0;
         var iter = self.change_subscribers.keyIterator();
         while (iter.next()) |ptr| {
-            const dependent_slot = ptr.*;
-            dependent_slot.destroyUnlocked(true);
+            subscribers[i] = ptr.*;
+            i += 1;
         }
-        // Clear the subscribers since they've been destroyed
+
+        // Clear the map first — prevents nested unsubscribeChangeUnlocked from
+        // mutating the map during iteration.
         self.change_subscribers.clearRetainingCapacity();
+
+        for (subscribers) |dependent_slot| {
+            // Clean up the parent edge on the dependent side.
+            _ = dependent_slot.parents.remove(self);
+
+            if (dependent_slot.on_invalidate) |hook| {
+                // Signal-backed slot: enqueue for deferred recompute, do NOT destroy.
+                hook(dependent_slot);
+            } else {
+                dependent_slot.destroyUnlocked(true);
+            }
+        }
     }
 
     pub fn destroy(self: *Slot, recurse: ?bool) void {
