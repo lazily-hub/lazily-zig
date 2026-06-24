@@ -34,6 +34,8 @@ pub const StringView = @import("./lazily/slot.zig").StringView;
 pub const slotEventLog = @import("./lazily/test.zig").slotEventLog;
 pub const expectEventLog = @import("./lazily/test.zig").expectEventLog;
 pub const StateMachine = @import("./lazily/state_machine.zig").StateMachine;
+pub const Signal = @import("./lazily/signal.zig").Signal;
+pub const signal = @import("./lazily/signal.zig").signal;
 
 test {
     std.testing.refAllDecls(@This());

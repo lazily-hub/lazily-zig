@@ -197,15 +197,12 @@ pub fn cell(
     comptime valueFn: *const ValueFn(T),
     comptime deinitFn: ?DeinitCellValueFn(T),
 ) !*Cell(T) {
-    if (ctx.getSlot(valueFn)) |cell_slot| {
-        return cell_slot.get(Cell(T));
-    }
-    const _cell = try Cell(T).init(
-        ctx,
-        valueFn,
-        deinitFn,
-    );
-    return _cell;
+    // Always go through Cell.init → slotKeyed so dependency edges are
+    // (re-)established on every read, not just the first.  This is critical
+    // for eager Signal recompute: after clearing parents, the valueFn must
+    // re-subscribe to its dependencies.  slotKeyed returns the cached slot
+    // when it exists, so the valueFn is not re-run.
+    return Cell(T).init(ctx, valueFn, deinitFn);
 }
 
 test "lazily/cell.cell: returns Cell(T) with initial value and caches computation" {
