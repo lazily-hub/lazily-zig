@@ -304,9 +304,16 @@ pub const Slot = struct {
     }
 
     /// Thread-safe call to Slot.touchUnlocked.
+    ///
+    /// `ctx` is captured into a local BEFORE `touchUnlocked()` because the
+    /// destroy path frees `self` (destroySelf → `allocator.destroy(self)`);
+    /// the deferred unlock must not dereference freed `self.ctx`. This was a
+    /// latent use-after-free that Zig 0.17's `std.atomic.Mutex.unlock()`
+    /// assertion (`state == .locked`) turned into a hard crash.
     pub fn touch(self: *Slot) void {
-        self.ctx.mutex.lock();
-        defer self.ctx.mutex.unlock();
+        const ctx = self.ctx;
+        ctx.mutex.lock();
+        defer ctx.mutex.unlock();
         self.touchUnlocked();
     }
 
@@ -368,8 +375,11 @@ pub const Slot = struct {
     }
 
     pub fn destroy(self: *Slot, recurse: ?bool) void {
-        self.ctx.mutex.lock();
-        defer self.ctx.mutex.unlock();
+        // Capture ctx before destroyUnlocked: the destroy path frees `self`,
+        // so the deferred unlock must not dereference freed `self.ctx`.
+        const ctx = self.ctx;
+        ctx.mutex.lock();
+        defer ctx.mutex.unlock();
         self.destroyUnlocked(recurse);
     }
 
