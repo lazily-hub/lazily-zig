@@ -1,6 +1,22 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const FfiResult = @import("ffi.zig").FfiResult;
+
+/// Version-agnostic Mutex: Zig < 0.16 uses std.Thread.Mutex;
+/// Zig >= 0.16 uses a spinlock over std.atomic.Mutex (std.Thread.Mutex was removed).
+const GraphMutex = if (builtin.zig_version.minor < 16)
+    std.Thread.Mutex
+else
+    struct {
+        inner: std.atomic.Mutex = .unlocked,
+        pub fn lock(self: *@This()) void {
+            while (!self.inner.tryLock()) {}
+        }
+        pub fn unlock(self: *@This()) void {
+            self.inner.unlock();
+        }
+    };
 
 /// Context with lazy cache
 pub const Context = struct {
@@ -8,7 +24,7 @@ pub const Context = struct {
     // Function pointer -> cached result
     cache: std.AutoHashMap(usize, *Slot),
     // Use a real Mutex if thread_safe is true, otherwise use a "no-op" struct
-    mutex: if (build_options.thread_safe) std.Thread.Mutex else struct {
+    mutex: if (build_options.thread_safe) GraphMutex else struct {
         pub fn lock(_: *@This()) void {}
         pub fn unlock(_: *@This()) void {}
     } = .{},
@@ -25,7 +41,7 @@ pub const Context = struct {
                 usize,
                 *Slot,
             ).init(allocator),
-            .pending_recompute = .{},
+            .pending_recompute = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
         };
         return ctx;
     }

@@ -8,4 +8,5 @@ _.path = "./.local/bin"
 [tasks]
 test = "mise run test_master $@"
 test_0_15_2 = "mise exec zig@0.15.2 -- zig build test --summary all -freference-trace=7 $@"
+test_0_16 = "mise exec zig@0.16.0 -- zig build test --summary all -freference-trace=7 $@"
 test_master = "mise exec zig@master -- zig build test --summary all -freference-trace=7 $@"

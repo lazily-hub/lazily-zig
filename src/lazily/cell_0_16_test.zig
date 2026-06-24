@@ -9,11 +9,8 @@ const slot = @import("slot.zig").slot;
 test "0.16:lazily/cell.thread_safe: slot contention" {
     if (!build_options.thread_safe) return error.SkipZigTest;
 
-    // We must use a thread-safe allocator for multithreaded tests.
-    var ts_allocator = std.heap.ThreadSafeAllocator{
-        .child_allocator = std.testing.allocator,
-    };
-    const allocator = ts_allocator.allocator();
+    // Zig 0.16 removed ThreadSafeAllocator; use testing allocator directly.
+    const allocator = std.testing.allocator;
 
     const ctx = try Context.init(allocator);
     defer ctx.deinit();

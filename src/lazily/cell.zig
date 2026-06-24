@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Context = @import("context.zig").Context;
 const currentSlotFor = @import("context.zig").currentSlotFor;
@@ -379,6 +380,7 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
 
 test "lazily/cell.thread_safe Cell updates" {
     if (!build_options.thread_safe) return error.SkipZigTest;
+    if (builtin.zig_version.minor >= 16) return error.SkipZigTest; // ThreadSafeAllocator removed in 0.16
 
     var ts_allocator = std.heap.ThreadSafeAllocator{
         .child_allocator = std.testing.allocator,
