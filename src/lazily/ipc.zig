@@ -932,3 +932,59 @@ test "lazily/ipc: ShmBlobArena descriptor flows through IpcValue.sharedBlob" {
     try std.testing.expectEqual(desc, value.SharedBlob);
     try std.testing.expectEqualStrings("blob payload", try arena.readBlob(value.SharedBlob));
 }
+
+test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
+    // Cross-sibling byte contract: the descriptor + 40-byte LZSH header for one
+    // write must match the canonical lazily-spec fixture, so rs/py/zig arenas
+    // produce interoperable bytes.
+    const allocator = std.testing.allocator;
+    const fixture_path = try std.fmt.allocPrint(
+        allocator,
+        "../lazily-spec/conformance/{s}",
+        .{"arena_blob.json"},
+    );
+    defer allocator.free(fixture_path);
+
+    const fixture_raw = try readFixtureFile(fixture_path);
+    defer allocator.free(fixture_raw);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        fixture_raw,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const root = parsed.value;
+
+    const input = try field(root, "input");
+    const capacity: usize = @intCast(try asU64(try field(input, "capacity")));
+    const epoch = try asU64(try field(input, "epoch"));
+    const payload = try parseByteArray(allocator, try field(input, "payload"));
+    defer allocator.free(payload);
+
+    var arena = try ShmBlobArena.withCapacity(allocator, capacity);
+    defer arena.deinit();
+    const desc = try arena.writeBlob(epoch, payload);
+
+    const expected = try field(root, "expected");
+    const descriptor = try field(expected, "descriptor");
+    try std.testing.expectEqual(try asU64(try field(descriptor, "offset")), desc.offset);
+    try std.testing.expectEqual(try asU64(try field(descriptor, "len")), desc.len);
+    try std.testing.expectEqual(
+        try asU64(try field(descriptor, "generation")),
+        desc.generation,
+    );
+    try std.testing.expectEqual(try asU64(try field(descriptor, "epoch")), desc.epoch);
+    try std.testing.expectEqual(
+        try asU64(try field(descriptor, "checksum")),
+        desc.checksum,
+    );
+
+    const header_bytes = try parseByteArray(allocator, try field(expected, "header_bytes"));
+    defer allocator.free(header_bytes);
+    try std.testing.expectEqualSlices(u8, header_bytes, arena.bytes[0..SHM_BLOB_HEADER_LEN]);
+
+    // round-trip
+    try std.testing.expectEqualSlices(u8, payload, try arena.readBlob(desc));
+}
