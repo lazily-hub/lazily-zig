@@ -223,8 +223,7 @@ pub const Slot = struct {
 
         self.storage = Storage.init(
             switch (comptime Mode(T)) {
-                // TODO: Rename .direct to .literal
-                .direct => switch (comptime Slot.PtrSize(T)) {
+                .literal => switch (comptime Slot.PtrSize(T)) {
                     .slice => Slot.Storage.Payload{
                         .slice = SliceStorage.init(T, stored_value),
                     },
@@ -259,7 +258,7 @@ pub const Slot = struct {
         };
 
         return switch (comptime Mode(T)) {
-            .direct => switch (comptime Slot.PtrSize(T)) {
+            .literal => switch (comptime Slot.PtrSize(T)) {
                 .slice => blk: {
                     const slice_storage = payload.slice;
                     break :blk slice_storage.toSlice(T);
@@ -270,13 +269,12 @@ pub const Slot = struct {
         };
     }
 
-    // TODO: Rename CannotGetPtrOfDirectMode to LiteralHasNoPtr
-    pub const GetPtrError = error{ CannotGetPtrOfDirectMode, SlotMissingPtr };
+    pub const GetPtrError = error{ LiteralHasNoPtr, SlotMissingPtr };
 
     pub fn getPtr(self: Slot, comptime T: type) GetPtrError!*T {
         const payload = if (self.storage) |storage| storage.payload else return error.SlotMissingPtr;
         return switch (comptime Mode(T)) {
-            .direct => return error.CannotGetPtrOfDirectMode,
+            .literal => return error.LiteralHasNoPtr,
             .indirect => @as(*T, @ptrCast(@alignCast(payload.single_ptr))),
         };
     }
@@ -431,17 +429,17 @@ pub const Slot = struct {
         self.ctx.allocator.destroy(self);
     }
 
-    pub const Modes = enum { direct, indirect };
+    pub const Modes = enum { literal, indirect };
     pub fn Mode(comptime T: type) Modes {
         const type_info = @typeInfo(T);
         const is_pointer = type_info == .pointer;
-        // Storage strategy: .direct for pointers/slices, .indirect others
-        return if (is_pointer) .direct else .indirect;
+        // Storage strategy: .literal for pointers/slices, .indirect others
+        return if (is_pointer) .literal else .indirect;
     }
 
     pub fn Result(comptime T: type) type {
         return switch (comptime Mode(T)) {
-            .direct => T,
+            .literal => T,
             .indirect => *T,
         };
     }
@@ -452,7 +450,7 @@ pub const Slot = struct {
 
     pub fn StorageKind(comptime T: type) enum { single_ptr, slice } {
         return switch (comptime Mode(T)) {
-            .direct => switch (comptime PtrSize(T)) {
+            .literal => switch (comptime PtrSize(T)) {
                 .slice => .slice,
                 .one, .many, .c => .single_ptr,
             },
@@ -472,11 +470,11 @@ pub const Slot = struct {
         }
 
         /// Converts a computed value `T` into the storage representation `StoredType(T)`.
-        /// - `.direct`: no allocation, returns the value as-is
+        /// - `.literal`: no allocation, returns the value as-is
         /// - `.indirect`: allocates `T` in `ctx.allocator` and returns `*T`
         pub fn toStoredType(comptime T: type, ctx: *Context, value: T) !Result(T) {
             return switch (comptime Mode(T)) {
-                .direct => value,
+                .literal => value,
                 .indirect => blk: {
                     const stored_value = try ctx.allocator.create(T);
                     stored_value.* = value;
@@ -547,7 +545,7 @@ pub const Slot = struct {
     /// Create a free function that knows the type `T`
     pub fn Free(comptime T: type) ?*const fn (std.mem.Allocator, *anyopaque) void {
         return switch (comptime Slot.Mode(T)) {
-            .direct => null,
+            .literal => null,
             .indirect => struct {
                 fn free(allocator: std.mem.Allocator, ptr: *anyopaque) void {
                     allocator.destroy(@as(*T, @ptrCast(@alignCast(ptr))));

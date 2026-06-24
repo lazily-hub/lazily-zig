@@ -94,7 +94,7 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
 
                 // Extract old value for comparison
                 const old_value: T = switch (comptime Mode(T)) {
-                    .direct => switch (comptime Slot.PtrSize(T)) {
+                    .literal => switch (comptime Slot.PtrSize(T)) {
                         .slice => old_storage.payload.slice.toSlice(T),
                         .one, .many, .c => @as(T, @ptrCast(@alignCast(old_storage.payload.single_ptr))),
                     },
@@ -120,7 +120,7 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
                 // Allocate new storage
                 const stored = Storage.toStoredType(T, ctx, new_value) catch return;
                 s.storage = Storage.init(switch (comptime Mode(T)) {
-                    .direct => switch (comptime Slot.PtrSize(T)) {
+                    .literal => switch (comptime Slot.PtrSize(T)) {
                         .slice => Slot.Storage.Payload{ .slice = Slot.SliceStorage.init(T, stored) },
                         .one, .many, .c => Slot.Storage.Payload{ .single_ptr = @ptrCast(@constCast(stored)) },
                     },

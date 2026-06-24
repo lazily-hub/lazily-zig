@@ -92,7 +92,7 @@ pub fn deinitSlotValue(
     comptime deinitValueFn: ?DeinitValueFn(T),
 ) DeinitPayloadFn {
     // If they try to use the default "free" on a raw pointer/slice, error out.
-    if (deinitValueFn == null and (comptime Mode(T) == .direct)) {
+    if (deinitValueFn == null and (comptime Mode(T) == .literal)) {
         const message = std.fmt.comptimePrint(
             "To prevent accidental freeing of string literals or unowned memory, " ++
                 "deinitValue cannot be used directly with raw slices/pointers. " ++
@@ -106,7 +106,7 @@ pub fn deinitSlotValue(
         fn call(_ctx: *Context, valueFn: *const ValueFn(T), value: T) void {
             _ = valueFn;
             switch (comptime Mode(T)) {
-                .direct => unreachable,
+                .literal => unreachable,
                 .indirect => {
                     // T is not a pointer, check for deinit method
                     if (comptime @typeInfo(T) == .@"struct" and
@@ -124,7 +124,7 @@ pub fn deinitSlotValue(
         pub fn deinit(_slot: *Slot) void {
             if (_slot.storage) |storage| {
                 const actual_value: T = switch (comptime Mode(T)) {
-                    .direct => switch (comptime Slot.PtrSize(T)) {
+                    .literal => switch (comptime Slot.PtrSize(T)) {
                         .slice => storage.payload.slice.toSlice(T),
                         .one, .many, .c => @as(T, @ptrCast(@alignCast(storage.payload.single_ptr))),
                     },
@@ -167,7 +167,7 @@ fn deinitIndirect(comptime T: type, comptime deinitFromUser: ?DeinitPayloadFn) D
             }
 
             switch (comptime Mode(T)) {
-                .direct => unreachable,
+                .literal => unreachable,
                 .indirect => {
                     ctx.allocator.destroy(
                         @as(
@@ -332,4 +332,139 @@ test "lazily/slot.Slot.touch" {
     try std.testing.expect(ctx.getSlot(getBar) != null);
     try std.testing.expect(ctx.getSlot(getBaz) != null);
     try expectEventLog(ctx, "baz|bar|foo|baz|bar|foo|");
+}
+
+test "lazily/slot.Slot destroy/unsubscribe soak — diamond DAG" {
+    // Guards the Slot destroy↔unsubscribeChangeUnlocked ordering fixed by
+    // 1dd8998 (capture ctx before destroy — UAF on deferred unlock) and the
+    // emitChangeUnlocked snapshot-before-iterate fix. `sink` has TWO parents
+    // (`left`, `right`): its teardown unsubscribes from both while each
+    // parent's destroy cascades into it — the exact ordering the fixes guard.
+    // The soak loop amplifies any corruption/UAF into a testing-allocator or
+    // runtime failure across many build→teardown cycles.
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const getSrc = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("src|");
+            return 1;
+        }
+    }.call;
+    const src = comptime initSlotFn(u8, getSrc, null);
+
+    const getLeft = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("left|");
+            return (try src(_ctx)).* + 1;
+        }
+    }.call;
+    const left = comptime initSlotFn(u8, getLeft, null);
+
+    const getRight = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("right|");
+            return (try src(_ctx)).* + 2;
+        }
+    }.call;
+    const right = comptime initSlotFn(u8, getRight, null);
+
+    const getSink = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("sink|");
+            return (try left(_ctx)).* + (try right(_ctx)).*;
+        }
+    }.call;
+    const sink = comptime initSlotFn(u8, getSink, null);
+
+    const n: usize = 300;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        // Build the diamond: pulls src, left, right, sink (sink depends on both).
+        try std.testing.expectEqual(5, (try sink(ctx)).*); // (1+1) + (1+2)
+
+        // Teardown from the root: src.touch() cascades destroy through both
+        // branches and the shared two-parent sink.
+        if (ctx.getSlot(getSrc)) |src_slot| {
+            src_slot.touch();
+        } else {
+            return error.SrcNotFound;
+        }
+
+        // Whole graph torn down each cycle — no survivors, no double-destroy.
+        try std.testing.expectEqual(null, ctx.getSlot(getSrc));
+        try std.testing.expectEqual(null, ctx.getSlot(getLeft));
+        try std.testing.expectEqual(null, ctx.getSlot(getRight));
+        try std.testing.expectEqual(null, ctx.getSlot(getSink));
+    }
+}
+
+test "lazily/slot.Slot.emitChange soak — multi-subscriber invalidation" {
+    // Guards emitChangeUnlocked's snapshot+clear-before-iterate fix
+    // (iteration-during-mutation): `src` has three direct dependents
+    // (a, b, c), each pulled into a shared `agg`. emitChange iterates src's
+    // subscriber map and destroys each; without the snapshot fix,
+    // destroyUnlocked→unsubscribeChangeUnlocked mutated the map mid-iteration.
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const getSrc = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("src|");
+            return 2;
+        }
+    }.call;
+    const src = comptime initSlotFn(u8, getSrc, null);
+
+    const getA = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("a|");
+            return (try src(_ctx)).* + 1;
+        }
+    }.call;
+    const a = comptime initSlotFn(u8, getA, null);
+
+    const getB = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("b|");
+            return (try src(_ctx)).* + 2;
+        }
+    }.call;
+    const b = comptime initSlotFn(u8, getB, null);
+
+    const getC = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("c|");
+            return (try src(_ctx)).* + 3;
+        }
+    }.call;
+    const c = comptime initSlotFn(u8, getC, null);
+
+    const getAgg = struct {
+        fn call(_ctx: *Context) !u8 {
+            try (try slotEventLog(_ctx)).append("agg|");
+            return (try a(_ctx)).* + (try b(_ctx)).* + (try c(_ctx)).*;
+        }
+    }.call;
+    const agg = comptime initSlotFn(u8, getAgg, null);
+
+    const n: usize = 300;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        try std.testing.expectEqual(12, (try agg(ctx)).*); // 3+4+5
+
+        // emitChange invalidates dependents but keeps src (eager-invalidation
+        // path that runs emitChangeUnlocked's snapshot-then-clear loop).
+        if (ctx.getSlot(getSrc)) |src_slot| {
+            src_slot.emitChange();
+        } else {
+            return error.SrcNotFound;
+        }
+
+        try std.testing.expect(ctx.getSlot(getSrc) != null);
+        try std.testing.expectEqual(null, ctx.getSlot(getA));
+        try std.testing.expectEqual(null, ctx.getSlot(getB));
+        try std.testing.expectEqual(null, ctx.getSlot(getC));
+        try std.testing.expectEqual(null, ctx.getSlot(getAgg));
+    }
 }
