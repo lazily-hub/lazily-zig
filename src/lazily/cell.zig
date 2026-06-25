@@ -32,7 +32,7 @@ pub fn Cell(comptime T: type) type {
         ctx: *Context,
         slot: *Slot,
         value: T,
-        // TODO: Add before_change_subscribers
+        before_change_subscribers: std.AutoHashMap(SubscriberKey, void),
         change_subscribers: std.AutoHashMap(SubscriberKey, void),
         deinitCellValue: ?DeinitCellValueFn(T),
 
@@ -52,6 +52,10 @@ pub fn Cell(comptime T: type) type {
                             .ctx = _ctx,
                             .slot = cell_slot,
                             .value = initial_value,
+                            .before_change_subscribers = std.AutoHashMap(
+                                SubscriberKey,
+                                void,
+                            ).init(_ctx.allocator),
                             .change_subscribers = std.AutoHashMap(
                                 SubscriberKey,
                                 void,
@@ -87,6 +91,7 @@ pub fn Cell(comptime T: type) type {
                 std.debug.print("Cell.deinit#1, deinit_fn={}\n", .{deinit_fn});
                 deinit_fn(self);
             }
+            self.before_change_subscribers.deinit();
             self.change_subscribers.deinit();
         }
 
@@ -101,6 +106,20 @@ pub fn Cell(comptime T: type) type {
             if (std.meta.eql(self.value, new_value)) {
                 self.ctx.mutex.unlock();
                 return;
+            }
+
+            // before_change subscribers fire BEFORE the value is committed, so
+            // `get()` still returns the outgoing value. Invoked under the
+            // context lock (like emitChangeUnlocked): callbacks must not
+            // re-enter Context/Cell methods that acquire `ctx.mutex` —
+            // `Cell.get` is lock-free and safe for reading the old value.
+            {
+                var before_iter = self.before_change_subscribers.iterator();
+                while (before_iter.next()) |entry| {
+                    const before_key = entry.key_ptr.*;
+                    const before_cb: ChangeCallback(T) = @ptrFromInt(before_key.cb_ptr);
+                    before_cb(self);
+                }
             }
 
             self.value = new_value;
@@ -139,6 +158,28 @@ pub fn Cell(comptime T: type) type {
             // Remove by swap-remove for O(1) erase (order not preserved).
             const subscriber_key = subscriberKey(self.ctx, cb);
             return self.change_subscribers.remove(subscriber_key);
+        }
+
+        /// Subscribe a callback that fires BEFORE a `set` commits its new
+        /// value (see `set` for the under-lock invocation contract).
+        pub fn subscribeBeforeChange(self: *@This(), cb: ChangeCallback(T)) !bool {
+            self.ctx.mutex.lock();
+            defer self.ctx.mutex.unlock();
+
+            const subscriber_key = subscriberKey(self.ctx, cb);
+
+            const gop = try self.before_change_subscribers.getOrPut(subscriber_key);
+            if (gop.found_existing) return false; // duplicate, not added
+
+            return true; // newly added
+        }
+
+        pub fn unsubscribeBeforeChange(self: *@This(), cb: ChangeCallback(T)) bool {
+            self.ctx.mutex.lock();
+            defer self.ctx.mutex.unlock();
+
+            const subscriber_key = subscriberKey(self.ctx, cb);
+            return self.before_change_subscribers.remove(subscriber_key);
         }
     };
 }
@@ -184,6 +225,52 @@ test "lazily/cell.Cell: subscribe dedup" {
     test_cell.set(3);
     try std.testing.expectEqual(@as(usize, 1), TestState.called.load(.seq_cst));
     try std.testing.expectEqual(@as(i32, 2), TestState.value.load(.seq_cst));
+}
+
+test "lazily/cell.Cell: before_change fires before commit" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    var test_cell = try Cell(i32).init(ctx, struct {
+        fn call(_ctx: *Context) !i32 {
+            _ = _ctx;
+            return 1;
+        }
+    }.call, null);
+
+    const TestState = struct {
+        var called = std.atomic.Value(usize).init(0);
+        // Snapshot of the value observed when before_change fires.
+        var observed = std.atomic.Value(i32).init(-1);
+
+        fn onBeforeChange(_cell: *Cell(i32)) void {
+            _ = called.fetchAdd(1, .seq_cst);
+            // Before commit: get() must still return the OLD value.
+            _ = observed.swap(_cell.get(), .seq_cst);
+        }
+    };
+
+    TestState.called.store(0, .seq_cst);
+
+    // subscribe dedup: first adds, second is rejected as duplicate.
+    try std.testing.expect(try test_cell.subscribeBeforeChange(TestState.onBeforeChange));
+    try std.testing.expect(!(try test_cell.subscribeBeforeChange(TestState.onBeforeChange)));
+
+    // Unchanged value: before_change must NOT fire.
+    test_cell.set(1);
+    try std.testing.expectEqual(@as(usize, 0), TestState.called.load(.seq_cst));
+
+    // Changed value: before_change fires once, observing the OLD value (1).
+    test_cell.set(2);
+    try std.testing.expectEqual(@as(usize, 1), TestState.called.load(.seq_cst));
+    try std.testing.expectEqual(@as(i32, 1), TestState.observed.load(.seq_cst));
+    try std.testing.expectEqual(@as(i32, 2), test_cell.get());
+
+    // Unsubscribe stops before-change notifications.
+    try std.testing.expect(test_cell.unsubscribeBeforeChange(TestState.onBeforeChange));
+    test_cell.set(3);
+    try std.testing.expectEqual(@as(usize, 1), TestState.called.load(.seq_cst));
 }
 
 /// Init a slot that stores the `Cell(T)` with the initial value defined by `valueFn`.
