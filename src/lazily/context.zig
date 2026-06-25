@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const FfiResult = @import("ffi.zig").FfiResult;
+const AllocatorMode = @import("ffi.zig").AllocatorMode;
+const AllocatorHandle = @import("ffi.zig").AllocatorHandle;
 
 /// Version-agnostic Mutex: Zig < 0.16 uses std.Thread.Mutex;
 /// Zig >= 0.16 uses a spinlock over std.atomic.Mutex (std.Thread.Mutex was removed).
@@ -32,6 +34,12 @@ pub const Context = struct {
     // so user valueFn can re-acquire the mutex per-slot without deadlock.
     pending_recompute: std.ArrayList(*Slot),
     draining_recompute: bool = false,
+    // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
+    // release a stateful allocator state that backed `allocator`. Used by the
+    // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
+    // callers leave these null (they own their allocator themselves).
+    post_deinit_fn: ?*const fn (state: *anyopaque) void = null,
+    post_deinit_state: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator) !*Context {
         const ctx = try allocator.create(Context);
@@ -57,7 +65,20 @@ pub const Context = struct {
         }
         self.cache.deinit();
         self.pending_recompute.deinit(self.allocator);
+
+        // Capture the post-deinit hook before freeing self: `destroy(self)`
+        // deallocates the Context struct via `allocator`, and the hook owns
+        // (and may free) the stateful allocator state that backs `allocator`,
+        // so it must run AFTER self is released. Locals stay valid across the
+        // free because they live on the caller's stack, not in self.
+        const post_fn = self.post_deinit_fn;
+        const post_state = self.post_deinit_state;
+
         self.allocator.destroy(self);
+
+        // post_state is non-null whenever post_fn is (the only setter,
+        // init_context_with_mode, installs both together).
+        if (post_fn) |f| f(post_state.?);
     }
 
     /// Get a Slot. Slot.destroy() will deinit and remove the Slot from the Context.cache.
@@ -612,13 +633,10 @@ pub fn currentSlotFor(ctx: *Context) ?*Slot {
 }
 
 export fn initContext() FfiResult {
-    // TODO: Option to use c_allocator.
-    // - Max throughput
-    // - Multi-thread scaling
-    // - Long running process stability
-    // TODO: Option to use ArenaAllocator
-    // - Purely Additive Caching (Immutable Graphs)
-    // - Batch Jobs
+    // Default allocator: c_allocator when libc is linked (max throughput /
+    // multi-thread scaling / long-running-process stability), else raw pages.
+    // Callers that want a different backing allocator (debug/arena/smp/c/page/
+    // wasm) use `init_context_with_mode` instead.
     const allocator = if (comptime build_options.link_libc)
         std.heap.c_allocator
     else
@@ -637,9 +655,126 @@ comptime {
     @export(&initContext, .{ .name = "init_context" });
 }
 
+/// FFI entry: create a Context backed by the requested `AllocatorMode`.
+///
+/// Stateless modes (page/wasm/c) resolve directly to an allocator with no
+/// state to own. Stateful modes (debug/arena/smp) are hosted in an
+/// `AllocatorHandle` (allocated by a stateless bootstrap allocator) and wired
+/// as a Context post-deinit hook so the state is released only after the
+/// Context struct has been freed.
+export fn initContextWithMode(mode: AllocatorMode) FfiResult {
+    if (statelessAllocatorFor(mode)) |a| {
+        const ctx = Context.init(a) catch {
+            return FfiResult.initError(
+                @intFromError(error.OutOfMemory),
+                "Failed to initialize Context",
+            );
+        };
+        return FfiResult.initSuccess(ctx);
+    }
+
+    const handle = AllocatorHandle.create(mode) catch {
+        return FfiResult.initError(
+            @intFromError(error.OutOfMemory),
+            "Failed to create allocator handle",
+        );
+    };
+    const ctx = Context.init(handle.allocator()) catch {
+        handle.destroy();
+        return FfiResult.initError(
+            @intFromError(error.OutOfMemory),
+            "Failed to initialize Context",
+        );
+    };
+    ctx.post_deinit_fn = AllocatorHandle.destroyFromHook;
+    ctx.post_deinit_state = handle;
+    return FfiResult.initSuccess(ctx);
+}
+comptime {
+    @export(&initContextWithMode, .{ .name = "init_context_with_mode" });
+}
+
+/// Resolve a stateless `AllocatorMode` to its allocator, or null for stateful
+/// modes. Comptime-guarded so libc/wasm-only allocators are never referenced
+/// on targets that lack them.
+fn statelessAllocatorFor(mode: AllocatorMode) ?std.mem.Allocator {
+    const c_alloc: ?std.mem.Allocator = if (build_options.link_libc)
+        std.heap.c_allocator
+    else
+        null;
+    const is_wasm = builtin.target.cpu.arch == .wasm32 or
+        builtin.target.cpu.arch == .wasm64;
+    const wasm_alloc: ?std.mem.Allocator = if (is_wasm)
+        std.heap.wasm_allocator
+    else
+        null;
+
+    return switch (mode) {
+        .page => std.heap.page_allocator,
+        .smp => std.heap.smp_allocator,
+        .c => c_alloc,
+        .wasm => wasm_alloc,
+        // Stateful modes own state via an AllocatorHandle instead.
+        .debug, .arena => null,
+    };
+}
+
 export fn deinitContext(ctx: *Context) void {
     ctx.deinit();
 }
 comptime {
     @export(&deinitContext, .{ .name = "deinit_context" });
+}
+
+test "lazily/context.Context: post-deinit hook fires after free" {
+    const allocator = std.testing.allocator;
+    const HookState = struct {
+        var fired = std.atomic.Value(bool).init(false);
+        fn hook(state: *anyopaque) void {
+            _ = state;
+            fired.store(true, .seq_cst);
+        }
+    };
+    HookState.fired.store(false, .seq_cst);
+
+    const ctx = try Context.init(allocator);
+    ctx.post_deinit_fn = HookState.hook;
+    ctx.post_deinit_state = @ptrCast(ctx);
+    ctx.deinit();
+
+    // Hook ran only after the Context struct was released.
+    try std.testing.expect(HookState.fired.load(.seq_cst));
+}
+
+test "lazily/context.initContextWithMode: stateless page-backed context" {
+    const result = initContextWithMode(.page);
+    try std.testing.expect(result.isSuccess());
+    const ctx: *Context = @ptrCast(@alignCast(result.ptr.?));
+    // No post-deinit hook for stateless modes.
+    try std.testing.expect(ctx.post_deinit_fn == null);
+
+    const buf = try ctx.allocator.alloc(u8, 64);
+    ctx.allocator.free(buf);
+
+    deinitContext(ctx);
+}
+
+test "lazily/context.initContextWithMode: arena-backed context soak" {
+    // Amplifies any use-after-free in the AllocatorHandle/hook teardown: each
+    // iteration allocates the Context + cache through the arena, exercises the
+    // backing allocator, then deinits (Context freed via arena, hook tears the
+    // arena down only after).
+    const iterations = 50;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const result = initContextWithMode(.arena);
+        try std.testing.expect(result.isSuccess());
+        const ctx: *Context = @ptrCast(@alignCast(result.ptr.?));
+        try std.testing.expect(ctx.post_deinit_fn != null);
+
+        const buf = try ctx.allocator.alloc(u8, 128);
+        ctx.allocator.free(buf);
+
+        deinitContext(ctx);
+    }
 }

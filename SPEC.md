@@ -109,6 +109,35 @@ pub const StringView = extern struct {
 
 Export functions via `@export` with `.c` calling convention.
 
+### Allocator modes
+
+The FFI offers two context constructors:
+
+| Export | Purpose |
+|--------|---------|
+| `init_context()` | Default allocator: `c_allocator` when `link_libc`, else `page_allocator` |
+| `init_context_with_mode(mode: AllocatorMode)` | Caller-selectable backing allocator |
+| `deinit_context(ctx)` | Tear down a context (and its owned allocator state, if any) |
+
+`AllocatorMode` (`src/lazily/ffi.zig`):
+
+| Mode | Backing allocator | State |
+|------|-------------------|-------|
+| `c` | `std.heap.c_allocator` | Stateless (requires `link_libc`) |
+| `page` | `std.heap.page_allocator` | Stateless |
+| `wasm` | `std.heap.wasm_allocator` | Stateless (wasm targets) |
+| `smp` | `std.heap.smp_allocator` | Stateless (global singleton) |
+| `debug` | `std.heap.DebugAllocator` | Stateful — leak/double-free detection |
+| `arena` | `std.heap.ArenaAllocator` (over the bootstrap allocator) | Stateful — additive-only, batch jobs |
+
+Stateful modes are hosted in an `AllocatorHandle` (allocated by a stateless
+bootstrap allocator) and installed as a `Context` post-deinit hook, so the
+allocator state is released only after the Context struct has been freed via
+that allocator (`Context.deinit` calls `self.allocator.destroy(self)` before the
+hook fires). Native Zig callers keep using `Context.init(allocator)` and own
+their allocator; the optional `post_deinit_fn` / `post_deinit_state` fields
+default to null.
+
 ## lazily-spec IPC
 
 The cross-language state plane is implemented in `src/lazily/ipc.zig` and uses
