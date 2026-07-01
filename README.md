@@ -93,3 +93,8 @@ Also wrap the allocator passed into `Context.init` with `std.heap.ThreadSafeAllo
 
 - [auth](./src/examples/auth/root.zig)
 - [cells](./src/examples/cells/root.zig)
+
+## See also
+
+- [lazily-spec](https://github.com/lazily-hub/lazily-spec) — language-agnostic wire protocol + conformance fixtures
+- [lazily-formal](https://github.com/lazily-hub/lazily-formal) — Lean 4 formal model (flat FSM kernel + Harel state chart)
