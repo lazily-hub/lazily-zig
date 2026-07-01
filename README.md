@@ -78,6 +78,24 @@ state is accepted but suppressed by the Cell's `std.meta.eql` guard, so no
 downstream cascade fires. Mirrors `StateMachine<S, E>` in lazily-rs and
 `StateMachine[S, E]` in lazily-py.
 
+### StateChart
+
+A `StateChart` is a full Harel/SCXML hierarchical state machine backed by a
+reactive `Cell(Config)`. It is **compute, not protocol** — only its converged
+active configuration lives in a cell, so any Slot/Signal reading the
+configuration is invalidated on a real transition; a no-op self-transition is
+suppressed by the Cell's `std.meta.eql` guard.
+
+Implemented subset (per `lazily-spec`): compound (nested) states, orthogonal
+(**parallel**) regions, shallow + deep **history**, entry/exit/transition
+**actions**, named **guards** (fail-closed), and external + internal
+transitions. Extended-state `{"expr": …}` guards and `run` actions are rejected
+explicitly; `final` states are accepted as leaves. `send` returns `true` when a
+transition is taken, `false` when rejected. Conforms to the canonical
+`lazily-spec/conformance/statechart` fixtures and mirrors `lazily-rs`
+`StateChart` / the Lean model in `lazily-formal`. One `StateChart` per
+`Context` (the configuration cell is keyed by a comptime value function).
+
 ### Reactor (TODO)
 
 A Reactor changes in the evaluation context, allowing for automatic recomputation of dependent Slots when the context changes. A recomputation will expire dependent Slots. A dependent Reactor will expire and recompute.

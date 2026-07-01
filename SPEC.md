@@ -160,6 +160,33 @@ Signals are not a separate IPC variant. An eager Signal is represented as the
 backing slot node, with snapshots carrying a materialized value and deltas using
 `SlotValue` for changed eager values.
 
+## StateChart
+
+`src/lazily/statechart.zig` implements the full Harel/SCXML state chart from
+`lazily-spec/docs/state-charts.md` and the Lean model in
+`lazily-formal/LazilyFormal/StateChart.lean`. It is **compute, not protocol**:
+the chart is never serialized as a distinct wire kind. The active configuration
+lives in a reactive `Cell(Config)` (a sorted set of interned state indices), so
+any Slot/Signal reading the configuration is invalidated on a real transition;
+no-op self-transitions are suppressed by the Cell's `std.meta.eql` guard.
+
+- `ChartDef.parse(allocator, chart_json)` builds an immutable definition from the
+  declarative JSON form, rejecting unsupported features explicitly (`run`
+  actions, `{"expr": …}` guards).
+- `StateChart.init(ctx, &def)` enters the initial configuration and records
+  initial entry actions.
+- `send(event, &guards)` runs the 4-phase algorithm (enabled → conflict-resolve
+  → record history → exit/transition/entry actions) and returns `true` if a
+  transition was taken.
+- `configuration()`, `activeLeaves(allocator)`, `matches(id)`, and
+  `lastActions()` are the spec query surface.
+
+Implemented subset: compound states, orthogonal (parallel) regions, shallow +
+deep history, entry/exit/transition actions, named guards, and external +
+internal transitions. The canonical fixtures are mirrored under
+`src/lazily/test/statechart/` and replayed by the `statechart conformance`
+tests (one per fixture). One `StateChart` per `Context`.
+
 ## Build
 
 ```bash
