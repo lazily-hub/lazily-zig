@@ -57,6 +57,27 @@ A Slot is the basic building block of lazy evaluation. It stores a lazy function
 
 Cells are mutable containers stored in a Slot. Using `Cell.set()` expires child slots, which can include Child slots containing Cells.
 
+### Signal
+
+A `Signal(T)` is an eager derived value backed by a memoized slot with deferred
+recompute. Unlike a lazy Slot (which recomputes on read), a Signal **eagerly**
+recomputes the instant any of its dependencies are invalidated. Recompute runs
+outside the graph mutex via `Context.drainPendingRecompute`, so user `valueFn`s
+may re-lock per-op without deadlock; a memo guard (`std.meta.eql`) suppresses
+downstream cascades when the recomputed value is unchanged. Mirrors
+`SignalHandle<T>` in lazily-rs and `Signal[T]` in lazily-py.
+
+### StateMachine
+
+A `StateMachine(S, E)` is a finite state machine backed by a reactive `Cell`.
+The state lives in a `Cell(S)` so any Slot that reads the machine's state is
+automatically invalidated when the machine transitions. The transition function
+is pure — `fn(*const S, E) ?S`: returning `null` rejects the event (guard),
+returning a value accepts it and sets the cell. A self-transition to an equal
+state is accepted but suppressed by the Cell's `std.meta.eql` guard, so no
+downstream cascade fires. Mirrors `StateMachine<S, E>` in lazily-rs and
+`StateMachine[S, E]` in lazily-py.
+
 ### Reactor (TODO)
 
 A Reactor changes in the evaluation context, allowing for automatic recomputation of dependent Slots when the context changes. A recomputation will expire dependent Slots. A dependent Reactor will expire and recompute.
