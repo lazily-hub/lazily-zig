@@ -41,6 +41,21 @@ pub const StateChart = @import("./lazily/statechart.zig").StateChart;
 pub const ChartDef = @import("./lazily/statechart.zig").ChartDef;
 pub const Signal = @import("./lazily/signal.zig").Signal;
 pub const signal = @import("./lazily/signal.zig").signal;
+pub const Effect = @import("./lazily/effect.zig").Effect;
+pub const effect = @import("./lazily/effect.zig").effect;
+pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
+pub const CellMap = @import("./lazily/collection.zig").CellMap;
+pub const CellFamily = @import("./lazily/collection.zig").CellFamily;
+pub const CollectionOp = @import("./lazily/collection.zig").CollectionOp;
+pub const InvalidateFlags = @import("./lazily/collection.zig").InvalidateFlags;
+pub const NodeKey = ipc.NodeKey;
+pub const WireStamp = ipc.WireStamp;
+pub const CrdtOp = ipc.CrdtOp;
+pub const FrontierEntry = ipc.FrontierEntry;
+pub const CrdtSync = ipc.CrdtSync;
+pub const OpKind = @import("./lazily/permission.zig").OpKind;
+pub const RemoteOp = @import("./lazily/permission.zig").RemoteOp;
+pub const PeerPermissions = @import("./lazily/permission.zig").PeerPermissions;
 
 test {
     std.testing.refAllDecls(@This());

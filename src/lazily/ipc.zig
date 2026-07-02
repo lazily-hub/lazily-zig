@@ -335,10 +335,17 @@ pub const NodeState = union(enum) {
     }
 };
 
+/// A wire-stable keyed address — a "/"-joined path string.
+/// Optional on `NodeSnapshot` and the `NodeAdd` delta op (`protocol.md § NodeKey`).
+/// Survives NodeId churn so a peer can subscribe to "entry `scores/alice`"
+/// without an out-of-band key→NodeId map (#lzwirekey).
+pub const NodeKey = []const u8;
+
 pub const NodeSnapshot = struct {
     node: NodeId,
     type_tag: []const u8,
     state: NodeState,
+    key: ?NodeKey = null,
 
     pub fn fromPayload(node: NodeId, type_tag: []const u8, bytes: []const u8) NodeSnapshot {
         return .{ .node = node, .type_tag = type_tag, .state = NodeState.fromPayload(bytes) };
@@ -357,7 +364,37 @@ pub const NodeSnapshot = struct {
             .node = try asU64(try field(value, "node")),
             .type_tag = try asString(try field(value, "type_tag")),
             .state = try NodeState.fromJson(allocator, try field(value, "state")),
+            .key = if (objectGet(value, "key")) |k| try asString(k) else null,
         };
+    }
+
+    pub fn jsonStringify(self: NodeSnapshot, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("node");
+        try jw.write(self.node);
+        try jw.objectField("type_tag");
+        try jw.write(self.type_tag);
+        try jw.objectField("state");
+        switch (self.state) {
+            .Payload => |payload_bytes| {
+                try jw.beginObject();
+                try jw.objectField("Payload");
+                try writeByteArray(payload_bytes, jw);
+                try jw.endObject();
+            },
+            .SharedBlob => |blob| {
+                try jw.beginObject();
+                try jw.objectField("SharedBlob");
+                try jw.write(blob);
+                try jw.endObject();
+            },
+            .Opaque => try jw.write("Opaque"),
+        }
+        if (self.key) |k| {
+            try jw.objectField("key");
+            try jw.write(k);
+        }
+        try jw.endObject();
     }
 };
 
@@ -424,6 +461,7 @@ pub const DeltaOp = union(enum) {
         node: NodeId,
         type_tag: []const u8,
         state: NodeState,
+        key: ?NodeKey = null,
     };
 
     pub fn cellSet(node: NodeId, payload: IpcValue) DeltaOp {
@@ -458,6 +496,7 @@ pub const DeltaOp = union(enum) {
                 .node = try asU64(try field(tagged.value, "node")),
                 .type_tag = try asString(try field(tagged.value, "type_tag")),
                 .state = try NodeState.fromJson(allocator, try field(tagged.value, "state")),
+                .key = if (objectGet(tagged.value, "key")) |k| try asString(k) else null,
             } };
         }
         if (std.mem.eql(u8, tagged.name, "NodeRemove")) {
@@ -489,7 +528,32 @@ pub const DeltaOp = union(enum) {
             },
             .NodeAdd => |op| {
                 try jw.objectField("NodeAdd");
-                try jw.write(op);
+                try jw.beginObject();
+                try jw.objectField("node");
+                try jw.write(op.node);
+                try jw.objectField("type_tag");
+                try jw.write(op.type_tag);
+                try jw.objectField("state");
+                switch (op.state) {
+                    .Payload => |payload_bytes| {
+                        try jw.beginObject();
+                        try jw.objectField("Payload");
+                        try writeByteArray(payload_bytes, jw);
+                        try jw.endObject();
+                    },
+                    .SharedBlob => |blob| {
+                        try jw.beginObject();
+                        try jw.objectField("SharedBlob");
+                        try jw.write(blob);
+                        try jw.endObject();
+                    },
+                    .Opaque => try jw.write("Opaque"),
+                }
+                if (op.key) |k| {
+                    try jw.objectField("key");
+                    try jw.write(k);
+                }
+                try jw.endObject();
             },
             .NodeRemove => |op| {
                 try jw.objectField("NodeRemove");
@@ -558,9 +622,159 @@ pub const DeltaApplyStatus = union(enum) {
     },
 };
 
+// --- CRDT plane (protocol.md § Distributed: CRDT Cell Plane) ---
+
+/// HLC stamp — total order `(wall_time, logical, peer)`. The wire mirror of
+/// the runtime hybrid logical clock. Plain integers so it is codec-stable.
+pub const WireStamp = struct {
+    wall_time: u64,
+    logical: u64,
+    peer: u64,
+
+    /// Total order comparison: `(wall_time, logical, peer)` lexicographic.
+    pub fn compare(self: WireStamp, other: WireStamp) std.math.Order {
+        if (self.wall_time < other.wall_time) return .lt;
+        if (self.wall_time > other.wall_time) return .gt;
+        if (self.logical < other.logical) return .lt;
+        if (self.logical > other.logical) return .gt;
+        if (self.peer < other.peer) return .lt;
+        if (self.peer > other.peer) return .gt;
+        return .eq;
+    }
+
+    pub fn fromJson(value: std.json.Value) !WireStamp {
+        return .{
+            .wall_time = try asU64(try field(value, "wall_time")),
+            .logical = try asU64(try field(value, "logical")),
+            .peer = try asU64(try field(value, "peer")),
+        };
+    }
+};
+
+/// A single CRDT state-merge op: ships the converged register/sequence/text
+/// state for a node, keyed by HLC stamp. State-based (CvRDT): commutative,
+/// associative, idempotent merge.
+pub const CrdtOp = struct {
+    node: NodeId,
+    key: ?NodeKey = null,
+    stamp: WireStamp,
+    state: IpcValue,
+
+    pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !CrdtOp {
+        return .{
+            .node = try asU64(try field(value, "node")),
+            .key = if (objectGet(value, "key")) |k| try asString(k) else null,
+            .stamp = try WireStamp.fromJson(try field(value, "stamp")),
+            .state = try IpcValue.fromJson(allocator, try field(value, "state")),
+        };
+    }
+
+    pub fn jsonStringify(self: CrdtOp, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("node");
+        try jw.write(self.node);
+        if (self.key) |k| {
+            try jw.objectField("key");
+            try jw.write(k);
+        }
+        try jw.objectField("stamp");
+        try jw.write(self.stamp);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.endObject();
+    }
+};
+
+/// A per-peer stamp frontier entry — `(peer, WireStamp)`.
+pub const FrontierEntry = struct {
+    peer: u64,
+    stamp: WireStamp,
+
+    pub fn fromJson(value: std.json.Value) !FrontierEntry {
+        return .{
+            .peer = try asU64(try field(value, "peer")),
+            .stamp = try WireStamp.fromJson(try field(value, "stamp")),
+        };
+    }
+
+    pub fn jsonStringify(self: FrontierEntry, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("peer");
+        try jw.write(self.peer);
+        try jw.objectField("stamp");
+        try jw.write(self.stamp);
+        try jw.endObject();
+    }
+};
+
+/// Anti-entropy wire format for the CRDT plane. Rides the same `lazily-ipc`
+/// transport as `Snapshot`/`Delta` as a third `IpcMessage` variant.
+pub const CrdtSync = struct {
+    frontier: []const FrontierEntry,
+    ops: []const CrdtOp,
+
+    pub fn init(frontier: []const FrontierEntry, ops: []const CrdtOp) CrdtSync {
+        return .{ .frontier = frontier, .ops = ops };
+    }
+
+    pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !CrdtSync {
+        return .{
+            .frontier = try parseFrontier(allocator, try field(value, "frontier")),
+            .ops = try parseCrdtOps(allocator, try field(value, "ops")),
+        };
+    }
+
+    pub fn jsonStringify(self: CrdtSync, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("frontier");
+        try jw.write(self.frontier);
+        try jw.objectField("ops");
+        try jw.write(self.ops);
+        try jw.endObject();
+    }
+
+    /// Permission filtering: drops ops for non-readable nodes entirely
+    /// (omission, not redaction). The `frontier` is retained in full.
+    pub fn filterReadable(self: CrdtSync, allocator: std.mem.Allocator, readable: std.AutoHashMap(NodeId, void)) !CrdtSync {
+        var filtered: std.ArrayList(CrdtOp) = .empty;
+        for (self.ops) |op| {
+            if (readable.contains(op.node)) {
+                try filtered.append(allocator, op);
+            }
+        }
+        return .{
+            .frontier = self.frontier,
+            .ops = try filtered.toOwnedSlice(allocator),
+        };
+    }
+};
+
+fn parseFrontier(allocator: std.mem.Allocator, value: std.json.Value) ![]const FrontierEntry {
+    switch (value) {
+        .array => |array| {
+            const out = try allocator.alloc(FrontierEntry, array.items.len);
+            for (array.items, out) |item, *entry| entry.* = try FrontierEntry.fromJson(item);
+            return out;
+        },
+        else => return error.ExpectedArray,
+    }
+}
+
+fn parseCrdtOps(allocator: std.mem.Allocator, value: std.json.Value) ![]const CrdtOp {
+    switch (value) {
+        .array => |array| {
+            const out = try allocator.alloc(CrdtOp, array.items.len);
+            for (array.items, out) |item, *op| op.* = try CrdtOp.fromJson(allocator, item);
+            return out;
+        },
+        else => return error.ExpectedArray,
+    }
+}
+
 pub const IpcMessage = union(enum) {
     Snapshot: Snapshot,
     Delta: Delta,
+    CrdtSync: CrdtSync,
 
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !IpcMessage {
         const tagged = try singleField(value);
@@ -569,6 +783,9 @@ pub const IpcMessage = union(enum) {
         }
         if (std.mem.eql(u8, tagged.name, "Delta")) {
             return .{ .Delta = try Delta.fromJson(allocator, tagged.value) };
+        }
+        if (std.mem.eql(u8, tagged.name, "CrdtSync")) {
+            return .{ .CrdtSync = try CrdtSync.fromJson(allocator, tagged.value) };
         }
         return error.UnknownIpcMessage;
     }
@@ -596,6 +813,10 @@ pub const IpcMessage = union(enum) {
             .Delta => |delta| {
                 try jw.objectField("Delta");
                 try jw.write(delta);
+            },
+            .CrdtSync => |crdt| {
+                try jw.objectField("CrdtSync");
+                try jw.write(crdt);
             },
         }
         try jw.endObject();
@@ -634,6 +855,14 @@ fn field(value: std.json.Value, name: []const u8) !std.json.Value {
         .object => |object| return object.get(name) orelse error.MissingField,
         else => return error.ExpectedObject,
     }
+}
+
+/// Like `field` but returns `null` when the field is absent (for optional fields).
+fn objectGet(value: std.json.Value, name: []const u8) ?std.json.Value {
+    return switch (value) {
+        .object => |object| object.get(name),
+        else => null,
+    };
 }
 
 fn asString(value: std.json.Value) ![]const u8 {
@@ -987,4 +1216,88 @@ test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
 
     // round-trip
     try std.testing.expectEqualSlices(u8, payload, try arena.readBlob(desc));
+}
+
+// ---------------------------------------------------------------------------
+// CRDT plane tests (protocol.md § Distributed: CRDT Cell Plane)
+// ---------------------------------------------------------------------------
+
+test "lazily/ipc: WireStamp total order" {
+    const a = WireStamp{ .wall_time = 100, .logical = 0, .peer = 1 };
+    const b = WireStamp{ .wall_time = 100, .logical = 1, .peer = 1 };
+    const c = WireStamp{ .wall_time = 100, .logical = 1, .peer = 2 };
+    const d = WireStamp{ .wall_time = 100, .logical = 1, .peer = 1 };
+    try std.testing.expectEqual(std.math.Order.lt, a.compare(b));
+    try std.testing.expectEqual(std.math.Order.lt, b.compare(c));
+    try std.testing.expectEqual(std.math.Order.eq, a.compare(a));
+    try std.testing.expectEqual(std.math.Order.eq, b.compare(d));
+}
+
+test "lazily/ipc: CrdtSync IpcMessage round-trip" {
+    const allocator = std.testing.allocator;
+
+    const crdt_sync = CrdtSync.init(
+        &.{
+            .{ .peer = 1, .stamp = .{ .wall_time = 100, .logical = 5, .peer = 1 } },
+            .{ .peer = 2, .stamp = .{ .wall_time = 99, .logical = 3, .peer = 2 } },
+        },
+        &.{
+            .{
+                .node = 10,
+                .key = "scores/alice",
+                .stamp = .{ .wall_time = 100, .logical = 5, .peer = 1 },
+                .state = IpcValue.fromInline(&.{ 1, 2, 3 }),
+            },
+            .{
+                .node = 20,
+                .key = null,
+                .stamp = .{ .wall_time = 99, .logical = 3, .peer = 2 },
+                .state = IpcValue.fromInline(&.{ 42 }),
+            },
+        },
+    );
+
+    const msg = IpcMessage{ .CrdtSync = crdt_sync };
+
+    const encoded = try msg.encodeJsonAlloc(allocator);
+    defer allocator.free(encoded);
+
+    var parsed = try IpcMessage.decodeJson(allocator, encoded);
+    defer parsed.deinit();
+
+    const re_encoded = try parsed.message.encodeJsonAlloc(allocator);
+    defer allocator.free(re_encoded);
+
+    try std.testing.expectEqualSlices(u8, encoded, re_encoded);
+
+    // Verify the decoded CrdtSync fields.
+    const decoded = parsed.message.CrdtSync;
+    try std.testing.expectEqual(@as(usize, 2), decoded.frontier.len);
+    try std.testing.expectEqual(@as(u64, 1), decoded.frontier[0].peer);
+    try std.testing.expectEqual(@as(u64, 100), decoded.frontier[0].stamp.wall_time);
+    try std.testing.expectEqual(@as(usize, 2), decoded.ops.len);
+    try std.testing.expectEqualStrings("scores/alice", decoded.ops[0].key.?);
+    try std.testing.expect(decoded.ops[1].key == null);
+    try std.testing.expectEqual(@as(u64, 20), decoded.ops[1].node);
+}
+
+test "lazily/ipc: CrdtSync filter_readable drops non-readable ops" {
+    const allocator = std.testing.allocator;
+
+    var readable = std.AutoHashMap(NodeId, void).init(allocator);
+    defer readable.deinit();
+    try readable.put(10, {});
+
+    const crdt_sync = CrdtSync.init(
+        &.{},
+        &.{
+            .{ .node = 10, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = IpcValue.fromInline(&.{ 1 }) },
+            .{ .node = 20, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = IpcValue.fromInline(&.{ 2 }) },
+        },
+    );
+
+    const filtered = try crdt_sync.filterReadable(allocator, readable);
+    defer allocator.free(filtered.ops);
+    try std.testing.expectEqual(@as(usize, 1), filtered.ops.len);
+    try std.testing.expectEqual(@as(NodeId, 10), filtered.ops[0].node);
 }

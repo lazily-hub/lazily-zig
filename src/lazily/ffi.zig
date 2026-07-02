@@ -19,6 +19,7 @@ pub const LazilyFfiMessageKind = enum(u32) {
     Unknown = 0,
     Snapshot = 1,
     Delta = 2,
+    CrdtSync = 3,
 };
 
 pub const AllocatorMode = enum(u32) {

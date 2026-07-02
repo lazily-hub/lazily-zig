@@ -307,8 +307,30 @@ pub fn build(b: *std.Build) void {
     // orchestrated by the build system will result in other Zig compiler
     // subcommands being invoked with the right flags defined. You can observe
     // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
+    // verbosity) to validate assumptions and diagnose issues.
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+
+    // --- lazily-formal integration ---
+    //
+    // The formal model (lazily-formal) is the executable reference behind the
+    // state-chart and collection conformance fixtures. Its Lean theorems prove
+    // the behavioral invariants that the Zig tests replay as runtime assertions.
+    //
+    // `zig build formal` invokes `lake build` in the sibling lazily-formal
+    // directory, verifying the formal model compiles cleanly. This is part of
+    // the full compliance check (`make check` runs both `zig build test` and
+    // `zig build formal`).
+    const formal_step = b.step("formal", "Build and verify the lazily-formal Lean model");
+    const lake_cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        "cd ../lazily-formal && lake build",
+    });
+    formal_step.dependOn(&lake_cmd.step);
+
+    // `zig build check` runs both the Zig tests AND the formal model.
+    const check_step = b.step("check", "Full compliance check: Zig tests + formal model");
+    check_step.dependOn(run_test);
+    check_step.dependOn(formal_step);
 }
