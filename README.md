@@ -169,4 +169,4 @@ Also wrap the allocator passed into `Context.init` with `std.heap.ThreadSafeAllo
 ## See also
 
 - [lazily-spec](https://github.com/lazily-hub/lazily-spec) — language-agnostic wire protocol + conformance fixtures
-- [lazily-formal](https://github.com/lazily-hub/lazily-formal) — Lean 4 formal model (flat FSM kernel + Harel state chart)
+- [lazily-formal](https://github.com/lazily-hub/lazily-formal) — Lean 4 formal model: the executable reference behind the conformance fixtures (flat FSM kernel + Harel state chart + reactive graph + keyed collections/reconciliation + memoized semantic tree + manufactured identity + text/sequence CRDTs + async lifecycle + distributed signaling)
