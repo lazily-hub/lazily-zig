@@ -56,6 +56,13 @@ pub const CrdtSync = ipc.CrdtSync;
 pub const OpKind = @import("./lazily/permission.zig").OpKind;
 pub const RemoteOp = @import("./lazily/permission.zig").RemoteOp;
 pub const PeerPermissions = @import("./lazily/permission.zig").PeerPermissions;
+pub const receipt = @import("./lazily/receipt.zig");
+pub const ReceiptOutcome = receipt.ReceiptOutcome;
+pub const CausalReceipt = receipt.CausalReceipt;
+pub const CausalReceipts = receipt.CausalReceipts;
+pub const ReceiptMessage = receipt.ReceiptMessage;
+pub const ReceiptApplyStatus = receipt.ReceiptApplyStatus;
+pub const ReceiptProjection = receipt.ReceiptProjection;
 
 test {
     std.testing.refAllDecls(@This());

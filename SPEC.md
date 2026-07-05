@@ -160,6 +160,34 @@ Signals are not a separate IPC variant. An eager Signal is represented as the
 backing slot node, with snapshots carrying a materialized value and deltas using
 `SlotValue` for changed eager values.
 
+## Causal Receipts
+
+`src/lazily/receipt.zig` implements the generic outcome projection from
+`lazily-spec/protocol.md § Causal Receipts` and is the Zig mirror of the Lean
+model in `lazily-formal/LazilyFormal/Receipt.lean`. Receipts are a projection
+plane — separate from `IpcMessage` — and are not a transport ACK.
+
+- `ReceiptOutcome` is `observed` / `accepted` (non-terminal) or `applied` /
+  `rejected` (terminal). `isTerminal()` mirrors `ReceiptOutcome.isTerminal`.
+- `CausalReceipt` carries `receipt_id`, `causation_id`, `observer`,
+  `generation`, `outcome`, and the optional `reason` / `payload_hash`. The two
+  optional fields are always emitted (as `null` when absent) to match
+  `lazily-spec/schemas/receipts.json`.
+- `ReceiptMessage` is the externally-tagged wire envelope
+  `{ "CausalReceipts": { "receipts": [...] } }`.
+- `ReceiptProjection.observe(current_generation, receipt)` is the pure reducer.
+  It matches `Receipt.lean`'s `apply` rule-for-rule: duplicate `receipt_id` ⇒
+  `duplicate`; mismatched generation ⇒ `stale_generation` (retained as an audit
+  id only); non-terminal ⇒ `recorded`; first terminal for a causation id ⇒
+  `recorded`; a second distinct terminal for the same causation id + generation
+  ⇒ `terminal_conflict` (fail closed, no winner selected).
+
+The canonical fixture at `../lazily-spec/conformance/receipts/causal_receipts.json`
+is replayed by `test "lazily/receipt: causal_receipts conformance fixture
+round-trips"` (byte-identical decode/re-encode) and `test "lazily/receipt:
+replaying the conformance fixture into a projection yields the asserted outcome"`
+(fold + assert against the fixture's `assertions` block).
+
 ## StateChart
 
 `src/lazily/statechart.zig` implements the full Harel/SCXML state chart from
