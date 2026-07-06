@@ -135,7 +135,12 @@ pub fn Cell(comptime T: type) type {
                 cb(self);
             }
 
-            self.ctx.drainPendingRecompute();
+            // While inside a `batch(run)` boundary, defer the eager-recompute
+            // flush so N `set` calls coalesce into one Signal/Effect rerun at
+            // the outermost batch exit (`reactive-graph.md` § batch).
+            if (!self.ctx.isBatching()) {
+                self.ctx.drainPendingRecompute();
+            }
         }
 
         pub fn subscribe(self: *@This(), cb: ChangeCallback(T)) !bool {
@@ -460,6 +465,53 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
     try std.testing.expect(ctx.getSlot(getGreeting) != null);
     try std.testing.expect(ctx.getSlot(getGreetingAndResponse) != null);
     try expectEventLog(ctx, "greeting|hello|name|greetingAndResponse|response|greeting|greeting|greetingAndResponse|");
+}
+
+test "lazily/cell.Cell: batch coalesces eager recomputes into one flush" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    const BatchState = struct {
+        var runs = std.atomic.Value(usize).init(0);
+
+        const getSourceA = struct {
+            fn call(_: *Context) anyerror!u32 {
+                return 0;
+            }
+        }.call;
+        const getSourceB = struct {
+            fn call(_: *Context) anyerror!u32 {
+                return 0;
+            }
+        }.call;
+
+        const getDerived = struct {
+            fn call(c: *Context) anyerror!u32 {
+                _ = try @import("cell.zig").cell(u32, c, getSourceA, null);
+                _ = try @import("cell.zig").cell(u32, c, getSourceB, null);
+                _ = runs.fetchAdd(1, .seq_cst);
+                return 0;
+            }
+        }.call;
+
+        fn runBatch(c: *Context) void {
+            const a = @import("cell.zig").cell(u32, c, getSourceA, null) catch return;
+            const b = @import("cell.zig").cell(u32, c, getSourceB, null) catch return;
+            a.set(10);
+            b.set(20);
+            a.set(11);
+        }
+    };
+
+    BatchState.runs.store(0, .seq_cst);
+    const sig = try @import("signal.zig").signal(u32, ctx, BatchState.getDerived, null);
+    defer ctx.allocator.destroy(sig);
+    try std.testing.expectEqual(@as(usize, 1), BatchState.runs.load(.seq_cst));
+
+    ctx.batch(BatchState.runBatch);
+    // 3 setCell calls inside the batch → exactly one eager recompute at flush.
+    try std.testing.expectEqual(@as(usize, 2), BatchState.runs.load(.seq_cst));
 }
 
 test "lazily/cell.thread_safe Cell updates" {

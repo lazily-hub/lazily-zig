@@ -56,6 +56,7 @@ fn on_invalidate_hook(s: *Slot) void {
     if (!s.stale) {
         s.stale = true;
         s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {};
+        s.ctx.instrumentation.effect_queue_pushes += 1;
     }
 }
 

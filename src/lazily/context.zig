@@ -34,12 +34,46 @@ pub const Context = struct {
     // so user valueFn can re-acquire the mutex per-slot without deadlock.
     pending_recompute: std.ArrayList(*Slot),
     draining_recompute: bool = false,
+    // `batch` boundary depth (0 == not batching). While > 0, `Cell.set` queues
+    // the eager-recompute drain until the outermost `finishBatch` exit, so N
+    // writes inside one `batch(run)` produce a single effect/Signal flush
+    // (`lazily-spec/docs/reactive-graph.md` § batch, conformance clause #6).
+    batch_depth: usize = 0,
+    // Instrumentation counters (sync surface). Mirrors lazily-rs
+    // `InstrumentationCounters` (`instrumentation.rs:66-97`). Always-on: 6 u64
+    // fields, bumped under `mutex` (no extra atomics). Use
+    // `instrumentationSnapshot()` / `resetInstrumentation()`.
+    instrumentation: Instrumentation = .{},
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
     // callers leave these null (they own their allocator themselves).
     post_deinit_fn: ?*const fn (state: *anyopaque) void = null,
     post_deinit_state: ?*anyopaque = null,
+
+    /// Copyable instrumentation snapshot. Fields mirror lazily-rs
+    /// `InstrumentationCounters` (`instrumentation.rs:66-97`). Always-on: 6 u64
+    /// fields, bumped under `mutex` (no extra atomics).
+    pub const Instrumentation = struct {
+        node_allocations: u64 = 0,
+        slot_recomputes: u64 = 0,
+        dependency_edges_added: u64 = 0,
+        dependency_edges_removed: u64 = 0,
+        effect_queue_pushes: u64 = 0,
+        max_effect_queue_depth: u64 = 0,
+    };
+
+    pub fn instrumentationSnapshot(self: *Context) Instrumentation {
+        return self.instrumentation;
+    }
+
+    pub fn resetInstrumentation(self: *Context) void {
+        self.instrumentation = .{};
+    }
+
+    fn bump(self: *Context, comptime field: []const u8) void {
+        @field(self.instrumentation, field) += 1;
+    }
 
     pub fn init(allocator: std.mem.Allocator) !*Context {
         const ctx = try allocator.create(Context);
@@ -96,14 +130,51 @@ pub const Context = struct {
         if (self.draining_recompute) return;
         if (self.pending_recompute.items.len == 0) return;
 
+        // Track the high-water mark of the effect queue depth.
+        if (@as(u64, @intCast(self.pending_recompute.items.len)) > self.instrumentation.max_effect_queue_depth) {
+            self.instrumentation.max_effect_queue_depth = @intCast(self.pending_recompute.items.len);
+        }
+
         self.draining_recompute = true;
         defer self.draining_recompute = false;
 
         while (self.pending_recompute.pop()) |slot| {
             slot.stale = false;
             if (slot.recompute) |recompute_fn| {
+                self.instrumentation.slot_recomputes += 1;
                 recompute_fn(slot);
             }
+        }
+    }
+
+    /// True when inside a `batch(run)` boundary. `Cell.set` checks this to
+    /// defer the eager-recompute drain to the outermost batch exit.
+    pub fn isBatching(self: *const Context) bool {
+        return self.batch_depth > 0;
+    }
+
+    /// Coalesce several `Cell.set` updates into one Signal/Effect flush at the
+    /// outermost batch exit (`lazily-spec/docs/reactive-graph.md` § batch).
+    ///
+    /// Mutation is synchronous — `run`'s `Cell.set` calls commit their values
+    /// and propagate invalidation to dependent slots immediately; only the
+    /// eager-recompute flush (`drainPendingRecompute`) is deferred, so eager
+    /// Signals and Effects rerun once at exit, not once per `set`.
+    pub fn batch(
+        self: *Context,
+        comptime run: anytype,
+    ) void {
+        self.batch_depth += 1;
+        defer self.finishBatch();
+        run(self);
+    }
+
+    fn finishBatch(self: *Context) void {
+        std.debug.assert(self.batch_depth > 0);
+        self.batch_depth -= 1;
+        if (self.batch_depth == 0) {
+            // Outermost exit: flush coalesced eager recomputes.
+            self.drainPendingRecompute();
         }
     }
 };
@@ -201,6 +272,7 @@ pub const Slot = struct {
         const ptr_size = comptime Slot.PtrSize(T);
         const free = comptime Free(T);
         const self = try ctx.allocator.create(Slot);
+        ctx.instrumentation.node_allocations += 1;
         self.* = Slot{
             .ctx = ctx,
             .value_fn_ptr = null,
@@ -309,6 +381,7 @@ pub const Slot = struct {
     pub fn subscribeChangeUnlocked(self: *Slot, child: *Slot) !void {
         _ = try self.change_subscribers.getOrPut(child);
         _ = try child.parents.getOrPut(self);
+        self.ctx.bump("dependency_edges_added");
     }
 
     pub fn unsubscribeChange(self: *Slot, child: *Slot) void {
@@ -320,6 +393,7 @@ pub const Slot = struct {
     pub fn unsubscribeChangeUnlocked(self: *Slot, child: *Slot) void {
         _ = self.change_subscribers.remove(child);
         _ = child.parents.remove(self);
+        self.ctx.bump("dependency_edges_removed");
     }
 
     /// Thread-safe call to Slot.touchUnlocked.
@@ -760,7 +834,6 @@ test "lazily/context.initContextWithMode: stateless page-backed context" {
 }
 
 test "lazily/context.initContextWithMode: arena-backed context soak" {
-    // Amplifies any use-after-free in the AllocatorHandle/hook teardown: each
     // iteration allocates the Context + cache through the arena, exercises the
     // backing allocator, then deinits (Context freed via arena, hook tears the
     // arena down only after).
@@ -777,4 +850,42 @@ test "lazily/context.initContextWithMode: arena-backed context soak" {
 
         deinitContext(ctx);
     }
+}
+
+test "lazily/context: instrumentation counters track allocations, edges, and recomputes" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    const CellMod = @import("cell.zig");
+    const sig_mod = @import("signal.zig");
+
+    const getSource = struct {
+        fn call(_: *Context) anyerror!u32 {
+            return 0;
+        }
+    }.call;
+    const source = try CellMod.cell(u32, ctx, getSource, null);
+
+    const before = ctx.instrumentationSnapshot();
+    // A signal that reads the cell establishes a dependency edge.
+    const getDerived = struct {
+        fn call(c: *Context) anyerror!u32 {
+            const src = try CellMod.cell(u32, c, getSource, null);
+            return src.get() + 1;
+        }
+    }.call;
+    const sig = try sig_mod.signal(u32, ctx, getDerived, null);
+    defer ctx.allocator.destroy(sig);
+    const after_setup = ctx.instrumentationSnapshot();
+    try std.testing.expect(after_setup.node_allocations > before.node_allocations);
+    try std.testing.expect(after_setup.dependency_edges_added > before.dependency_edges_added);
+
+    // Setting the source triggers an eager recompute (Signal).
+    source.set(7);
+    const after_set = ctx.instrumentationSnapshot();
+    try std.testing.expect(after_set.slot_recomputes > after_setup.slot_recomputes);
+
+    ctx.resetInstrumentation();
+    try std.testing.expectEqual(@as(u64, 0), ctx.instrumentationSnapshot().node_allocations);
 }

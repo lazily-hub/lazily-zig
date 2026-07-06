@@ -333,4 +333,22 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Full compliance check: Zig tests + formal model");
     check_step.dependOn(run_test);
     check_step.dependOn(formal_step);
+
+    // --- benchmarks (`zig build bench`) ---
+    // Mirrors lazily-rs `benches/context.rs`. Uses std.time.Timer (no criterion).
+    const bench_step = b.step("bench", "Run lazily-zig benchmarks");
+    const bench_exe = b.addExecutable(.{
+        .name = "lazily-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benches/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lazily", .module = mod },
+            },
+            .link_libc = link_libc,
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&run_bench.step);
 }
