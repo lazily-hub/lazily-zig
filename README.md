@@ -96,6 +96,34 @@ mise run test
 The default build does not link libc. Use `zig build -Dlink_libc=true` when an
 embedding artifact needs libc-backed allocator or C runtime symbols.
 
+## Benchmarks
+
+See [BENCHMARKS.md](BENCHMARKS.md) for measured results and methodology. Two
+surfaces:
+
+- **Reactive-core micro-bench** — counter-based instrumentation deltas for the
+  hot paths (cached reads, cold get, fan-out invalidation, memo-guard
+  suppression), mirroring the lazily-rs `context` benches. Zig 0.17-dev has no
+  `std.time.Timer`, so it measures deterministic work-counts instead of a wall
+  clock.
+
+  ```sh
+  zig build bench
+  ```
+
+- **Spreadsheet-scale bench** — a spreadsheet-shaped graph (`N` input cells +
+  `N` formula slots, `formula[i] = input[i] + input[i-1]`) covering build, cold
+  full recalc, one-input-edit + bounded-viewport read, and full-sheet
+  invalidation. Wall-clock timed via `clock_gettime(.MONOTONIC)`. Scales to a
+  full **10,000,000-cell Google Sheets workbook** (`LAZILY_SCALE_N=5000000`); a
+  one-cell edit + viewport read stays in the **~6-7 µs** range at both 2M and
+  10M cells because off-viewport formulas are never recomputed.
+
+  ```sh
+  zig build bench-scale                              # default N=1,000,000 (~2M cells)
+  LAZILY_SCALE_N=5000000 zig build bench-scale       # 10M-cell workbook
+  ```
+
 ## Terminology
 
 ### Context

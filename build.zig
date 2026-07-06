@@ -351,4 +351,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&run_bench.step);
+
+    // --- scale benchmark (`zig build bench-scale`) ---
+    // #lzscalebench — large spreadsheet-shaped graph (N inputs + N formulas)
+    // mirroring lazily-rs `benches/scale.rs` and lazily-go `scale_bench_test.go`.
+    // Gated behind its own step so the default `zig build bench` stays fast.
+    // Size/viewport via env: LAZILY_SCALE_N (default 1_000_000),
+    // LAZILY_SCALE_VIEWPORT (default 1000).
+    const bench_scale_step = b.step(
+        "bench-scale",
+        "Run lazily-zig scale benchmark (LAZILY_SCALE_N / LAZILY_SCALE_VIEWPORT)",
+    );
+    const bench_scale_exe = b.addExecutable(.{
+        .name = "lazily-bench-scale",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benches/scale_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lazily", .module = mod },
+            },
+            .link_libc = link_libc,
+        }),
+    });
+    const run_bench_scale = b.addRunArtifact(bench_scale_exe);
+    bench_scale_step.dependOn(&run_bench_scale.step);
 }
