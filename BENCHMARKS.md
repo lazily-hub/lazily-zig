@@ -189,4 +189,65 @@ respective sizes: a bounded-viewport edit never pays for the off-viewport sheet.
   `cold_full_recalc`. Per-cell figures still divide by `2N` for cross-language
   comparability.
 
+## Cross-language comparison (lazily-rs / lazily-cpp / lazily-zig)
+
+Head-to-head on the same spreadsheet-shaped workload (`N` input cells + `N`
+formula slots, `formula[i] = input[i] + input[i-1]`), measured on `x86_64`
+Linux. lazily-rs uses criterion; lazily-cpp uses its `std::chrono` harness;
+lazily-zig uses `clock_gettime(.MONOTONIC)` for the scale bench. Numbers are
+the current published results from each repo's `BENCHMARKS.md`.
+
+### Micro-benchmarks (single-threaded `Context` unless noted)
+
+| Metric | lazily-rs | lazily-cpp | lazily-zig |
+|---|---:|---:|---:|
+| cached read (Context) | 10.5 ns | 19 ns | — † |
+| cached read (ThreadSafeContext) | 67 ns | 22 ns | — † |
+| cold first get (Context) | 93 ns | 88 ns | — † |
+| cold first get (ThreadSafeContext) | 1.13 µs | 98 ns | — † |
+| fan-out 256 (Context) | 72.5 µs | 1.05 µs | — † |
+| fan-out 256 (ThreadSafeContext) | 219 µs | 1.68 µs | — |
+| set_cell high_fan_out 512 | 145 µs | 3.08 µs | — † |
+| memo equality suppression (Context) | 3.29 µs | 34 ns | — † |
+| effect flushing (Context) | 99 ns | 127 ns | — |
+| batch storms 64 (Context) | 3.85 µs | 4.45 µs | — |
+
+† lazily-zig 0.17-dev removed `std.time.Timer`, so its reactive-core
+micro-bench is **counter-based** (deterministic work-counts: allocations,
+edges, recomputes — not wall-clock). The counters confirm the same zero-work
+steady state (cached reads = 0 allocs / 0 recomputes) but are not directly
+comparable on a wall-clock axis — see the *Reactive-core micro-bench*
+section above.
+
+### Scale — 1M rows (~2M cells)
+
+| Metric | lazily-rs | lazily-cpp | lazily-zig |
+|---|---:|---:|---:|
+| build (2N nodes) | 105 ms | 143 ms | 132 ms |
+| cold full recalc | 106 ms | 102 ms | 381 ms |
+| viewport recalc (edit 1, read 1k) | 15.6 µs | 47.7 µs | 6.4 µs |
+
+### Scale — 10M cells (full Google Sheets workbook capacity)
+
+| Metric | lazily-rs | lazily-cpp | lazily-zig |
+|---|---:|---:|---:|
+| build | 706 ms | 1.33 s | 1.13 s |
+| cold full recalc | 518 ms | 1.12 s | 2.26 s |
+| viewport recalc | 11.4 µs | 71.7 µs | 6.6 µs |
+
+**Honest read:** lazily-zig's integer-keyed `AutoHashMap(usize, *Slot)`
+cache delivers the **cheapest viewport reads** of the three (6.4–6.6 µs,
+size-independent), and its build time is competitive with lazily-cpp.
+lazily-zig's cold/full recalc is slower because its keyed-escape-hatch graph
+materializes formula slots lazily on first read (so `cold_full_recalc` pays
+both allocation and compute) and the `ArenaAllocator` does not free churned
+slots between scenarios. lazily-rs leads build/cold-recalc via its leaner
+monomorphized per-node storage, and lazily-cpp wins the high-fan-out
+micro-benchmarks via its `SmallFn`/`SmallVec` node layout. The **shared
+headline** across all three: they back a full-capacity Google Sheets workbook
+and all exhibit the **lazy-pull viewport property** — a one-cell edit +
+bounded-viewport read stays in the **microsecond** range, independent of
+sheet size, because off-viewport formulas are left dirty and never
+recomputed (~5,000–650,000× cheaper than a full recalc).
+
 [rs-scale]: https://github.com/lazily-hub/lazily-rs/blob/main/benches/scale.rs

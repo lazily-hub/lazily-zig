@@ -103,8 +103,8 @@ embedding artifact needs libc-backed allocator or C runtime symbols.
 
 ## Benchmarks
 
-See [BENCHMARKS.md](BENCHMARKS.md) for measured results and methodology. Two
-surfaces:
+See [BENCHMARKS.md](BENCHMARKS.md) for measured results, methodology, and a
+cross-language comparison with lazily-rs and lazily-cpp. Two surfaces:
 
 - **Reactive-core micro-bench** — counter-based instrumentation deltas for the
   hot paths (cached reads, cold get, fan-out invalidation, memo-guard
