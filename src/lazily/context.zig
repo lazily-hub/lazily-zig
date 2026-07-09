@@ -6,19 +6,20 @@ const AllocatorMode = @import("ffi.zig").AllocatorMode;
 const AllocatorHandle = @import("ffi.zig").AllocatorHandle;
 
 /// Version-agnostic graph mutex:
-/// - Zig < 0.16 uses `std.Thread.Mutex` (a real parking mutex in the stdlib).
-/// - Zig >= 0.16 uses the vendored `ParkingMutex` (`parking_mutex.zig`,
-///   `#lzparkingmutex`). Zig 0.16 removed `std.Thread.Mutex` and pushed
-///   synchronization onto the new `std.Io` runtime, which the lazily graph
-///   lock cannot host portably. The previous fallback was a busy-wait
-///   spinlock over `std.atomic.Mutex` — a high-load cliff under N-writer
-///   contention. `ParkingMutex` parks contended threads via the Linux futex
-///   syscall (and yields on other targets). See `parking_mutex.zig` and
-///   BENCHMARKS.md § Thread-safe contention.
+/// - Zig < 0.16 uses `std.Thread.Mutex`.
+/// - Zig >= 0.16 uses `ReentrantMutex` (`parking_mutex.zig`, `#lzparkingmutex`)
+///   — a `ParkingMutex` (Linux futex) wrapped with owner-thread tracking so
+///   the same thread can re-acquire the lock without deadlock. Reentrancy is
+///   required because `Slot.initKeyed` calls user `valueFn` which re-enters
+///   the graph via `cell()`/`slot()` (each locks `ctx.mutex`). The pre-fix
+///   engine released the lock before valueFn to avoid the deadlock — which
+///   opened a use-after-free race (`#lzuafix`: concurrent `emitChange` freed a
+///   slot mid-materialization). Holding the lock across subscribe → valueFn →
+///   cache-put closes the window.
 const GraphMutex = if (builtin.zig_version.minor < 16)
     std.Thread.Mutex
 else
-    @import("parking_mutex.zig").ParkingMutex;
+    @import("parking_mutex.zig").ReentrantMutex;
 
 /// Context with lazy cache
 pub const Context = struct {
@@ -292,10 +293,20 @@ pub const Slot = struct {
             .free = if (mode == .indirect) free else null,
         };
 
+        // Hold the graph lock across subscribe → valueFn → cache-put.
+        // `GraphMutex` is reentrant (`#lzparkingmutex`), so valueFn's internal
+        // `cell()`/`slot()` calls (which re-lock `ctx.mutex`) are no-ops — they
+        // just bump the depth counter. This closes the use-after-free race
+        // window (`#lzuafix`): without holding the lock here, a concurrent
+        // `Cell.set → emitChange` could free `self` (found via a parent's
+        // `change_subscribers`) between the subscribe and the cache-put, then
+        // the cache-put would write a dangling pointer.
+        ctx.mutex.lock();
+        defer ctx.mutex.unlock();
+
         const current_slot: ?*Slot = currentSlotFor(ctx);
         if (current_slot) |child_slot| {
-            try self.subscribeChange(child_slot);
-            // try child_slot.subscribeChange(self);
+            try self.subscribeChangeUnlocked(child_slot);
         }
 
         var frame = TrackingFrame{
@@ -330,10 +341,15 @@ pub const Slot = struct {
             },
         );
 
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
+        // Dedup: if another thread (or a re-entrant valueFn) already published
+        // a slot for this cache_key, discard `self`. Use `destroySelf(true)`
+        // (recurse=true) so the new slot's parent edges are unsubscribed —
+        // `destroySelf(false)` left dangling references in parents'
+        // `change_subscribers` (a pre-existing bug surfaced by the reentrant
+        // lock change, since valueFn now actually registers edges before we
+        // reach this dedup check under a held lock).
         if (ctx.cache.get(cache_key)) |existing| {
-            self.destroySelf(false);
+            self.destroySelf(true);
             return existing;
         }
 
@@ -489,19 +505,62 @@ pub const Slot = struct {
 
     /// Destroys the value and its subscribers recursively.
     /// Internal version: assumes ctx.mutex is ALREADY held.
+    ///
+    /// Both edge maps (`parents` and `change_subscribers`) are snapshotted into
+    /// allocator-backed slices and cleared BEFORE iteration. This fixes an
+    /// iteration-during-mutation bug: `unsubscribeChangeUnlocked` removes from
+    /// `self.parents`, and the recursive `destroyUnlocked` on a dependent
+    /// calls back into `unsubscribeChangeUnlocked` which removes from
+    /// `self.change_subscribers` — both maps the loops were iterating.
+    /// Under contention this corrupted the hashmap into an infinite loop (the
+    /// `#lzuafix` hang). The snapshot-then-clear pattern is the same one
+    /// `emitChangeUnlocked` already uses for its subscriber cascade.
     pub fn destroySelf(self: *Slot, recurse: ?bool) void {
         if (self.storage) |storage| {
             if (recurse == null or recurse == true) {
-                var parents_iter = self.parents.keyIterator();
-                while (parents_iter.next()) |ptr| {
-                    const parent_slot = ptr.*;
-                    parent_slot.unsubscribeChangeUnlocked(self);
+                // Snapshot + clear parents before unsubscribing (avoids
+                // mutation-during-iteration on self.parents).
+                const parent_count = self.parents.count();
+                if (parent_count > 0) {
+                    if (self.ctx.allocator.alloc(*Slot, parent_count)) |parents| {
+                        var i: usize = 0;
+                        var piter = self.parents.keyIterator();
+                        while (piter.next()) |ptr| {
+                            parents[i] = ptr.*;
+                            i += 1;
+                        }
+                        self.parents.clearRetainingCapacity();
+                        for (parents) |parent_slot| {
+                            parent_slot.unsubscribeChangeUnlocked(self);
+                        }
+                        self.ctx.allocator.free(parents);
+                    } else |_| {
+                        // OOM mid-destroy — clear and skip edge cleanup.
+                        // The slot still gets freed below.
+                        self.parents.clearRetainingCapacity();
+                    }
                 }
 
-                var subscribers_iter = self.change_subscribers.keyIterator();
-                while (subscribers_iter.next()) |ptr| {
-                    const dependent_slot = ptr.*;
-                    dependent_slot.destroyUnlocked(true);
+                // Snapshot + clear subscribers before recursive destroy (avoids
+                // mutation-during-iteration on self.change_subscribers).
+                const sub_count = self.change_subscribers.count();
+                if (sub_count > 0) {
+                    if (self.ctx.allocator.alloc(*Slot, sub_count)) |subs| {
+                        var i: usize = 0;
+                        var siter = self.change_subscribers.keyIterator();
+                        while (siter.next()) |ptr| {
+                            subs[i] = ptr.*;
+                            i += 1;
+                        }
+                        self.change_subscribers.clearRetainingCapacity();
+                        for (subs) |dependent_slot| {
+                            _ = dependent_slot.parents.remove(self);
+                            dependent_slot.destroyUnlocked(true);
+                        }
+                        self.ctx.allocator.free(subs);
+                    } else |_| {
+                        self.change_subscribers.clearRetainingCapacity();
+                    }
                 }
             }
 

@@ -286,6 +286,97 @@ To avoid over-optimizing at the expense of real-world system performance
   but orthogonal — they need their own investigation and would conflate the
   parking-mutex measurement if bundled here.
 
+## Optimizations Applied (v0.9.0)
+
+v0.9.0 ships **three concurrency fixes** uncovered by writing the v0.8.0
+contention bench, plus the **opt-in RwLock policy** and a richer bench that
+measures read-scaling.
+
+1. **`ReentrantMutex` (`#lzreentrant`) —** wraps `ParkingMutex` with
+   owner-thread tracking + depth counter so the same thread can re-acquire the
+   graph lock without deadlock. This lets `Slot.initKeyed` hold the lock across
+   subscribe → valueFn → cache-put, closing the use-after-free race window
+   (`#lzuafix`): a concurrent `Cell.set → emitChange` previously freed a slot
+   that the materializing thread hadn't yet published to the cache. The
+   reentrant lock is the new `GraphMutex` on Zig ≥0.16.
+
+2. **`destroySelf` snapshot fix (`#lziterfix`) —** both edge maps (`parents`
+   and `change_subscribers`) were iterated while `unsubscribeChangeUnlocked`
+   and the recursive `destroyUnlocked` mutated them — iteration-during-mutation
+   that corrupted the hashmap into an infinite loop under contention. Now
+   snapshotted into allocator-backed slices and cleared BEFORE iteration (same
+   pattern `emitChangeUnlocked` already used).
+
+3. **`slotKeyed` lock-leak fix —** the cached-read path could error on
+   `subscribeChangeUnlocked` (OutOfMemory from `getOrPut`) without releasing
+   the lock. With the reentrant mutex, this left `depth` un-decremented →
+   `inner` never released → permanent deadlock. Fixed by scoping the lock with
+   `defer ctx.mutex.unlock()`.
+
+4. **`RwLock` (`#lzrwlock`) —** opt-in read/write lock (mirrors lazily-cpp
+   v0.4.0's `RwThreadSafeContext`). Shared reads (`lockShared`/`unlockShared`)
+   allow concurrent readers; exclusive writes (`lockExclusive`/
+   `unlockExclusive`) serialize mutations. Classic reader-count-gates-writer
+   pattern over two `ParkingMutex`es. Reader-preferring (steady reads starve
+   writers — the right default for UI/editor/CRDT workloads).
+
+### Mixed-optimize root cause
+
+The v0.8.0 contention bench hung under the slot() workload. Root cause: the
+bench imported `lazily` as a Debug module (no `.optimize` set on `addModule`)
+while the bench root was ReleaseFast. Inlined functions like
+`ReentrantMutex.lock` expanded with mismatched assumptions across the
+optimize boundary, causing subtle UB under the mixed binary. Fix: the bench
+now creates a ReleaseFast lazily module matching its own optimize mode
+(`bench_lazily_mod` in `build.zig`). All consumers should set `.optimize`
+on their lazily module import to match their own build.
+
+### Contention results (v0.9.0) — write workload
+
+`zig build bench-contention` — N threads × {lock; counter++; unlock}, 20 ms
+window per run, ReleaseFast, matching optimize modes.
+
+| Threads | ParkingMutex (Mops/s) | Spinlock (Mops/s) | RwLock-exclusive (Mops/s) |
+|---:|---:|---:|---:|
+| 1 | 89.3 | 136.1 | 86.4 |
+| 2 | 28.9 | 25.9 | 26.6 |
+| 4 | 14.7 | 10.0 | 16.1 |
+| 8 | 13.3 | 5.2 | 13.5 |
+| 16 | 13.7 | 3.8 | 12.6 |
+
+All three serialize under the exclusive lock. ParkingMutex and RwLock-
+exclusive both park contended threads (bounded latency ~68–80 ns at N=4–16);
+the spinlock's busy-wait collapses (latency balloons to 266 ns at N=16).
+
+### Contention results (v0.9.0) — read workload
+
+N threads × {lock; read counter; unlock}. RwLock uses `lockShared` (concurrent
+readers); ParkingMutex and Spinlock use exclusive lock (serialized reads).
+Read section = 8 spin iterations (~simulated cached read).
+
+| Threads | ParkingMutex-excl (Mops/s) | Spinlock-excl (Mops/s) | RwLock-shared (Mops/s) |
+|---:|---:|---:|---:|
+| 1 | 10.3 | 10.2 | 10.1 |
+| 2 | 7.7 | 10.4 | **11.9** |
+| 4 | 6.6 | 8.4 | **10.2** |
+
+**The read-scaling headline:** RwLock throughput *increases* from N=1→2
+(10.1→11.9 Mops/s) because two readers hold the lock concurrently, while
+ParkingMutex-excl *decreases* (10.3→7.7) because every read serializes. The
+RwLock's reader-gate (a second ParkingMutex) limits scaling beyond N≈2 — a
+single-atomic rwsem design would scale further, sequenced as future work
+(matching lazily-cpp v0.4.0's `ScalableThreadSafeContext`).
+
+### Remaining concurrency issue (not fixed in v0.9.0)
+
+The full `slot()` / `Cell.set` workload under concurrent same-cell writes still
+crashes (SEGV) after many iterations. The three fixes above (reentrant lock,
+destroySelf snapshot, slotKeyed defer) addressed the lock-level bugs, but the
+destroy-on-invalidate model itself has a deeper race: `emitChange` frees a
+dependent slot whose storage pointer was returned to a reader on another
+thread. The fix is invalidate-in-place (item #6 of the optimization plan —
+mark stale instead of free, refresh on next read), sequenced for v1.0.0.
+
 ## Cross-language comparison (lazily-rs / lazily-cpp / lazily-zig)
 
 Head-to-head on the same spreadsheet-shaped workload (`N` input cells + `N`

@@ -150,6 +150,141 @@ pub const ParkingMutex = struct {
     }
 };
 
+/// Reentrant mutex: wraps `ParkingMutex` with owner-thread tracking so the
+/// same thread can acquire the lock multiple times without deadlock. Each
+/// `lock()` from the owner increments `depth`; each `unlock()` decrements;
+/// the underlying `ParkingMutex` is only released when `depth` reaches 0.
+///
+/// This is the graph mutex type used by `Context` (via `GraphMutex`) on
+/// Zig ≥0.16. The lazily graph's `Slot.initKeyed` calls user `valueFn` which
+/// re-enters the graph via `cell()`/`slot()` (each of which locks). A
+/// non-reentrant mutex would deadlock on that re-entry. The old pre-0.16
+/// `std.Thread.Mutex` was similarly non-reentrant, so the engine released the
+/// lock before calling valueFn — which opened a use-after-free race window
+/// (`#lzuafix`: a concurrent `emitChange` could free a slot that the
+/// materializing thread hadn't yet published to the cache). Reentrancy lets
+/// `initKeyed` hold the lock across subscribe → valueFn → cache-put, closing
+/// the window.
+///
+/// Correctness: `owner` is set AFTER `inner.lock()` succeeds and cleared
+/// BEFORE `inner.unlock()`. Between those points, the owning thread
+/// exclusively owns both `owner` and `depth` (no other thread can read or
+/// write them — they're blocked on `inner`). The re-entrancy check
+/// (`owner.load() == tid`) reads `owner` without holding `inner`, but this is
+/// safe because only the owning thread sees `owner == tid`, and it's the only
+/// thread that reads `depth`.
+pub const ReentrantMutex = struct {
+    inner: ParkingMutex = .{},
+    owner: atomic.Value(usize) = .init(0),
+    depth: u32 = 0,
+
+    pub fn init() ReentrantMutex {
+        return .{};
+    }
+
+    pub inline fn lock(self: *ReentrantMutex) void {
+        const tid = currentThreadId();
+        if (self.owner.load(.monotonic) == tid) {
+            // Re-entrant acquire by the owner — just bump depth.
+            self.depth += 1;
+            return;
+        }
+        // Contended (or first) acquire — park on the inner mutex.
+        self.inner.lock();
+        self.owner.store(tid, .monotonic);
+        self.depth = 1;
+    }
+
+    pub inline fn tryLock(self: *ReentrantMutex) bool {
+        const tid = currentThreadId();
+        if (self.owner.load(.monotonic) == tid) {
+            self.depth += 1;
+            return true;
+        }
+        if (self.inner.tryLock()) {
+            self.owner.store(tid, .monotonic);
+            self.depth = 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub inline fn unlock(self: *ReentrantMutex) void {
+        std.debug.assert(self.depth > 0);
+        self.depth -= 1;
+        if (self.depth == 0) {
+            self.owner.store(0, .release);
+            self.inner.unlock();
+        }
+    }
+};
+
+/// Returns the current thread's OS-level ID as a `usize`. Used as the
+/// reentrant-mutex owner token.
+fn currentThreadId() usize {
+    return @intCast(std.Thread.getCurrentId());
+}
+
+/// Read/write lock — opt-in policy for read-heavy workloads (mirrors lazily-cpp
+/// v0.4.0's `RwThreadSafeContext`). Multiple readers can hold the lock
+/// concurrently via `lockShared`/`unlockShared`; writers get exclusive access
+/// via `lockExclusive`/`unlockExclusive`.
+///
+/// Implementation: the classic "reader-count gates writer" pattern over two
+/// `ParkingMutex`es. The first reader acquires `writer_gate` (locking out
+/// writers); the last reader releases it. `reader_gate` serializes the
+/// reader-count update (a short critical section). Writers acquire
+/// `writer_gate` exclusively. This is reader-preferring (a steady stream of
+/// readers starves writers) — the right default for UI/editor/CRDT workloads
+/// where reads vastly outnumber writes.
+///
+/// Not as efficient as a single-atomic rwsem (the two-mutex handshake adds
+/// overhead on reader entry/exit), but correct and simple. The bench shows
+/// the conceptual scaling advantage of shared reads vs exclusive reads.
+pub const RwLock = struct {
+    writer_gate: ParkingMutex = .{},
+    reader_gate: ParkingMutex = .{},
+    reader_count: atomic.Value(u32) = .init(0),
+
+    pub fn init() RwLock {
+        return .{};
+    }
+
+    /// Acquire a shared (read) lock. Multiple readers may hold concurrently.
+    /// Blocks if a writer holds the exclusive lock.
+    pub inline fn lockShared(self: *RwLock) void {
+        self.reader_gate.lock();
+        const count = self.reader_count.fetchAdd(1, .monotonic);
+        if (count == 0) {
+            // First reader — lock out writers.
+            self.writer_gate.lock();
+        }
+        self.reader_gate.unlock();
+    }
+
+    /// Release a shared (read) lock.
+    pub inline fn unlockShared(self: *RwLock) void {
+        self.reader_gate.lock();
+        const count = self.reader_count.fetchSub(1, .monotonic);
+        if (count == 1) {
+            // Last reader — release the writer gate.
+            self.writer_gate.unlock();
+        }
+        self.reader_gate.unlock();
+    }
+
+    /// Acquire an exclusive (write) lock. Blocks until all readers and writers
+    /// release.
+    pub inline fn lockExclusive(self: *RwLock) void {
+        self.writer_gate.lock();
+    }
+
+    /// Release an exclusive (write) lock.
+    pub inline fn unlockExclusive(self: *RwLock) void {
+        self.writer_gate.unlock();
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

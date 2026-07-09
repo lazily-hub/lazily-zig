@@ -56,24 +56,28 @@ pub fn slotKeyed(
     valueFn: *const ValueFn(T),
     deinitPayload: ?DeinitPayloadFn,
 ) !Slot.Result(T) {
-    ctx.mutex.lock();
+    // Fast path: cached read. The lock is scoped with `defer` so it is ALWAYS
+    // released — even if `subscribeChangeUnlocked` errors (OutOfMemory from
+    // getOrPut). Without `defer`, an error here would leak the reentrant lock
+    // (depth not decremented → inner never released → permanent deadlock).
+    // The cache-miss path falls through the block (lock released by defer),
+    // then calls `initKeyed` which does its own locking.
+    {
+        ctx.mutex.lock();
+        defer ctx.mutex.unlock();
 
-    // Check cache
-    if (ctx.cache.get(cache_key)) |cached_slot| {
-        if (cached_slot.storage != null) {
-            const current_slot: ?*Slot = currentSlotFor(ctx);
-            if (current_slot) |child_slot| {
-                // We are holding the lock, so we can use Unlocked
-                try cached_slot.subscribeChangeUnlocked(child_slot);
+        if (ctx.cache.get(cache_key)) |cached_slot| {
+            if (cached_slot.storage != null) {
+                const current_slot: ?*Slot = currentSlotFor(ctx);
+                if (current_slot) |child_slot| {
+                    try cached_slot.subscribeChangeUnlocked(child_slot);
+                }
+                return cached_slot.get(T);
             }
-            const tuple = cached_slot.get(T);
-            ctx.mutex.unlock();
-            return tuple;
         }
     }
-    ctx.mutex.unlock();
 
-    // Create a free function that knows the type T
+    // Cache miss — create a free function that knows the type T.
     var new_slot = try Slot.initKeyed(
         T,
         ctx,
@@ -467,4 +471,65 @@ test "lazily/slot.Slot.emitChange soak — multi-subscriber invalidation" {
         try std.testing.expectEqual(null, ctx.getSlot(getC));
         try std.testing.expectEqual(null, ctx.getSlot(getAgg));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: cached slot reads under N-thread contention
+//
+// Regression guard for the v0.9.0 fixes: the cached-read path in slotKeyed
+// previously could leak the reentrant lock on a subscribeChangeUnlocked error
+// (depth not decremented → permanent deadlock). The defer-scoped lock in
+// slotKeyed closes that. This test exercises the path under 4-thread
+// contention to catch any regression.
+// ---------------------------------------------------------------------------
+
+fn getConstantU32(_: *Context) anyerror!u32 {
+    return 42;
+}
+
+const SlotConcArgs = struct {
+    ctx: *Context,
+    barrier: *std.atomic.Value(i32),
+    done: *std.atomic.Value(u32),
+    err: *?anyerror,
+};
+
+fn slotConcWorker(args: *SlotConcArgs) void {
+    _ = args.barrier.fetchSub(1, .seq_cst);
+    while (args.barrier.load(.acquire) > 0) std.atomic.spinLoopHint();
+
+    const ctx = args.ctx;
+    _ = slot(u32, ctx, getConstantU32, null) catch |e| {
+        args.err.* = e;
+    };
+    _ = args.done.fetchAdd(1, .seq_cst);
+}
+
+test "lazily/slot: cached read under 4-thread contention" {
+    // Use page_allocator (same as the bench) to match the failure conditions.
+    const ctx = try Context.init(std.heap.page_allocator);
+    defer ctx.deinit();
+    // Prime the cache so all workers hit the cached-read path.
+    _ = try slot(u32, ctx, getConstantU32, null);
+
+    const n_threads: usize = 4;
+    var barrier = std.atomic.Value(i32).init(@intCast(n_threads));
+    var done = std.atomic.Value(u32).init(0);
+    var err: ?anyerror = null;
+
+    var args = SlotConcArgs{
+        .ctx = ctx,
+        .barrier = &barrier,
+        .done = &done,
+        .err = &err,
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, slotConcWorker, .{&args});
+    }
+    for (threads) |t| t.join();
+
+    try std.testing.expectEqual(@as(u32, @intCast(n_threads)), done.load(.seq_cst));
+    if (err) |e| return e;
 }

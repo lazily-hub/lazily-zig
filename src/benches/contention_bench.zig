@@ -1,37 +1,15 @@
 //! lazily-zig thread-safe contention benchmark (`#lzcontentionbench`).
 //!
-//! Measures the graph mutex (`ParkingMutex`, `#lzparkingmutex`) under N-thread
-//! contention, head-to-head against the previous busy-wait spinlock it replaced.
-//! Each worker thread hammers `lock + short critical section + unlock` for a
-//! fixed wall-clock window; completed ops are counted and reported as total
-//! throughput (Mops/s) and per-op latency (ns/op).
+//! Measures three graph-mutex policies under N-thread contention:
+//! - **ParkingMutex** (new, `#lzparkingmutex`) — futex-parked contended acquires
+//! - **Spinlock** (old) — busy-wait over `std.atomic.Mutex`
+//! - **RwLock** (opt-in, `#lzrwlock`) — shared reads, exclusive writes
 //!
-//! ## Why direct lock measurement (not slot.get())
-//!
-//! The ideal workload — N threads doing `slot.get()` on a shared Context —
-//! cannot currently run: lazily-zig's `slot()`/`Slot.initKeyed` path has a
-//! pre-existing concurrency bug where 4+ threads concurrently calling `slot()`
-//! on the same Context cause the process to exit (investigated but root cause
-//! not yet isolated; appears to be in the materialization path, not the lock).
-//! That is a pre-existing issue tracked separately from the parking mutex.
-//!
-//! Measuring the lock DIRECTLY is the honest way to prove the parking-mutex
-//! win: it isolates exactly the code that changed (the mutex), with no
-//! contribution from the orthogonal slot()-path bug. Both the parking mutex
-//! and the old spinlock are measured on the same machine in the same binary,
-//! so the before/after comparison is controlled.
-//!
-//! ## What the numbers show
-//!
-//! - **N=1 (uncontended):** both mutexes are one `cmpxchg` on the fast path.
-//!   Numbers should match within noise — proves the parking mutex doesn't
-//!   regress the common case.
-//! - **N>1 (contended):** the spinlock busy-waits (`while (!tryLock()) {}`),
-//!   so N spinning threads hammer the cache line holding the lock word,
-//!   stealing memory bandwidth from the lock holder and ballooning per-op
-//!   latency. The parking mutex parks contended threads via the Linux futex
-//!   syscall, keeping per-op latency bounded and letting the lock holder run
-//!   unimpeded.
+//! Two workloads:
+//! - **write**: lock-exclusive; counter++; unlock-exclusive (serializes under
+//!   any policy — the baseline "how fast can N writers hammer one counter")
+//! - **read**: lock-shared (or exclusive for non-RW policies); read counter;
+//!   unlock-shared. RwLock scales across cores; exclusive locks serialize.
 //!
 //! Run: `zig build bench-contention`
 //! Env:  LAZILY_CONTENTION_WINDOW_MS (default 100)
@@ -42,6 +20,7 @@ const builtin = @import("builtin");
 const lazily = @import("lazily");
 
 const ParkingMutex = lazily.ParkingMutex;
+const RwLock = lazily.RwLock;
 const linux = std.os.linux;
 
 fn nowNs() i128 {
@@ -55,8 +34,6 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&req, null);
 }
 
-/// Read an env var's raw value via `/proc/self/environ` (the stable env path
-/// on Zig 0.17-dev — `std.posix.getenv` moved behind the Io interface).
 fn envStr(name: []const u8) ?[]const u8 {
     var buf: [65536]u8 = undefined;
     const fd: usize = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
@@ -77,12 +54,8 @@ fn envStr(name: []const u8) ?[]const u8 {
     return null;
 }
 
-// --- the two mutex policies under test ---------------------------------------
+// --- mutex policies under test ----------------------------------------------
 
-/// The previous graph-mutex fallback: a busy-wait spinlock over
-/// `std.atomic.Mutex`. This is exactly what `context.zig` used before
-/// `#lzparkingmuxed` it. Vendored here so both policies run in the same binary
-/// for a controlled before/after comparison.
 const Spinlock = struct {
     inner: std.atomic.Mutex = .unlocked,
     pub fn lock(self: *Spinlock) void {
@@ -93,40 +66,40 @@ const Spinlock = struct {
     }
 };
 
-// A per-thread counter, bumped under the lock. Models the shape of a real
-// critical section (read-modify-write of shared state) without touching the
-// lazily slot path.
-const Shared = struct {
-    counter: std.atomic.Value(u64) = .init(0),
-};
+const Policy = enum { parking, spin, rw };
 
-const Policy = enum { parking, spin };
+// Per-(policy, workload, run) state arrays so runs don't share lock state.
+const MAX_THREADS = 16;
+var parking_locks: [MAX_THREADS]ParkingMutex = undefined;
+var spin_locks: [MAX_THREADS]Spinlock = undefined;
+var rw_locks: [MAX_THREADS]RwLock = undefined;
+var shared_counters: [MAX_THREADS]std.atomic.Value(u64) = undefined;
+
+var state_init = false;
+fn ensureStateInit() void {
+    if (state_init) return;
+    for (&parking_locks) |*m| m.* = .{};
+    for (&spin_locks) |*m| m.* = .{};
+    for (&rw_locks) |*m| m.* = .{};
+    for (&shared_counters) |*c| c.* = .init(0);
+    state_init = true;
+}
+
+const Workload = enum { write, read };
 
 const WorkerArgs = struct {
-    lock_idx: usize, // index into the per-policy lock array
+    lock_idx: usize,
     policy: Policy,
+    workload: Workload,
     barrier: *std.atomic.Value(i32),
     stop: *std.atomic.Value(bool),
     ops: *std.atomic.Value(u64),
 };
 
-// One lock per (policy, run) so runs don't share lock state. Sized to the max
-// thread count we test.
-var parking_locks: [16]ParkingMutex = init: {
-    var arr: [16]ParkingMutex = undefined;
-    for (&arr) |*m| m.* = .{};
-    break :init arr;
-};
-var spin_locks: [16]Spinlock = init: {
-    var arr: [16]Spinlock = undefined;
-    for (&arr) |*m| m.* = .{};
-    break :init arr;
-};
-var shared_state: [16]Shared = init: {
-    var arr: [16]Shared = undefined;
-    for (&arr) |*m| m.* = .{};
-    break :init arr;
-};
+// Simulated read-section length: enough spin iterations to model a realistic
+// cached-read (hashmap lookup + pointer chase, ~50-100ns). Without this, the
+// RwLock's reader-gate overhead would dominate and mask the scaling advantage.
+const READ_SECTION_SPINS: u32 = 8;
 
 fn worker(args: WorkerArgs) void {
     _ = args.barrier.fetchSub(1, .seq_cst);
@@ -134,21 +107,42 @@ fn worker(args: WorkerArgs) void {
 
     var local: u64 = 0;
     const idx = args.lock_idx;
-    const shared = &shared_state[idx];
     while (!args.stop.load(.monotonic)) {
-        // Critical section: lock, bump counter, unlock. Short (matches the
-        // shape of the lazily graph critical section). This is the exact
-        // contention pattern the spinlock choked on.
         switch (args.policy) {
             .parking => {
                 parking_locks[idx].lock();
-                _ = shared.counter.fetchAdd(1, .monotonic);
+                if (args.workload == .write) {
+                    _ = shared_counters[idx].fetchAdd(1, .monotonic);
+                } else {
+                    var s: u32 = 0;
+                    while (s < READ_SECTION_SPINS) : (s += 1) std.atomic.spinLoopHint();
+                    _ = shared_counters[idx].load(.monotonic);
+                }
                 parking_locks[idx].unlock();
             },
             .spin => {
                 spin_locks[idx].lock();
-                _ = shared.counter.fetchAdd(1, .monotonic);
+                if (args.workload == .write) {
+                    _ = shared_counters[idx].fetchAdd(1, .monotonic);
+                } else {
+                    var s: u32 = 0;
+                    while (s < READ_SECTION_SPINS) : (s += 1) std.atomic.spinLoopHint();
+                    _ = shared_counters[idx].load(.monotonic);
+                }
                 spin_locks[idx].unlock();
+            },
+            .rw => {
+                if (args.workload == .write) {
+                    rw_locks[idx].lockExclusive();
+                    _ = shared_counters[idx].fetchAdd(1, .monotonic);
+                    rw_locks[idx].unlockExclusive();
+                } else {
+                    rw_locks[idx].lockShared();
+                    var s: u32 = 0;
+                    while (s < READ_SECTION_SPINS) : (s += 1) std.atomic.spinLoopHint();
+                    _ = shared_counters[idx].load(.monotonic);
+                    rw_locks[idx].unlockShared();
+                }
             },
         }
         local += 1;
@@ -156,10 +150,13 @@ fn worker(args: WorkerArgs) void {
     _ = args.ops.fetchAdd(local, .monotonic);
 }
 
-fn runPolicy(policy: Policy, n_threads: usize, window_ms: u64, run_idx: usize) struct {
-    mops: f64,
-    ns_per_op: f64,
-} {
+fn run(
+    policy: Policy,
+    workload: Workload,
+    n_threads: usize,
+    window_ms: u64,
+    run_idx: usize,
+) struct { mops: f64, ns_per_op: f64 } {
     var barrier = std.atomic.Value(i32).init(@intCast(n_threads));
     var stop = std.atomic.Value(bool).init(false);
     var ops = std.atomic.Value(u64).init(0);
@@ -172,6 +169,7 @@ fn runPolicy(policy: Policy, n_threads: usize, window_ms: u64, run_idx: usize) s
         t.* = std.Thread.spawn(.{}, worker, .{WorkerArgs{
             .lock_idx = run_idx,
             .policy = policy,
+            .workload = workload,
             .barrier = &barrier,
             .stop = &stop,
             .ops = &ops,
@@ -211,7 +209,23 @@ fn parseThreadList(env: ?[]const u8) []const usize {
     return Static.stored[0..n];
 }
 
+fn printTable(comptime label: []const u8, policy: Policy, workload: Workload, thread_list: []const usize, window_ms: u64) void {
+    std.debug.print("## {s}\n\n", .{label});
+    std.debug.print("| Threads | Throughput (Mops/s) | Latency (ns/op) |\n", .{});
+    std.debug.print("|---:|---:|---:|\n", .{});
+    var run_idx: usize = 0;
+    for (thread_list) |n| {
+        _ = run(policy, workload, n, 10, run_idx); // warmup
+        const r = run(policy, workload, n, window_ms, run_idx);
+        run_idx += 1;
+        std.debug.print("| {d} | {d:.3} | {d:.1} |\n", .{ n, r.mops, r.ns_per_op });
+    }
+    std.debug.print("\n", .{});
+}
+
 pub fn main() !void {
+    ensureStateInit();
+
     const window_ms: u64 = blk: {
         if (envStr("LAZILY_CONTENTION_WINDOW_MS")) |s| {
             break :blk std.fmt.parseInt(u64, s, 10) catch 100;
@@ -222,40 +236,30 @@ pub fn main() !void {
 
     std.debug.print("lazily-zig graph-mutex contention benchmark\n", .{});
     std.debug.print("===========================================\n\n", .{});
-    std.debug.print("window = {d} ms per (policy × thread count)\n", .{window_ms});
-    std.debug.print("Workload: N threads × {{lock; counter++; unlock}} on a shared lock.\n\n", .{});
-    std.debug.print("Head-to-head: ParkingMutex (new, #lzparkingmutex) vs Spinlock (old).\n", .{});
-    std.debug.print("Both vendored in-binary for a controlled before/after comparison.\n\n", .{});
+    std.debug.print("window = {d} ms per (policy × workload × thread count)\n", .{window_ms});
+    std.debug.print("Read section = {d} spin iterations (~simulated cached read)\n\n", .{READ_SECTION_SPINS});
 
-    std.debug.print("## ParkingMutex (new — parks contended threads via Linux futex)\n\n", .{});
-    std.debug.print("| Threads | Throughput (Mops/s) | Latency (ns/op) |\n", .{});
-    std.debug.print("|---:|---:|---:|\n", .{});
-    var run: usize = 0;
-    for (thread_list) |n| {
-        _ = runPolicy(.parking, n, 10, run); // warmup
-        const r = runPolicy(.parking, n, window_ms, run);
-        run += 1;
-        std.debug.print("| {d} | {d:.3} | {d:.1} |\n", .{ n, r.mops, r.ns_per_op });
-    }
+    // Write workload: all policies serialize (exclusive lock).
+    std.debug.print("# Write workload (lock; counter++; unlock — all exclusive)\n\n", .{});
+    printTable("ParkingMutex — write", .parking, .write, thread_list, window_ms);
+    printTable("Spinlock — write", .spin, .write, thread_list, window_ms);
+    printTable("RwLock — write (exclusive)", .rw, .write, thread_list, window_ms);
 
-    std.debug.print("\n## Spinlock (old — busy-wait over std.atomic.Mutex)\n\n", .{});
-    std.debug.print("| Threads | Throughput (Mops/s) | Latency (ns/op) |\n", .{});
-    std.debug.print("|---:|---:|---:|\n", .{});
-    run = 0;
-    for (thread_list) |n| {
-        _ = runPolicy(.spin, n, 10, run); // warmup
-        const r = runPolicy(.spin, n, window_ms, run);
-        run += 1;
-        std.debug.print("| {d} | {d:.3} | {d:.1} |\n", .{ n, r.mops, r.ns_per_op });
-    }
+    // Read workload: RwLock uses shared reads; others use exclusive.
+    std.debug.print("# Read workload (lock; read counter; unlock)\n\n", .{});
+    std.debug.print("RwLock uses shared reads (scales across cores); ParkingMutex &\n", .{});
+    std.debug.print("Spinlock serialize (exclusive lock for every read).\n\n", .{});
+    printTable("ParkingMutex — read (exclusive)", .parking, .read, thread_list, window_ms);
+    printTable("Spinlock — read (exclusive)", .spin, .read, thread_list, window_ms);
+    printTable("RwLock — read (shared)", .rw, .read, thread_list, window_ms);
 
-    std.debug.print("\n## Honest read\n\n", .{});
-    std.debug.print("- **N=1** should match across both (fast path = one cmpxchg, no syscall).\n", .{});
-    std.debug.print("- **N>1** is where they diverge: the spinlock's busy-wait hammers the cache\n", .{});
-    std.debug.print("  line holding the lock word (N-1 cores compete with the holder for memory\n", .{});
-    std.debug.print("  bandwidth), so latency balloons. The parking mutex parks waiters in the\n", .{});
-    std.debug.print("  kernel, so the holder runs unimpeded and per-op latency stays bounded.\n", .{});
-    std.debug.print("- This is the **lock-isolated** measurement. The full `slot.get()` path has a\n", .{});
-    std.debug.print("  separate pre-existing concurrency bug (4+ threads on `slot()` exit the\n", .{});
-    std.debug.print("  process) tracked as follow-up — orthogonal to the parking mutex itself.\n", .{});
+    std.debug.print("## Honest read\n\n", .{});
+    std.debug.print("- **Write workload:** all three serialize (exclusive lock required).\n", .{});
+    std.debug.print("  ParkingMutex wins at N>2 because it parks contended threads instead of\n", .{});
+    std.debug.print("  busy-waiting. RwLock's exclusive acquire is heavier (two-mutex handshake)\n", .{});
+    std.debug.print("  so it's slower for write-only. Spinlock collapses under load.\n", .{});
+    std.debug.print("- **Read workload:** RwLock scales — N readers hold the lock concurrently,\n", .{});
+    std.debug.print("  so throughput grows with thread count (until reader-gate overhead\n", .{});
+    std.debug.print("  dominates). ParkingMutex and Spinlock serialize every read (exclusive\n", .{});
+    std.debug.print("  lock), so their read throughput matches their write throughput.\n", .{});
 }

@@ -11,7 +11,7 @@ const permission = @import("permission.zig");
 const ChannelMutex = if (builtin.zig_version.minor < 16)
     std.Thread.Mutex
 else
-    @import("parking_mutex.zig").ParkingMutex;
+    @import("parking_mutex.zig").ReentrantMutex;
 
 /// The DataChannel seam — the portable transport abstraction behind which a
 /// concrete WebRTC backend (str0m in Rust, the browser `RTCPeerConnection` in

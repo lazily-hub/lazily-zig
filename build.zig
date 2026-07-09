@@ -415,12 +415,23 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/benches/contention_bench.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "lazily", .module = mod },
-            },
+            .imports = &.{},
             .link_libc = link_libc,
         }),
     });
+    // ReleaseFast lazily module matching the bench's optimize mode. Mixing a
+    // ReleaseFast bench root with the default (Debug) lazily module causes
+    // inlined functions to expand with mismatched assumptions across the
+    // module boundary — a source of subtle hangs/UB in the mixed binary.
+    const bench_lazily_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = link_libc,
+    });
+    bench_lazily_mod.addOptions("build_options", build_options);
+    bench_contention_exe.root_module.addImport("lazily", bench_lazily_mod);
     const run_bench_contention = b.addRunArtifact(bench_contention_exe);
     bench_contention_step.dependOn(&run_bench_contention.step);
+    b.installArtifact(bench_contention_exe);
 }
