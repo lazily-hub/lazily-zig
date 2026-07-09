@@ -325,43 +325,37 @@ pub const TextCrdt = struct {
         var out = std.ArrayList(OpId).empty;
         errdefer out.deinit(allocator);
 
-        // Iterative pre-order DFS. Push roots reversed so highest pops first.
-        const roots = children.get(null);
-        if (roots) |r| {
-            var i: usize = r.items.len;
-            while (i > 0) {
-                i -= 1;
-                try out.append(allocator, r.items[i]);
+        // True recursive pre-order DFS. Roots (origin = null) are visited in
+        // descending OpId order; for each node, its same-origin children
+        // (concurrent inserts "after" that origin) are likewise visited
+        // descending — the RGA "newest after origin first" tiebreak. A deleted
+        // char is skipped from the output but still descended through, so its
+        // descendants keep their tree position.
+        if (children.get(null)) |roots| {
+            for (roots.items) |r| {
+                try self.walkOrigin(r, &children, allocator, &out, include_deleted);
             }
-        }
-
-        var pos: usize = 0;
-        while (pos < out.items.len) : (pos += 1) {
-            const id = out.items[pos];
-            const kids = children.get(id);
-            if (kids) |k| {
-                // Push reversed so highest pops first.
-                var j: usize = k.items.len;
-                while (j > 0) {
-                    j -= 1;
-                    try out.append(allocator, k.items[j]);
-                }
-            }
-        }
-
-        if (!include_deleted) {
-            var compact = std.ArrayList(OpId).empty;
-            for (out.items) |id| {
-                if (self.elems.get(id)) |elem| {
-                    if (elem.deleted == null) {
-                        try compact.append(allocator, id);
-                    }
-                }
-            }
-            out.deinit(allocator);
-            return compact.toOwnedSlice(allocator);
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    fn walkOrigin(
+        self: *const TextCrdt,
+        id: OpId,
+        children: *const std.HashMap(?OpId, std.ArrayList(OpId), OptionalOpIdContext, std.hash_map.default_max_load_percentage),
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(OpId),
+        include_deleted: bool,
+    ) !void {
+        const elem = self.elems.get(id) orelse return;
+        if (include_deleted or elem.deleted == null) {
+            try out.append(allocator, id);
+        }
+        if (children.get(id)) |kids| {
+            for (kids.items) |k| {
+                try self.walkOrigin(k, children, allocator, out, include_deleted);
+            }
+        }
     }
 };
 

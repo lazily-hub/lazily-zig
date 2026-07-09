@@ -33,9 +33,9 @@ notes and platform carve-outs lives in
 | Free-text character CRDT (`TextCrdt`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TextCrdt` delta sync (`version_vector` / `delta_since` / `apply_delta`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Move-aware sequence CRDT (`SeqCrdt`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Lossless tree CRDT core (`LosslessTreeCrdt`, M1) | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
-| Lossless tree — dotted-frontier anti-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
-| Lossless tree — concurrent merge convergence | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
+| Lossless tree CRDT core (`LosslessTreeCrdt`, M1) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Lossless tree — dotted-frontier anti-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Lossless tree — concurrent merge convergence | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Registers (LWW / MV) + `PnCounter` + `CellCrdt` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | IPC wire — `Snapshot` + `Delta` + `CrdtSync` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Shared-memory blob path (`ShmBlobArena`) | ✅ | ✅ | ✅ | ~ | ~ | ✅ | ✅ | ✅ |
@@ -43,7 +43,7 @@ notes and platform carve-outs lives in
 | Distributed plane — WebRTC transport + signaling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | State projection / mirror | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Causal receipts (`CausalReceipts` outcome projection) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Message-passing + RPC command plane (`command-plane-v1`) | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
+| Message-passing + RPC command plane (`command-plane-v1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | C-ABI FFI boundary | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ |
 | Permission boundary (`PeerPermissions` / `RemoteOp`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Capability negotiation (`SessionHandshake`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -75,6 +75,8 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/signaling.zig` | Signaling protocol wire types (`ClientMessage`/`ServerMessage`) + in-process `SignalingRoom` (anti-spoof `from` stamping). |
 | `src/lazily/async_context.zig` | `AsyncContext` — task-queue + `settle()` drain surface for the async reactive plane (Zig has no language async; revision tracking implements stale-completion discard). |
 | `src/lazily/receipt.zig` | `CausalReceipts` outcome projection (`ReceiptOutcome`, `ReceiptProjection`). |
+| `src/lazily/lossless_tree.zig` | `LosslessTreeCrdt` — single rooted concrete-syntax tree whose leaves own every rendered byte (`render == source` for valid/invalid/unknown text). M1 core: create / tombstone / intra-parent reorder / leaf-edit / split-leaf / merge-adjacent-leaves, plus op-based delta sync over a dotted, non-contiguous `TreeVersionFrontier`. Leaf text embeds `TextCrdt`; child order is a fractional index (`keyBetween`); the clock is a Lamport `OpId`. Conforms to `schemas/lossless-tree.json` + `schemas/lossless-tree-delta.json`. |
+| `src/lazily/command_plane.zig` | Command / RPC message plane (`command-plane-v1`) — the four externally-tagged frames (`CommandSubmit` / `CommandCancel` / `CommandEvents` / `CommandProjection`), the `CommandProjection` reducer (terminal authority = causal receipt; generation guards; idempotency; cancel-before-terminal; terminal-conflict fail-closed; reconnect equivalence), and the `CommandRpcClient` facade whose polled `pollCall` resolves only on a terminal receipt. Conforms to `schemas/message-passing.json`. |
 | `src/lazily/permission.zig` | `PeerPermissions` / `RemoteOp` default-deny allowlist. |
 | `src/lazily/state_machine.zig` / `statechart.zig` | Flat `StateMachine(S,E)` + Harel `StateChart` (compound, orthogonal, history, actions, guards). |
 

@@ -185,6 +185,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_ipc_mod_tests = b.addRunArtifact(ipc_mod_tests);
 
+    const lossless_tree_mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lazily/lossless_tree_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = filters,
+    });
+    const run_lossless_tree_mod_tests = b.addRunArtifact(lossless_tree_mod_tests);
+
+    const command_plane_mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lazily/command_plane_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = filters,
+    });
+    const run_command_plane_mod_tests = b.addRunArtifact(command_plane_mod_tests);
+
     const example_auth_mod = b.addModule(
         "lazily_example_auth",
         .{
@@ -241,6 +261,8 @@ pub fn build(b: *std.Build) void {
     run_test.dependOn(&run_mod_tests.step);
     run_test.dependOn(&run_exe_tests.step);
     run_test.dependOn(&run_ipc_mod_tests.step);
+    run_test.dependOn(&run_lossless_tree_mod_tests.step);
+    run_test.dependOn(&run_command_plane_mod_tests.step);
     run_test.dependOn(&run_example_auth_mod_tests.step);
     run_test.dependOn(&run_example_cells_mod_tests.step);
 
