@@ -5,20 +5,20 @@ const FfiResult = @import("ffi.zig").FfiResult;
 const AllocatorMode = @import("ffi.zig").AllocatorMode;
 const AllocatorHandle = @import("ffi.zig").AllocatorHandle;
 
-/// Version-agnostic Mutex: Zig < 0.16 uses std.Thread.Mutex;
-/// Zig >= 0.16 uses a spinlock over std.atomic.Mutex (std.Thread.Mutex was removed).
+/// Version-agnostic graph mutex:
+/// - Zig < 0.16 uses `std.Thread.Mutex` (a real parking mutex in the stdlib).
+/// - Zig >= 0.16 uses the vendored `ParkingMutex` (`parking_mutex.zig`,
+///   `#lzparkingmutex`). Zig 0.16 removed `std.Thread.Mutex` and pushed
+///   synchronization onto the new `std.Io` runtime, which the lazily graph
+///   lock cannot host portably. The previous fallback was a busy-wait
+///   spinlock over `std.atomic.Mutex` — a high-load cliff under N-writer
+///   contention. `ParkingMutex` parks contended threads via the Linux futex
+///   syscall (and yields on other targets). See `parking_mutex.zig` and
+///   BENCHMARKS.md § Thread-safe contention.
 const GraphMutex = if (builtin.zig_version.minor < 16)
     std.Thread.Mutex
 else
-    struct {
-        inner: std.atomic.Mutex = .unlocked,
-        pub fn lock(self: *@This()) void {
-            while (!self.inner.tryLock()) {}
-        }
-        pub fn unlock(self: *@This()) void {
-            self.inner.unlock();
-        }
-    };
+    @import("parking_mutex.zig").ParkingMutex;
 
 /// Context with lazy cache
 pub const Context = struct {

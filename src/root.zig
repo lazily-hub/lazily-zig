@@ -5,6 +5,7 @@ pub const CellFn = @import("./lazily/cell.zig").CellFn;
 pub const Cell = @import("./lazily/cell.zig").Cell;
 pub const initCellFn = @import("./lazily/cell.zig").initCellFn;
 pub const Context = @import("./lazily/context.zig").Context;
+pub const ParkingMutex = @import("./lazily/parking_mutex.zig").ParkingMutex;
 pub const ipc = @import("./lazily/ipc.zig");
 pub const CapabilityHandshake = ipc.CapabilityHandshake;
 pub const Codec = ipc.Codec;

@@ -3,21 +3,15 @@ const builtin = @import("builtin");
 const ipc = @import("ipc.zig");
 const permission = @import("permission.zig");
 
-/// Version-agnostic Mutex shim (matches `context.zig`'s `GraphMutex` pattern):
-/// Zig < 0.16 uses `std.Thread.Mutex`; Zig >= 0.16 uses a spinlock over
-/// `std.atomic.Mutex` (std.Thread.Mutex was removed).
+/// Version-agnostic Mutex shim (matches `context.zig`'s `GraphMutex`):
+/// Zig < 0.16 uses `std.Thread.Mutex`; Zig >= 0.16 uses the vendored
+/// `ParkingMutex` (`parking_mutex.zig`, `#lzparkingmutex`) — see the note in
+/// `context.zig`. The previous busy-wait spinlock was a high-load cliff under
+/// N-writer contention; `ParkingMutex` parks via the Linux futex syscall.
 const ChannelMutex = if (builtin.zig_version.minor < 16)
     std.Thread.Mutex
 else
-    struct {
-        inner: std.atomic.Mutex = .unlocked,
-        pub fn lock(self: *@This()) void {
-            while (!self.inner.tryLock()) {}
-        }
-        pub fn unlock(self: *@This()) void {
-            self.inner.unlock();
-        }
-    };
+    @import("parking_mutex.zig").ParkingMutex;
 
 /// The DataChannel seam — the portable transport abstraction behind which a
 /// concrete WebRTC backend (str0m in Rust, the browser `RTCPeerConnection` in

@@ -398,4 +398,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench_scale = b.addRunArtifact(bench_scale_exe);
     bench_scale_step.dependOn(&run_bench_scale.step);
+
+    // --- thread-safe contention benchmark (`zig build bench-contention`) ---
+    // #lzcontentionbench — N-writer throughput on a shared cell. Mirrors
+    // lazily-cpp `ts_contention_for`. Measures the graph mutex under load:
+    // the baseline that gates (and proves) the parking-mutex fix
+    // (`#lzparkingmutex`). Requires thread_safe=true (the build default).
+    // Env: LAZILY_CONTENTION_WINDOW_MS (default 100), LAZILY_CONTENTION_THREADS.
+    const bench_contention_step = b.step(
+        "bench-contention",
+        "Run lazily-zig thread-safe contention benchmark (LAZILY_CONTENTION_WINDOW_MS / _THREADS)",
+    );
+    const bench_contention_exe = b.addExecutable(.{
+        .name = "lazily-bench-contention",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benches/contention_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lazily", .module = mod },
+            },
+            .link_libc = link_libc,
+        }),
+    });
+    const run_bench_contention = b.addRunArtifact(bench_contention_exe);
+    bench_contention_step.dependOn(&run_bench_contention.step);
 }
