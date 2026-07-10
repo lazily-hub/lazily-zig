@@ -466,10 +466,38 @@ its v0.22.2 `#lzslotfastpath` refresh fast path — delivers the **cheapest
 viewport reads** of the three (4.5 µs @ 1M, 4.1 µs @ 10M, undercutting
 lazily-zig's integer-keyed cache at 6.4/6.6 µs). lazily-cpp's v0.6.0 `SmallAny`
 inline value storage flipped the cold-recalc lead (36 ms vs lazily-rs 106 ms @
-1M). lazily-zig's cold/full recalc is slower because its keyed-escape-hatch graph
-materializes formula slots lazily on first read (so `cold_full_recalc` pays
-both allocation and compute) and the `ArenaAllocator` does not free churned
-slots between scenarios. lazily-cpp wins the high-fan-out micro-benchmarks via
+1M). lazily-zig's cold/full recalc still trails because its keyed-escape-hatch
+graph materializes formula slots lazily on first read (so `cold_full_recalc`
+pays both allocation and compute — a definitional shift of work that lazily-cpp/
+rs charge partly to `build`) and every read hash-probes a global 2N-entry
+integer cache, and because the `ArenaAllocator` does not free churned slots
+between scenarios.
+
+> **Node-layout optimizations (`#lzinline` / `#lzedgeinline` / `#lzcachegop`).**
+> Profiling `cold_full_recalc` (Linux `perf`, ReleaseFast) put ~38% of
+> wall-clock in `ArenaAllocator.alloc`, of which ~21–25% was *growing the two
+> per-node `AutoHashMap` edge sets* (`change_subscribers` + `parents`) — the
+> engine paid O(N) heap allocations just to record dependency edges. Three
+> changes close most of that gap, matching the `SmallVec`/`SmallAny` layout
+> lazily-cpp uses:
+>
+> - **`#lzinline`** — small `.indirect` values (`i64`, `f64`, pointers, ≤16-byte
+>   PODs) are stored inline in the slot instead of a separate heap box, removing
+>   one allocation and one pointer chase per node.
+> - **`#lzedgeinline`** — `SlotEdgeSet` stores the first 4 edges per direction
+>   inline and only spills to an `AutoHashMap` for genuinely high-fan-out nodes,
+>   so the low-degree common case (a spreadsheet formula reads 2–3 cells)
+>   allocates **zero** edge maps.
+> - **`#lzcachegop`** — the global-cache dedup + publish collapses from a
+>   `get` + `put` (two hashes of the 2N-entry map per node) into one `getOrPut`.
+>
+> Effect: cold-recalc `ArenaAllocator.alloc` self-time drops from ~38% to ~17%
+> of samples (the edge-map `getOrPut → grow → allocate` chain falls from ~25% to
+> ~3%), for a measured ~8–12% cold-recalc wall-clock improvement on a pinned
+> core. The 1M/10M tables above predate these changes and should be re-measured
+> on the reference machine before the next cross-language sync.
+
+lazily-cpp wins the high-fan-out micro-benchmarks via
 its `SmallFn`/`SmallVec` node layout. The **shared headline** across all three:
 they back a full-capacity Google Sheets workbook and all exhibit the
 **lazy-pull viewport property** — a one-cell edit + bounded-viewport read stays

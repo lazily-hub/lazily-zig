@@ -245,6 +245,122 @@ pub fn valueFnCacheKey(valueFn: anytype) usize {
     };
 }
 
+/// Inline-capacity set of `*Slot` (`#lzedgeinline`) — the dependency-edge
+/// container for `Slot.change_subscribers` and `Slot.parents`.
+///
+/// Profiling `cold_full_recalc` showed ~21% of wall-clock in growing the
+/// per-slot `AutoHashMap` edge sets: every reactive node allocated one map per
+/// direction and grew it on the first edge insert, so an N-node graph paid
+/// O(N) heap allocations just to record edges. Real reactive graphs are
+/// overwhelmingly low-degree (a spreadsheet formula reads 2–3 cells), so this
+/// set stores the first `inline_cap` edges inline in the slot and only spills
+/// to a heap `AutoHashMap` for genuinely high-fan-out nodes (e.g. one source
+/// feeding thousands of dependents). Low-degree graphs allocate zero edge maps.
+///
+/// This is a drop-in for the `AutoHashMap(*Slot, void)` surface the graph used
+/// (`getOrPut` dedup-add, `remove`, `count`, `keyIterator`,
+/// `clearRetainingCapacity`, `deinit`), so the surrounding, concurrency-
+/// sensitive snapshot-then-clear-then-iterate control flow is unchanged. Access
+/// is always serialized by `ctx.mutex`, exactly as the map was.
+pub const SlotEdgeSet = struct {
+    /// Inline slots before spilling to a map. 4 covers the low-degree common
+    /// case (spreadsheet fan-in/out is 2, diamond/multi-subscriber test graphs
+    /// are ≤3) while keeping the per-slot footprint modest (4 pointers = 32
+    /// bytes/direction). Higher-degree nodes (e.g. one source feeding many
+    /// dependents) spill to a heap `AutoHashMap`.
+    pub const inline_cap: usize = 4;
+
+    allocator: std.mem.Allocator,
+    buf: [inline_cap]*Slot = undefined,
+    len: usize = 0,
+    map: ?std.AutoHashMap(*Slot, void) = null,
+
+    pub fn init(allocator: std.mem.Allocator) SlotEdgeSet {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SlotEdgeSet) void {
+        if (self.map) |*m| m.deinit();
+        self.* = undefined;
+    }
+
+    pub fn count(self: *const SlotEdgeSet) usize {
+        return if (self.map) |*m| m.count() else self.len;
+    }
+
+    /// Dedup-add `key`. Mirrors `AutoHashMap.getOrPut` for the graph's use
+    /// (callers only rely on the dedup side effect). Spills inline→map when the
+    /// inline buffer is full.
+    pub fn getOrPut(self: *SlotEdgeSet, key: *Slot) !void {
+        if (self.map) |*m| {
+            _ = try m.getOrPut(key);
+            return;
+        }
+        for (self.buf[0..self.len]) |e| {
+            if (e == key) return; // already present
+        }
+        if (self.len < inline_cap) {
+            self.buf[self.len] = key;
+            self.len += 1;
+            return;
+        }
+        // Inline buffer full — spill to a heap map (allocate ONCE, then reuse).
+        var m = std.AutoHashMap(*Slot, void).init(self.allocator);
+        errdefer m.deinit();
+        try m.ensureTotalCapacity(inline_cap + 1);
+        for (self.buf[0..self.len]) |e| {
+            m.putAssumeCapacity(e, {});
+        }
+        m.putAssumeCapacity(key, {});
+        self.map = m;
+        self.len = 0;
+    }
+
+    /// Remove `key` if present; returns whether it was. Inline path uses
+    /// swap-remove (set is unordered; all iteration sites snapshot first).
+    pub fn remove(self: *SlotEdgeSet, key: *Slot) bool {
+        if (self.map) |*m| return m.remove(key);
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.buf[i] == key) {
+                self.buf[i] = self.buf[self.len - 1];
+                self.len -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn clearRetainingCapacity(self: *SlotEdgeSet) void {
+        if (self.map) |*m| m.clearRetainingCapacity();
+        self.len = 0;
+    }
+
+    /// Iterator matching `AutoHashMap.keyIterator()`: `next()` yields
+    /// `*(*Slot)` (a pointer to the stored key), so existing call sites'
+    /// `ptr.*` continues to work.
+    pub const KeyIterator = struct {
+        set: *SlotEdgeSet,
+        idx: usize = 0,
+        map_it: ?std.AutoHashMap(*Slot, void).KeyIterator = null,
+
+        pub fn next(self: *KeyIterator) ?*(*Slot) {
+            if (self.map_it) |*mi| return mi.next();
+            if (self.idx < self.set.len) {
+                const p = &self.set.buf[self.idx];
+                self.idx += 1;
+                return p;
+            }
+            return null;
+        }
+    };
+
+    pub fn keyIterator(self: *SlotEdgeSet) KeyIterator {
+        if (self.map) |*m| return .{ .set = self, .map_it = m.keyIterator() };
+        return .{ .set = self };
+    }
+};
+
 pub const Slot = struct {
     ctx: *Context,
     value_fn_ptr: ?*anyopaque,
@@ -253,16 +369,41 @@ pub const Slot = struct {
     mode: Modes,
     /// Pointer classification for the cached value type (std.builtin.Type.Pointer.Size): .one, .many, .slice, .c
     ptr_size: std.builtin.Type.Pointer.Size,
-    change_subscribers: std.AutoHashMap(*Slot, void),
-    parents: std.AutoHashMap(*Slot, void),
+    change_subscribers: SlotEdgeSet,
+    parents: SlotEdgeSet,
     deinitPayload: ?*const fn (*Slot) void,
     free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
+    // Inline small-value storage (`#lzinline`). For `.indirect` values whose
+    // size/alignment fit `inline_cap`/`inline_align`, the value lives directly
+    // in `inline_buf` instead of a separate heap box: `storage.payload.single_ptr`
+    // points at `&inline_buf`. This removes one allocation + one pointer chase
+    // per materialization (the dominant `cold_full_recalc` cost) and is safe
+    // under invalidate-in-place (`#lzinplace`) because a stale slot is orphaned,
+    // not freed, so the interior pointer stays valid for concurrent readers.
+    // `storage_inline` gates the per-slot free in `destroySelf`.
+    storage_inline: bool = false,
+    inline_buf: [inline_cap]u8 align(inline_align) = undefined,
     // Eager-Signal hooks (default null = lazy/destroy-on-invalidate semantics).
     // on_invalidate: fired instead of destroyUnlocked when a dependency invalidates this slot.
     // recompute: type-erased re-materialize (re-run valueFn, memo guard, swap, emitChange).
     on_invalidate: ?*const fn (*Slot) void = null,
     recompute: ?*const fn (*Slot) void = null,
     stale: bool = false,
+
+    /// Inline-storage budget (`#lzinline`). 16 bytes / 16-byte alignment covers
+    /// the overwhelming majority of reactive value types — `i64`, `f64`,
+    /// `usize`, pointers, `u128`, and 2-word POD structs — without bloating the
+    /// per-slot footprint. Larger/over-aligned values fall back to a heap box.
+    pub const inline_cap: usize = 16;
+    pub const inline_align: usize = 16;
+
+    /// A `.indirect` value qualifies for inline storage when it fits the inline
+    /// budget. Comptime-evaluated per `T`, so the branch is compiled away.
+    pub fn inlineEligible(comptime T: type) bool {
+        return comptime Mode(T) == .indirect and
+            @sizeOf(T) <= inline_cap and
+            @alignOf(T) <= inline_align;
+    }
 
     pub fn init(
         comptime T: type,
@@ -298,14 +439,8 @@ pub const Slot = struct {
             .mode = mode,
             .storage = null,
             .ptr_size = ptr_size,
-            .change_subscribers = std.AutoHashMap(
-                *Slot,
-                void,
-            ).init(ctx.allocator),
-            .parents = std.AutoHashMap(
-                *Slot,
-                void,
-            ).init(ctx.allocator),
+            .change_subscribers = SlotEdgeSet.init(ctx.allocator),
+            .parents = SlotEdgeSet.init(ctx.allocator),
             .deinitPayload = deinitPayload,
             .free = if (mode == .indirect) free else null,
         };
@@ -335,42 +470,54 @@ pub const Slot = struct {
         defer popTracking(&frame);
 
         const value = try valueFn(ctx);
-        const stored_value = try Storage.toStoredType(
-            T,
-            ctx,
-            value,
-        );
         self.value_fn_ptr = @ptrCast(@constCast(valueFn));
 
-        self.storage = Storage.init(
-            switch (comptime Mode(T)) {
-                .literal => switch (comptime Slot.PtrSize(T)) {
+        switch (comptime Mode(T)) {
+            .literal => {
+                const stored_value = try Storage.toStoredType(T, ctx, value);
+                self.storage = Storage.init(switch (comptime Slot.PtrSize(T)) {
                     .slice => Slot.Storage.Payload{
                         .slice = SliceStorage.init(T, stored_value),
                     },
                     .one, .many, .c => Slot.Storage.Payload{
                         .single_ptr = @ptrCast(@constCast(stored_value)),
                     },
-                },
-                .indirect => Slot.Storage.Payload{
-                    .single_ptr = @ptrCast(stored_value),
-                },
+                });
             },
-        );
-
-        // Dedup: if another thread (or a re-entrant valueFn) already published
-        // a slot for this cache_key, discard `self`. Use `destroySelf(true)`
-        // (recurse=true) so the new slot's parent edges are unsubscribed —
-        // `destroySelf(false)` left dangling references in parents'
-        // `change_subscribers` (a pre-existing bug surfaced by the reentrant
-        // lock change, since valueFn now actually registers edges before we
-        // reach this dedup check under a held lock).
-        if (ctx.cache.get(cache_key)) |existing| {
-            self.destroySelf(true);
-            return existing;
+            .indirect => {
+                if (comptime Slot.inlineEligible(T)) {
+                    // Inline the value in the slot itself (`#lzinline`): no heap
+                    // box, no per-slot free. `single_ptr` points at the slot's
+                    // own `inline_buf`, which is stable for the slot's lifetime
+                    // (slots are never moved, and orphaned-not-freed under
+                    // `#lzinplace`).
+                    const inline_ptr: *T = @ptrCast(@alignCast(&self.inline_buf));
+                    inline_ptr.* = value;
+                    self.storage_inline = true;
+                    self.storage = Storage.init(.{ .single_ptr = @ptrCast(inline_ptr) });
+                } else {
+                    const stored_value = try Storage.toStoredType(T, ctx, value);
+                    self.storage = Storage.init(.{ .single_ptr = @ptrCast(stored_value) });
+                }
+            },
         }
 
-        try ctx.cache.put(cache_key, self);
+        // Dedup + publish in one hash lookup (`#lzcachegop`). If another thread
+        // (or a re-entrant valueFn) already published a slot for this cache_key,
+        // discard `self` — use `destroySelf(true)` (recurse=true) so the new
+        // slot's parent edges are unsubscribed (`destroySelf(false)` left
+        // dangling references in parents' `change_subscribers`, a pre-existing
+        // bug surfaced by the reentrant lock change, since valueFn now actually
+        // registers edges before we reach this dedup check under a held lock).
+        // Otherwise, `self` is the winner: write it into the entry we just
+        // reserved. `getOrPut` folds the former `get` + `put` (two hashes of the
+        // 2N-entry cache per materialization) into one.
+        const gop = try ctx.cache.getOrPut(cache_key);
+        if (gop.found_existing) {
+            self.destroySelf(true);
+            return gop.value_ptr.*;
+        }
+        gop.value_ptr.* = self;
         return self;
     }
 
@@ -412,8 +559,8 @@ pub const Slot = struct {
     }
 
     pub fn subscribeChangeUnlocked(self: *Slot, child: *Slot) !void {
-        _ = try self.change_subscribers.getOrPut(child);
-        _ = try child.parents.getOrPut(self);
+        try self.change_subscribers.getOrPut(child);
+        try child.parents.getOrPut(self);
         self.ctx.bump("dependency_edges_added");
     }
 
@@ -635,7 +782,7 @@ pub const Slot = struct {
             if (self.deinitPayload) |deinitPayload| {
                 deinitPayload(self);
             }
-            if (self.mode == .indirect) {
+            if (self.mode == .indirect and !self.storage_inline) {
                 if (self.free) |free_fn| {
                     free_fn(self.ctx.allocator, storage.payload.single_ptr);
                 }
@@ -1015,4 +1162,95 @@ test "lazily/context: instrumentation counters track allocations, edges, and rec
 
     ctx.resetInstrumentation();
     try std.testing.expectEqual(@as(u64, 0), ctx.instrumentationSnapshot().node_allocations);
+}
+
+// ---------------------------------------------------------------------------
+// SlotEdgeSet (`#lzedgeinline`) — the inline-capacity dependency-edge container.
+// SlotEdgeSet only stores and compares `*Slot` pointers (never dereferences
+// them), so these tests fabricate distinct, well-aligned fake tokens rather
+// than materializing real slots. This directly exercises the inline→spill
+// transition, dedup, swap-remove, iteration, and clear — the paths not covered
+// by the graph's low-degree fixtures.
+// ---------------------------------------------------------------------------
+
+fn fakeSlot(i: usize) *Slot {
+    // 64-byte stride keeps every token distinct and ≥16-aligned (Slot's
+    // alignment). Never dereferenced.
+    return @ptrFromInt((i + 1) * 64);
+}
+
+test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, clear" {
+    const a = std.testing.allocator;
+    var set = SlotEdgeSet.init(a);
+    defer set.deinit();
+
+    // Fill exactly to inline capacity — stays inline (no map).
+    var i: usize = 0;
+    while (i < SlotEdgeSet.inline_cap) : (i += 1) try set.getOrPut(fakeSlot(i));
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
+    try std.testing.expect(set.map == null);
+
+    // Dedup: re-adding an existing key does not grow the set.
+    try set.getOrPut(fakeSlot(0));
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
+    try std.testing.expect(set.map == null);
+
+    // One more distinct key spills to a heap map, preserving every entry.
+    try set.getOrPut(fakeSlot(SlotEdgeSet.inline_cap));
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap + 1, set.count());
+    try std.testing.expect(set.map != null);
+
+    // Iterate: every inserted key appears exactly once.
+    var seen: usize = 0;
+    var it = set.keyIterator();
+    while (it.next()) |ptr| {
+        var found = false;
+        var j: usize = 0;
+        while (j <= SlotEdgeSet.inline_cap) : (j += 1) {
+            if (fakeSlot(j) == ptr.*) found = true;
+        }
+        try std.testing.expect(found);
+        seen += 1;
+    }
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap + 1, seen);
+
+    // Remove from the spilled map; second remove reports absence.
+    try std.testing.expect(set.remove(fakeSlot(0)));
+    try std.testing.expect(!set.remove(fakeSlot(0)));
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
+
+    set.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), set.count());
+}
+
+test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no spill" {
+    const a = std.testing.allocator;
+    var set = SlotEdgeSet.init(a);
+    defer set.deinit();
+
+    try set.getOrPut(fakeSlot(0));
+    try set.getOrPut(fakeSlot(1));
+    try set.getOrPut(fakeSlot(2));
+    try std.testing.expect(set.map == null);
+    try std.testing.expectEqual(@as(usize, 3), set.count());
+
+    // Swap-remove the middle entry: the other two survive, still inline.
+    try std.testing.expect(set.remove(fakeSlot(1)));
+    try std.testing.expect(!set.remove(fakeSlot(1)));
+    try std.testing.expectEqual(@as(usize, 2), set.count());
+
+    // Both survivors still resolve via iteration.
+    var have0 = false;
+    var have2 = false;
+    var it = set.keyIterator();
+    while (it.next()) |ptr| {
+        if (ptr.* == fakeSlot(0)) have0 = true;
+        if (ptr.* == fakeSlot(2)) have2 = true;
+    }
+    try std.testing.expect(have0 and have2);
+
+    // Re-adding fills the freed inline slot without ever spilling.
+    try set.getOrPut(fakeSlot(1));
+    try std.testing.expectEqual(@as(usize, 3), set.count());
+    try std.testing.expect(set.map == null);
 }

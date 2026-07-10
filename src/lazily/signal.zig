@@ -111,22 +111,32 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
                     deinit_fn(s); // reads s.storage (old)
                 }
 
-                // Free old allocation for indirect mode
-                if (s.mode == .indirect) {
+                // Free old allocation for indirect mode — but NOT inline storage
+                // (`#lzinline`): `single_ptr` points into `s.inline_buf`, which
+                // was never heap-allocated.
+                if (s.mode == .indirect and !s.storage_inline) {
                     if (s.free) |free_fn| {
                         free_fn(ctx.allocator, old_storage.payload.single_ptr);
                     }
                 }
 
-                // Allocate new storage
-                const stored = Storage.toStoredType(T, ctx, new_value) catch return;
-                s.storage = Storage.init(switch (comptime Mode(T)) {
-                    .literal => switch (comptime Slot.PtrSize(T)) {
-                        .slice => Slot.Storage.Payload{ .slice = Slot.SliceStorage.init(T, stored) },
-                        .one, .many, .c => Slot.Storage.Payload{ .single_ptr = @ptrCast(@constCast(stored)) },
-                    },
-                    .indirect => Slot.Storage.Payload{ .single_ptr = @ptrCast(stored) },
-                });
+                // Store new value. Mirror initKeyed: inline small indirect
+                // values in the slot itself, heap-box everything else.
+                if (comptime Slot.inlineEligible(T)) {
+                    const inline_ptr: *T = @ptrCast(@alignCast(&s.inline_buf));
+                    inline_ptr.* = new_value;
+                    s.storage_inline = true;
+                    s.storage = Storage.init(.{ .single_ptr = @ptrCast(inline_ptr) });
+                } else {
+                    const stored = Storage.toStoredType(T, ctx, new_value) catch return;
+                    s.storage = Storage.init(switch (comptime Mode(T)) {
+                        .literal => switch (comptime Slot.PtrSize(T)) {
+                            .slice => Slot.Storage.Payload{ .slice = Slot.SliceStorage.init(T, stored) },
+                            .one, .many, .c => Slot.Storage.Payload{ .single_ptr = @ptrCast(@constCast(stored)) },
+                        },
+                        .indirect => Slot.Storage.Payload{ .single_ptr = @ptrCast(stored) },
+                    });
+                }
             }
 
             // Step 4: Cascade if changed (outside lock)
