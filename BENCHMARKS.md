@@ -111,10 +111,10 @@ LAZILY_SCALE_N=5000000 zig build bench-scale   # Google Sheets 10M-cell workbook
 
 | Benchmark | Time | Per cell | What it measures |
 |-----------|-----:|---------:|------------------|
-| `build` | 132 ms | ~66 ns | Construct the N input nodes (formulas lazy, not yet materialized). |
-| `cold_full_recalc` | 381 ms | ~190 ns | First read of every formula — materializes all N formula slots + edges and computes them. |
-| `viewport_recalc` | **6.4 µs** | — | Edit one input, read only a 1,000-cell viewport. ~59,000× cheaper than a full recalc. |
-| `full_recalc_invalidate_all` | 603 ms | ~301 ns | Touch every input, then read every formula (worst-case full-sheet edit). |
+| `build` | 120 ms | ~60 ns | Construct the N input nodes (formulas lazy, not yet materialized). |
+| `cold_full_recalc` | 275 ms | ~138 ns | First read of every formula — materializes all N formula slots + edges and computes them. |
+| `viewport_recalc` | **10.4 µs** | — | Edit one input, read only a 1,000-cell viewport. ~38,000× cheaper than a full recalc. |
+| `full_recalc_invalidate_all` | 403 ms | ~202 ns | Touch every input, then read every formula (worst-case full-sheet edit). |
 
 ### 5,000,000 rows (10M cells — a full Google Sheets workbook)
 
@@ -124,14 +124,14 @@ input cells + 5,000,000 formula cells (`LAZILY_SCALE_N=5000000`, measured with
 
 | Benchmark | Time | Per cell | What it measures |
 |-----------|-----:|---------:|------------------|
-| `build` | 1.13 s | ~113 ns | Build the 5M input nodes of a full 10M-cell workbook. |
-| `cold_full_recalc` | 2.26 s | ~226 ns | Materialize + compute all 5M formulas cold. |
-| `viewport_recalc` | **6.6 µs** | — | Edit one input, read a 1,000-cell viewport. ~647,000× cheaper than a full recalc. |
-| `full_recalc_invalidate_all` | 4.25 s | ~425 ns | Re-edit every input, recompute the whole workbook. |
+| `build` | 862 ms | ~86 ns | Build the 5M input nodes of a full 10M-cell workbook. |
+| `cold_full_recalc` | 2.29 s | ~229 ns | Materialize + compute all 5M formulas cold. |
+| `viewport_recalc` | **10.6 µs** | — | Edit one input, read a 1,000-cell viewport. ~297,000× cheaper than a full recalc. |
+| `full_recalc_invalidate_all` | 3.15 s | ~315 ns | Re-edit every input, recompute the whole workbook. |
 
-So lazily-zig backs a **full-capacity Google Sheets workbook**: build ~1.1 s,
+So lazily-zig backs a **full-capacity Google Sheets workbook**: build ~0.86 s,
 full cold recompute ~2.3 s, and a one-cell edit + bounded-viewport read stays in
-the **~6-7 µs** range — because the lazy pull-based model leaves off-viewport
+the **~10-11 µs** range — because the lazy pull-based model leaves off-viewport
 formulas dirty and never recomputes them (only ~2 formulas actually recompute
 per edit, regardless of sheet size — the property a viewport-rendered
 spreadsheet needs).
@@ -150,8 +150,8 @@ you create, so the `scale` group measures the populated-cell path that matters.
 
 ### A note on viewport scaling
 
-lazily-zig's viewport recalc is **effectively size-independent** — ~6.4 µs at
-2M cells and ~6.6 µs at 10M cells. This matches lazily-rs's flat curve (and is
+lazily-zig's viewport recalc is **effectively size-independent** — ~10.4 µs at
+2M cells and ~10.6 µs at 10M cells. This matches lazily-rs's flat curve (and is
 *better* than lazily-go, whose viewport grows from ~25 µs to ~103 µs with sheet
 size). Two reasons:
 
@@ -164,7 +164,7 @@ size). Two reasons:
    latency does not grow meaningfully with total sheet size — no per-node
    identity hashing over a multi-GB structure.
 
-The `~59,000×` / `~647,000×` speedups above are `full_recalc / viewport` for the
+The `~38,000×` / `~297,000×` speedups above are `full_recalc / viewport` for the
 respective sizes: a bounded-viewport edit never pays for the off-viewport sheet.
 
 ### Honest caveats
@@ -177,14 +177,17 @@ respective sizes: a bounded-viewport edit never pays for the off-viewport sheet.
 - **The scale graph uses the runtime-keyed `Slot` escape hatch**, not the
   idiomatic comptime-keyed `cell()`/`slot()` (which cannot model `N` distinct
   runtime-indexed nodes). The reactive semantics exercised — dependency
-  tracking, lazy destroy-on-invalidate, local fan-in, memoized warm reads — are
-  the real library paths.
-- **Allocator:** the scale bench uses an `ArenaAllocator` over
-  `page_allocator`, fresh per scenario. The library's `destroy`/`free` calls are
-  arena no-ops, so the churn scenarios (`viewport_recalc`,
-  `full_recalc_invalidate_all`) accumulate re-materialized slots into the arena;
-  rep counts are kept small for large `N` to stay within memory, and the arena
-  is torn down between scenarios.
+  tracking, invalidate-in-place (`#lzinplace`, v1.0.0), local fan-in, memoized
+  warm reads — are the real library paths.
+- **Allocator:** the scale bench uses an `ArenaAllocator` over `page_allocator`,
+  fresh per scenario (`cold_full_recalc` allocates a new arena **per rep**, so
+  its number is churn-free). Since `#lzinplace` (v1.0.0) invalidation recomputes
+  values in place rather than destroying and re-creating slots, the churn
+  scenarios (`viewport_recalc`, `full_recalc_invalidate_all`) no longer
+  re-allocate slots per rep — arena growth is bounded to the one-time
+  materialization, and `full_recalc_invalidate_all` takes the min over reps.
+  Rep counts are still kept small for large `N` to bound peak memory, and the
+  arena is torn down between scenarios.
 - **`build` materializes N nodes, not 2N**, because Zig has no
   register-without-compute; the remaining N formula nodes appear in
   `cold_full_recalc`. Per-cell figures still divide by `2N` for cross-language
@@ -417,10 +420,17 @@ read) rather than destroy-on-invalidate.
 ## Cross-language comparison (lazily-rs / lazily-cpp / lazily-zig)
 
 Head-to-head on the same spreadsheet-shaped workload (`N` input cells + `N`
-formula slots, `formula[i] = input[i] + input[i-1]`), measured on `x86_64`
-Linux. lazily-rs uses criterion; lazily-cpp uses its `std::chrono` harness;
-lazily-zig uses `clock_gettime(.MONOTONIC)` for the scale bench. Numbers are
-the current published results from each repo's `BENCHMARKS.md`.
+formula slots, `formula[i] = input[i] + input[i-1]`). lazily-rs uses criterion;
+lazily-cpp uses its `std::chrono` harness; lazily-zig uses
+`clock_gettime(.MONOTONIC)` for the scale bench. The scale tables below were
+**re-measured together on one reference machine** (AMD Ryzen 9 9950X3D, Linux),
+each bench pinned to a single core (`taskset -c 4`) and run **serially** so no
+run contends for L3 / memory bandwidth. rs reports the criterion median of 10
+samples; zig reports its internal min-of-8; cpp is a single clean run (±~15%
+run-to-run, per its convention). "Rows" = formula count `N`, so cells = `2N` and
+the two scale points are `N = 1,000,000` (2M cells) and `N = 5,000,000` (10M
+cells) — **the same 10M-cell workload for all three** (an earlier table compared
+cpp at 20M cells against rs/zig at 10M; that is corrected here).
 
 ### Micro-benchmarks (single-threaded `Context` unless noted)
 
@@ -448,30 +458,43 @@ section above.
 
 | Metric | lazily-rs | lazily-cpp | lazily-zig |
 |---|---:|---:|---:|
-| build (2N nodes) | 105 ms | 123 ms | 132 ms |
-| cold full recalc | 106 ms | 36 ms | 381 ms |
-| viewport recalc (edit 1, read 1k) | 4.5 µs | 35.1 µs | 6.4 µs |
+| build (2N nodes) | 124 ms | **97 ms** | 120 ms |
+| cold full recalc | 105 ms | **28 ms** | 275 ms |
+| full recalc (invalidate all) | 80 ms | **49 ms** | 403 ms |
+| viewport recalc (edit 1, read 1k) | **3.7 µs** | 23.2 µs | 10.4 µs |
 
 ### Scale — 10M cells (full Google Sheets workbook capacity)
 
+`N = 5,000,000` (5M inputs + 5M formulas = 10M cells) for all three.
+
 | Metric | lazily-rs | lazily-cpp | lazily-zig |
 |---|---:|---:|---:|
-| build | 706 ms | 1.41 s | 1.13 s |
-| cold full recalc | 518 ms | 415 ms | 2.26 s |
-| viewport recalc | 4.1 µs | 43.8 µs | 6.6 µs |
+| build | 718 ms | **520 ms** | 862 ms |
+| cold full recalc | 544 ms | **137 ms** | 2.29 s |
+| full recalc (invalidate all) | 398 ms | **243 ms** | 3.15 s |
+| viewport recalc | **3.8 µs** | 22.5 µs | 10.6 µs |
 
-**Honest read:** lazily-rs's monomorphized `Rc<T>` fast path leads the
-spreadsheet-scale **build** wall clock (leanest per-node storage) and — after
-its v0.22.2 `#lzslotfastpath` refresh fast path — delivers the **cheapest
-viewport reads** of the three (4.5 µs @ 1M, 4.1 µs @ 10M, undercutting
-lazily-zig's integer-keyed cache at 6.4/6.6 µs). lazily-cpp's v0.6.0 `SmallAny`
-inline value storage flipped the cold-recalc lead (36 ms vs lazily-rs 106 ms @
-1M). lazily-zig's cold/full recalc still trails because its keyed-escape-hatch
-graph materializes formula slots lazily on first read (so `cold_full_recalc`
-pays both allocation and compute — a definitional shift of work that lazily-cpp/
-rs charge partly to `build`) and every read hash-probes a global 2N-entry
-integer cache, and because the `ArenaAllocator` does not free churned slots
-between scenarios.
+> For reference, lazily-cpp also measures `N = 10,000,000` (20M cells): build
+> 1.02 s, cold full recalc 303 ms, full recalc 628 ms, viewport 24.7 µs. The old
+> cross-language table listed cpp's cold "415 ms" under "10M cells" — that was
+> actually this 20M-cell run; the true 10M-cell (5M-row) figure is **137 ms**.
+
+**Honest read:** lazily-cpp's v0.6.0 `SmallAny` inline value storage owns the
+**cold/full-recalc** wall clock (28 ms vs rs 105 ms @ 1M; 137 ms vs rs 544 ms @
+10M cells) and now also the leanest **build**. lazily-rs — after its v0.22.2
+`#lzslotfastpath` refresh fast path — delivers the **cheapest viewport reads** of
+the three (3.7 µs @ 1M, 3.8 µs @ 10M), because its pointer-referenced `Rc<T>`
+slots read by chase, not by hash probe; lazily-zig's integer-keyed cache pays a
+hash probe per read (10.4/10.6 µs). lazily-zig's cold/full recalc trails for two
+**definitional** reasons, not an efficiency bug: (1) its keyed-escape-hatch graph
+materializes formula slots lazily on first read, so `cold_full_recalc` pays
+*allocation + compute* together — work that lazily-cpp/rs already charged to
+`build`; and (2) every read hash-probes a global `2N`-entry integer cache, whose
+miss rate grows with `N` — which is why zig's v1.1.0 node-layout wins show up
+strongly at 1M (cold 381 → 275 ms, ~28% faster) but wash out at 10M cells (2.26 →
+2.29 s), where cache probing dominates the alloc savings. All three still exhibit
+the microsecond, size-independent **viewport** property — the property a
+viewport-rendered spreadsheet actually needs.
 
 > **Node-layout optimizations (`#lzinline` / `#lzedgeinline` / `#lzcachegop`).**
 > Profiling `cold_full_recalc` (Linux `perf`, ReleaseFast) put ~38% of
@@ -493,9 +516,10 @@ between scenarios.
 >
 > Effect: cold-recalc `ArenaAllocator.alloc` self-time drops from ~38% to ~17%
 > of samples (the edge-map `getOrPut → grow → allocate` chain falls from ~25% to
-> ~3%), for a measured ~8–12% cold-recalc wall-clock improvement on a pinned
-> core. The 1M/10M tables above predate these changes and should be re-measured
-> on the reference machine before the next cross-language sync.
+> ~3%). The scale tables above are **re-measured post-v1.1.0** on the reference
+> machine: cold recalc improved 381 → 275 ms at 1M (~28%), but is flat at 10M
+> cells (2.26 → 2.29 s), where the global keyed-cache hash-probing — not
+> allocation — is the dominant cost and grows with `N`.
 
 lazily-cpp wins the high-fan-out micro-benchmarks via
 its `SmallFn`/`SmallVec` node layout. The **shared headline** across all three:
