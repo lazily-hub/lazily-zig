@@ -45,6 +45,14 @@ pub const Context = struct {
     // fields, bumped under `mutex` (no extra atomics). Use
     // `instrumentationSnapshot()` / `resetInstrumentation()`.
     instrumentation: Instrumentation = .{},
+    // Slots that were invalidated (stale) and subsequently removed from the
+    // cache by a reader detecting staleness. They are NOT freed immediately
+    // because a reader on another thread may hold a `*T` pointer into the
+    // slot's storage. They are freed at `Context.deinit`. This is the
+    // invalidate-in-place model (`#lzinplace`) — the fix for the
+    // destroy-on-invalidate UAF that caused SEGV under concurrent same-cell
+    // writes. Bounded by the number of invalidation cycles between deinits.
+    orphaned_slots: std.ArrayList(*Slot),
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
@@ -85,6 +93,7 @@ pub const Context = struct {
                 *Slot,
             ).init(allocator),
             .pending_recompute = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
+            .orphaned_slots = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
         };
         return ctx;
     }
@@ -100,6 +109,14 @@ pub const Context = struct {
         }
         self.cache.deinit();
         self.pending_recompute.deinit(self.allocator);
+
+        // Free orphaned slots (stale-removed from cache but kept alive because
+        // reader threads may hold storage pointers into them). At deinit, all
+        // readers are done — safe to free. (#lzinplace)
+        for (self.orphaned_slots.items) |slot| {
+            slot.destroySelf(false);
+        }
+        self.orphaned_slots.deinit(self.allocator);
 
         // Capture the post-deinit hook before freeing self: `destroy(self)`
         // deallocates the Context struct via `allocator`, and the hook owns
@@ -426,10 +443,13 @@ pub const Slot = struct {
         self.touchUnlocked();
     }
 
-    /// Slot.touchUnlocked expires self and expires all dependent Slots.
-    /// See Slot.subscribeChange and Slot.emitChangeUnlocked.
+    /// Slot.touchUnlocked marks self stale and cascades to all dependents.
+    /// See `invalidateSlotUnlocked`. Invalidate-in-place (`#lzinplace`): the
+    /// slot is NOT freed — its storage pointer stays valid for readers on
+    /// other threads. The slot is refreshed (removed from cache + recreated)
+    /// on the next read via `slotKeyed`'s stale check.
     pub fn touchUnlocked(self: *Slot) void {
-        self.destroyUnlocked(true);
+        self.invalidateSlotUnlocked();
     }
 
     /// Thread-safe call to Slot.emitChangeUnlocked.
@@ -450,7 +470,10 @@ pub const Slot = struct {
     /// For each dependent:
     /// - If `on_invalidate` is set (Signal-backed slot): call the hook (enqueue
     ///   for deferred recompute, mark stale). The slot is NOT destroyed.
-    /// - Otherwise: `destroyUnlocked(true)` as before (lazy invalidate).
+    /// - Otherwise: `invalidateSlotUnlocked()` — mark stale + cascade. The
+    ///   slot is NOT freed (invalidate-in-place, `#lzinplace`). Its storage
+    ///   pointer stays valid for readers on other threads. The slot is
+    ///   refreshed on the next read via `slotKeyed`'s stale check.
     pub fn emitChangeUnlocked(self: *Slot) void {
         const subscriber_count = self.change_subscribers.count();
         if (subscriber_count == 0) return;
@@ -478,7 +501,52 @@ pub const Slot = struct {
                 // Signal-backed slot: enqueue for deferred recompute, do NOT destroy.
                 hook(dependent_slot);
             } else {
-                dependent_slot.destroyUnlocked(true);
+                // Lazy slot: mark stale + cascade. Do NOT free (#lzinplace).
+                dependent_slot.invalidateSlotUnlocked();
+            }
+        }
+    }
+
+    /// Invalidate-in-place (`#lzinplace`): mark this slot stale and cascade to
+    /// all transitive dependents. Does NOT free the slot, does NOT remove it
+    /// from the cache. The slot's storage pointer stays valid for readers on
+    /// other threads. On the next read, `slotKeyed` detects staleness, removes
+    /// the slot from the cache (orphaning it), and creates a fresh slot via
+    /// `initKeyed`. The orphaned slot is freed at `Context.deinit`.
+    ///
+    /// This replaces the previous `destroyUnlocked(true)` call site in
+    /// `emitChangeUnlocked` and `touchUnlocked`. The destroy-on-invalidate
+    /// model freed slots whose storage pointers readers on other threads
+    /// held — a use-after-free that caused SEGV under concurrent same-cell
+    /// writes. Invalidate-in-place eliminates the UAF by never freeing during
+    /// invalidation.
+    pub fn invalidateSlotUnlocked(self: *Slot) void {
+        if (self.stale) return; // already stale — skip (prevents infinite cascade)
+        self.stale = true;
+
+        // Cascade: mark all dependents stale too (their values transitively
+        // depend on this slot's now-stale value). Same snapshot + clear +
+        // iterate pattern as emitChangeUnlocked.
+        const sub_count = self.change_subscribers.count();
+        if (sub_count == 0) return;
+
+        const subs = self.ctx.allocator.alloc(*Slot, sub_count) catch return;
+        defer self.ctx.allocator.free(subs);
+
+        var i: usize = 0;
+        var iter = self.change_subscribers.keyIterator();
+        while (iter.next()) |ptr| {
+            subs[i] = ptr.*;
+            i += 1;
+        }
+        self.change_subscribers.clearRetainingCapacity();
+
+        for (subs) |dependent_slot| {
+            _ = dependent_slot.parents.remove(self);
+            if (dependent_slot.on_invalidate) |hook| {
+                hook(dependent_slot);
+            } else {
+                dependent_slot.invalidateSlotUnlocked();
             }
         }
     }

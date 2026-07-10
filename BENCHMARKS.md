@@ -367,15 +367,52 @@ RwLock's reader-gate (a second ParkingMutex) limits scaling beyond N≈2 — a
 single-atomic rwsem design would scale further, sequenced as future work
 (matching lazily-cpp v0.4.0's `ScalableThreadSafeContext`).
 
-### Remaining concurrency issue (not fixed in v0.9.0)
+### ~~Remaining concurrency issue~~ — FIXED in v1.0.0
 
-The full `slot()` / `Cell.set` workload under concurrent same-cell writes still
-crashes (SEGV) after many iterations. The three fixes above (reentrant lock,
-destroySelf snapshot, slotKeyed defer) addressed the lock-level bugs, but the
-destroy-on-invalidate model itself has a deeper race: `emitChange` frees a
-dependent slot whose storage pointer was returned to a reader on another
-thread. The fix is invalidate-in-place (item #6 of the optimization plan —
-mark stale instead of free, refresh on next read), sequenced for v1.0.0.
+The destroy-on-invalidate UAF that caused SEGV under concurrent same-cell
+writes is **fixed** by invalidate-in-place (`#lzinplace`, v1.0.0). See the
+v1.0.0 optimizations section below.
+
+## Optimizations Applied (v1.0.0)
+
+v1.0.0 ships **invalidate-in-place** (`#lzinplace`) — the final concurrency
+fix that eliminates the destroy-on-invalidate UAF root cause. This is item #6
+of the optimization plan, completing the high-load concurrency story started
+in v0.8.0.
+
+1. **`Slot.invalidateSlotUnlocked()` (`context.zig`, `#lzinplace`) —**
+   replaces `destroyUnlocked(true)` in `emitChangeUnlocked` and
+   `touchUnlocked`. Marks the slot `stale = true` and cascades to all
+   transitive dependents (same snapshot + clear + iterate pattern). Does NOT
+   free the slot, does NOT remove it from the cache. The slot's storage
+   pointer stays valid for readers on other threads — eliminating the UAF
+   that caused SEGV when `emitChange` freed a slot whose `*T` pointer another
+   thread held.
+
+2. **Stale-slot refresh in `slotKeyed` (`slot.zig`) —** the cached-read path
+   now checks `cached_slot.stale`. If stale, the slot is removed from the
+   cache and appended to `ctx.orphaned_slots` (a zombie list). The caller
+   falls through to `initKeyed`, which creates a fresh slot. The orphaned
+   slot's memory is NOT freed (its storage pointer may be held by a reader);
+   it is freed at `Context.deinit`.
+
+3. **`Context.orphaned_slots` zombie list —** tracks stale-removed slots so
+   they can be safely freed at deinit. Bounded by the number of invalidation
+   cycles between deinits. For workloads with heavy churn (many invalidations
+   between deinits), a periodic compaction or arena-reset would reduce memory
+   growth — sequenced as future work.
+
+### Soak test — concurrent set+get (4 threads × 5000 iterations)
+
+The test `lazily/slot: concurrent set+get soak — invalidate-in-place` in
+`slot.zig` runs 4 threads each doing `Cell.set(i); slot.get()` for 5000
+iterations on a shared cell. Before `#lzinplace`, this SEGV'd after ~50–200
+iterations (the UAF). With invalidate-in-place, it completes all 20,000 ops
+with zero errors.
+
+This aligns lazily-zig's invalidation model with lazily-rs and lazily-py,
+which have always used invalidate-in-place (mark dirty, recompute on next
+read) rather than destroy-on-invalidate.
 
 ## Cross-language comparison (lazily-rs / lazily-cpp / lazily-zig)
 

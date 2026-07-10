@@ -67,12 +67,21 @@ pub fn slotKeyed(
         defer ctx.mutex.unlock();
 
         if (ctx.cache.get(cache_key)) |cached_slot| {
-            if (cached_slot.storage != null) {
+            if (cached_slot.storage != null and !cached_slot.stale) {
+                // Fresh cached value — return it.
                 const current_slot: ?*Slot = currentSlotFor(ctx);
                 if (current_slot) |child_slot| {
                     try cached_slot.subscribeChangeUnlocked(child_slot);
                 }
                 return cached_slot.get(T);
+            }
+            // Stale slot in cache — remove + orphan it so initKeyed creates
+            // a fresh slot. The orphaned slot is NOT freed (#lzinplace): its
+            // storage pointer may be held by a reader on another thread.
+            // It's freed at Context.deinit.
+            if (cached_slot.stale) {
+                _ = ctx.cache.remove(cache_key);
+                ctx.orphaned_slots.append(ctx.allocator, cached_slot) catch {};
             }
         }
     }
@@ -90,6 +99,14 @@ pub fn slotKeyed(
 }
 
 const SlotError = error{MissingStorage};
+
+/// Test helper: assert a slot exists in the cache and is stale.
+/// Used after touch/emitChange to verify invalidate-in-place (#lzinplace).
+fn expectStale(ctx: *Context, fnc: anytype) !void {
+    if (ctx.getSlot(fnc)) |s| {
+        try std.testing.expect(s.stale);
+    } else return error.TestExpectedStaleSlot;
+}
 
 pub fn deinitSlotValue(
     comptime T: type,
@@ -258,8 +275,10 @@ test "lazily/slot.Slot.emitChange" {
     }
 
     try std.testing.expect(ctx.getSlot(getFoo) != null);
-    try std.testing.expectEqual(null, ctx.getSlot(getBar));
-    try std.testing.expectEqual(null, ctx.getSlot(getBaz));
+    // emitChange invalidates dependents in-place (#lzinplace): bar/baz stay
+    // in cache but are marked stale (not destroyed/removed as before).
+    try expectStale(ctx, getBar);
+    try expectStale(ctx, getBaz);
     try expectEventLog(ctx, "baz|bar|foo|");
 
     try std.testing.expectEqual(11, (try baz(ctx)).*);
@@ -326,9 +345,10 @@ test "lazily/slot.Slot.touch" {
         return error.FooNotFound;
     }
 
-    try std.testing.expectEqual(null, ctx.getSlot(getFoo));
-    try std.testing.expectEqual(null, ctx.getSlot(getBar));
-    try std.testing.expectEqual(null, ctx.getSlot(getBaz));
+    // touch invalidates foo + cascades to bar, baz (#lzinplace: stale, not freed)
+    try expectStale(ctx, getFoo);
+    try expectStale(ctx, getBar);
+    try expectStale(ctx, getBaz);
     try expectEventLog(ctx, "baz|bar|foo|");
 
     try std.testing.expectEqual(11, (try baz(ctx)).*);
@@ -395,11 +415,11 @@ test "lazily/slot.Slot destroy/unsubscribe soak — diamond DAG" {
             return error.SrcNotFound;
         }
 
-        // Whole graph torn down each cycle — no survivors, no double-destroy.
-        try std.testing.expectEqual(null, ctx.getSlot(getSrc));
-        try std.testing.expectEqual(null, ctx.getSlot(getLeft));
-        try std.testing.expectEqual(null, ctx.getSlot(getRight));
-        try std.testing.expectEqual(null, ctx.getSlot(getSink));
+        // Whole graph invalidated each cycle (#lzinplace: stale, not freed)
+        try expectStale(ctx, getSrc);
+        try expectStale(ctx, getLeft);
+        try expectStale(ctx, getRight);
+        try expectStale(ctx, getSink);
     }
 }
 
@@ -466,10 +486,11 @@ test "lazily/slot.Slot.emitChange soak — multi-subscriber invalidation" {
         }
 
         try std.testing.expect(ctx.getSlot(getSrc) != null);
-        try std.testing.expectEqual(null, ctx.getSlot(getA));
-        try std.testing.expectEqual(null, ctx.getSlot(getB));
-        try std.testing.expectEqual(null, ctx.getSlot(getC));
-        try std.testing.expectEqual(null, ctx.getSlot(getAgg));
+        // emitChange invalidates dependents in-place (#lzinplace)
+        try expectStale(ctx, getA);
+        try expectStale(ctx, getB);
+        try expectStale(ctx, getC);
+        try expectStale(ctx, getAgg);
     }
 }
 
@@ -531,5 +552,87 @@ test "lazily/slot: cached read under 4-thread contention" {
     for (threads) |t| t.join();
 
     try std.testing.expectEqual(@as(u32, @intCast(n_threads)), done.load(.seq_cst));
+    if (err) |e| return e;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: set+get under N-thread contention (#lzinplace soak)
+//
+// The destroy-on-invalidate UAF regression test. Before #lzinplace, N threads
+// concurrently calling Cell.set + slot.get on the same cell caused SEGV after
+// many iterations: emitChange freed a slot whose storage pointer another
+// thread held. With invalidate-in-place (mark stale, don't free), the slot
+// stays alive — no UAF. This test runs 4 threads × 5000 iterations each as a
+// soak. If it completes without error, the fix holds.
+// ---------------------------------------------------------------------------
+
+fn getSourceU32(_: *Context) anyerror!u32 {
+    return 0;
+}
+
+fn getDerivedU32(c: *Context) anyerror!u32 {
+    const CellMod = @import("cell.zig");
+    const s = try CellMod.cell(u32, c, getSourceU32, null);
+    return s.get() +% 1;
+}
+
+const SetGetArgs = struct {
+    ctx: *Context,
+    barrier: *std.atomic.Value(i32),
+    ops: *std.atomic.Value(u64),
+    err: *?anyerror,
+};
+
+fn setGetWorker(args: *SetGetArgs) void {
+    _ = args.barrier.fetchSub(1, .seq_cst);
+    while (args.barrier.load(.acquire) > 0) std.atomic.spinLoopHint();
+
+    const ctx = args.ctx;
+    const CellMod = @import("cell.zig");
+    const c = CellMod.cell(u32, ctx, getSourceU32, null) catch |e| {
+        args.err.* = e;
+        return;
+    };
+
+    var i: u32 = 0;
+    const iters: u32 = 5000;
+    while (i < iters) : (i += 1) {
+        c.set(i);
+        _ = slot(u32, ctx, getDerivedU32, null) catch |e| {
+            args.err.* = e;
+            return;
+        };
+    }
+    _ = args.ops.fetchAdd(iters, .monotonic);
+}
+
+test "lazily/slot: concurrent set+get soak — invalidate-in-place (#lzinplace)" {
+    const ctx = try Context.init(std.heap.page_allocator);
+    defer ctx.deinit();
+    // Prime the cell + derived slot.
+    const CellMod = @import("cell.zig");
+    _ = try CellMod.cell(u32, ctx, getSourceU32, null);
+    _ = try slot(u32, ctx, getDerivedU32, null);
+
+    const n_threads: usize = 4;
+    var barrier = std.atomic.Value(i32).init(@intCast(n_threads));
+    var ops = std.atomic.Value(u64).init(0);
+    var err: ?anyerror = null;
+
+    var args = SetGetArgs{
+        .ctx = ctx,
+        .barrier = &barrier,
+        .ops = &ops,
+        .err = &err,
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, setGetWorker, .{&args});
+    }
+    for (threads) |t| t.join();
+
+    // All 4 threads × 5000 iterations should complete without SEGV.
+    try std.testing.expectEqual(@as(u64, 20_000), ops.load(.monotonic));
     if (err) |e| return e;
 }
