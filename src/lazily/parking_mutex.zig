@@ -92,31 +92,32 @@ pub const ParkingMutex = struct {
             atomic.spinLoopHint();
         }
 
-        // Park path. `state` always reflects the actual memory value observed
-        // and that cmpxchg is expected to match. `new` is what we write:
-        //   - if memory is UNLOCKED, acquire as LOCKED (no waiters to flag)
-        //   - if memory is LOCKED or CONTESTED, arm CONTESTED so an unlocker
-        //     sees waiters and issues a wake syscall.
-        // (An earlier version "optimistically" rewrote `state = LOCKED` after
-        // observing UNLOCKED; that corrupted the local invariant — `new` was
-        // then computed as CONTESTED while memory was still 0, so cmpxchg
-        // looped forever. `state` must stay the honest observed value.)
-        var state = self.state.load(.monotonic);
-        while (true) {
-            const new: u32 = if (state == UNLOCKED) LOCKED else CONTESTED;
-            if (self.state.cmpxchgWeak(state, new, .acquire, .monotonic)) |observed| {
-                // cmpxchg failed; memory was `observed`, not `state`. Retry.
-                state = observed;
-                continue;
-            }
-            // cmpxchg succeeded: memory is now `new`.
-            if (new == LOCKED) return; // we acquired uncontended
-            // new == CONTESTED: we flagged a waiter. Park until woken.
-            // The kernel gates the sleep on state == CONTESTED; if an unlocker
-            // raced ahead, futex returns EAGAIN immediately and we retry.
+        // Park path — the canonical 3-state futex mutex (Drepper, "Futexes Are
+        // Tricky" §2; the glibc low-level-lock design). Once we enter the slow
+        // path we acquire the lock by *swapping in CONTESTED*, never LOCKED: a
+        // slow-path acquirer cannot know whether other waiters are still
+        // parked, so it conservatively leaves the CONTESTED flag set. `unlock`
+        // then always issues a wake (its `swap` returns 2, not 1), so wakeups
+        // chain one waiter at a time and none is ever stranded.
+        //
+        // The previous version acquired as LOCKED when it observed UNLOCKED
+        // from the wait path (`if (new == LOCKED) return`). That dropped the
+        // CONTESTED flag: with ≥2 waiters parked, waking one — which then
+        // re-acquired as LOCKED — meant its eventual `unlock` saw LOCKED and
+        // skipped the wake, stranding the co-parked waiter forever. That is the
+        // N-thread-contention deadlock (slot/cell thread-safe soaks hung in
+        // `futex_wait` at 0% CPU). Acquiring as CONTESTED costs at most one
+        // spurious wake syscall when we were in fact the last waiter — the
+        // standard, correct trade.
+        //
+        // `swap(CONTESTED)` returns the prior state:
+        //   - UNLOCKED → the lock was free; we now own it (state left CONTESTED).
+        //   - LOCKED / CONTESTED → still held; park until woken, then retry. The
+        //     swap has already re-armed CONTESTED, so `futex_wait` gates on it;
+        //     if an unlocker raced ahead (state→UNLOCKED) the wait returns
+        //     EAGAIN immediately and we re-swap.
+        while (self.state.swap(CONTESTED, .acquire) != UNLOCKED) {
             self.waitOnContended();
-            // After wake (or spurious return): re-examine memory and retry.
-            state = self.state.load(.monotonic);
         }
     }
 
@@ -220,7 +221,9 @@ pub const ReentrantMutex = struct {
 };
 
 /// Returns the current thread's OS-level ID as a `usize`. Used as the
-/// reentrant-mutex owner token.
+/// reentrant-mutex owner token. `std.Thread.getCurrentId()` already caches the
+/// tid in a thread-local after the first `gettid()`, so this is a TLS read on
+/// the hot path — no per-acquire syscall.
 fn currentThreadId() usize {
     return @intCast(std.Thread.getCurrentId());
 }

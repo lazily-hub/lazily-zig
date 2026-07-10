@@ -447,8 +447,18 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
         try std.testing.expectEqualStrings("You", (try name(ctx)).get());
     }
     try std.testing.expect(ctx.getSlot(getName) != null);
-    try std.testing.expectEqual(null, ctx.getSlot(getGreeting));
-    try std.testing.expectEqual(null, ctx.getSlot(getGreetingAndResponse));
+    // Invalidate-in-place (`#lzinplace`, v1.0.0): setting `name` invalidates its
+    // dependents (`greeting`, and transitively `greetingAndResponse`) in place
+    // — they stay in the cache marked STALE rather than being removed, and are
+    // refreshed on the next read. (Pre-#lzinplace this asserted the dependent
+    // slots were absent from the cache; that model freed slots whose storage a
+    // concurrent reader could still hold — the destroy-on-invalidate UAF.)
+    if (ctx.getSlot(getGreeting)) |s| {
+        try std.testing.expect(s.stale);
+    } else return error.TestExpectedStaleGreeting;
+    if (ctx.getSlot(getGreetingAndResponse)) |s| {
+        try std.testing.expect(s.stale);
+    } else return error.TestExpectedStaleGreetingAndResponse;
     try expectEventLog(ctx, "greeting|hello|name|greetingAndResponse|response|");
 
     var greeting_slot = try getGreeting(ctx);
