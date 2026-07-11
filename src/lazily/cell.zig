@@ -524,13 +524,71 @@ test "lazily/cell.Cell: batch coalesces eager recomputes into one flush" {
     try std.testing.expectEqual(@as(usize, 2), BatchState.runs.load(.seq_cst));
 }
 
+/// A thread-safe allocator for the `Cell` contention soak below.
+/// `std.heap.ThreadSafeAllocator` was removed in Zig 0.16, so on 0.16+ this is a
+/// minimal mutex-wrapped shim over a child allocator; on <0.16 it defers to the
+/// std type. Wrapping `std.testing.allocator` keeps leak detection while making
+/// concurrent allocation (from the soak's N threads, some outside the graph
+/// lock) safe. Selected at comptime by feature-detecting the std decl.
+const ThreadSafeTestAllocator = if (@hasDecl(std.heap, "ThreadSafeAllocator"))
+    struct {
+        inner: std.heap.ThreadSafeAllocator,
+        fn init(child: std.mem.Allocator) @This() {
+            return .{ .inner = .{ .child_allocator = child } };
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return self.inner.allocator();
+        }
+    }
+else
+    struct {
+        child: std.mem.Allocator,
+        // std.Thread.Mutex was removed alongside ThreadSafeAllocator in 0.16;
+        // use the repo's futex-backed ParkingMutex.
+        mutex: @import("parking_mutex.zig").ParkingMutex = .{},
+
+        fn init(child: std.mem.Allocator) @This() {
+            return .{ .child = child };
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+        const vtable: std.mem.Allocator.VTable = .{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        };
+        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.child.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.child.rawResize(memory, alignment, new_len, ret_addr);
+        }
+        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.child.rawFree(memory, alignment, ret_addr);
+        }
+    };
+
 test "lazily/cell.thread_safe Cell updates" {
     if (!build_options.thread_safe) return error.SkipZigTest;
-    if (builtin.zig_version.minor >= 16) return error.SkipZigTest; // ThreadSafeAllocator removed in 0.16
 
-    var ts_allocator = std.heap.ThreadSafeAllocator{
-        .child_allocator = std.testing.allocator,
-    };
+    var ts_allocator = ThreadSafeTestAllocator.init(std.testing.allocator);
     const allocator = ts_allocator.allocator();
 
     const ctx = try Context.init(allocator);
