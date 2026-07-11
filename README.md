@@ -22,7 +22,7 @@ notes and platform carve-outs lives in
 | Feature | Rust | Python | Kotlin | JS | Dart | Zig | Go | C++ |
 | --------- | :----: | :------: | :------: | :--: | :----: | :---: | :--: | :---: |
 | Reactive graph — `Cell` / `Slot` / `Signal` / `Effect` / memo / batch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Reactive family (`ReactiveFamily`) — keyed cell/slot family + materialization mode (`#lzmatmode`) | ✅ | — | ✅ | ✅ | — | — | — | ✅ |
+| Reactive family (`ReactiveFamily`) — keyed cell/slot family + materialization mode (`#lzmatmode`) | ✅ | — | ✅ | ✅ | — | ✅ | — | ✅ |
 | Thread-safe context (lock-backed) | ✅ | ✅ | ✅ | — | — | ✅ | ✅ | ✅ |
 | Async reactive context | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Flat state machine | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -64,6 +64,7 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/context.zig` | Reactive `Context` (lazy cache + mutex), `Slot`, `TrackingFrame`, `Context.batch(run)` boundary, and always-on `Instrumentation` counters (`node_allocations`, `slot_recomputes`, `dependency_edges_*`, `effect_queue_*`). |
 | `src/lazily/cell.zig` / `signal.zig` / `effect.zig` | `Cell` / `Signal` (eager, memo-guarded) / `Effect` (scheduled side effect) — the 4 reactive primitives. |
 | `src/lazily/collection.zig` | `CellMap` / `CellFamily` with atomic move and three-signal (value/membership/order) independence. |
+| `src/lazily/reactive_family.zig` | `ReactiveFamily` — unified keyed reactive family (`#lzmatmode`) over a comptime `EntryKind` (`cell` input / `slot` derived) + `MaterializationMode` (eager default / lazy opt-in). Observationally transparent eager vs lazy; deferral-not-deallocation present-set monotonicity; entry-kind orthogonal to mode. Replays `../lazily-spec/conformance/materialization/*.json`. |
 | `src/lazily/cell_tree.zig` | `CellTree` — ordered keyed tree composing `CellMap` per level (atomic child move, per-level reactivity). |
 | `src/lazily/reconcile.zig` | LIS-move-minimized keyed reconciliation op-set (`DiffOp`, `reconcile`, `longestIncreasingSubsequence`). |
 | `src/lazily/sem_tree.zig` | `SemTree` — memoized semantic tree; an edit recomputes only the ancestor chain (sibling isolation + memo guard). |
