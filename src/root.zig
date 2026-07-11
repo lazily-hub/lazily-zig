@@ -140,10 +140,15 @@ pub const signaling = @import("./lazily/signaling.zig");
 pub const ClientMessage = signaling.ClientMessage;
 pub const ServerMessage = signaling.ServerMessage;
 pub const SignalingRoom = signaling.SignalingRoom;
+pub const thread_safe_context = @import("./lazily/thread_safe_context.zig");
+pub const ThreadSafeContext = thread_safe_context.ThreadSafeContext;
+pub const TsHandle = thread_safe_context.TsHandle;
 pub const async_context = @import("./lazily/async_context.zig");
+/// Generic async reactive context: `AsyncContext(V)` per value type. Nested
+/// `AsyncContext(V).ComputeContext` replaces the old top-level `AsyncComputeContext`.
 pub const AsyncContext = async_context.AsyncContext;
 pub const AsyncSlotState = async_context.AsyncSlotState;
-pub const AsyncComputeContext = async_context.AsyncComputeContext;
+pub const AsyncSlotHandle = async_context.AsyncSlotHandle;
 pub const lossless_tree = @import("./lazily/lossless_tree.zig");
 pub const LosslessTreeCrdt = lossless_tree.LosslessTreeCrdt;
 pub const TreeSortKey = lossless_tree.SortKey;

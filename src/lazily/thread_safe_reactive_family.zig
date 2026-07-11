@@ -28,7 +28,9 @@
 
 const std = @import("std");
 const ParkingMutex = @import("parking_mutex.zig").ParkingMutex;
-const Context = @import("context.zig").Context;
+const tsc = @import("thread_safe_context.zig");
+const ThreadSafeContext = tsc.ThreadSafeContext;
+const TsHandle = tsc.TsHandle;
 const reactive_family = @import("reactive_family.zig");
 
 pub const MaterializationMode = reactive_family.MaterializationMode;
@@ -53,21 +55,23 @@ fn HashMapFor(comptime K: type, comptime V: type) type {
 /// and materialization confluence.
 pub fn ThreadSafeReactiveFamily(comptime K: type, comptime V: type, comptime entry_kind: EntryKind) type {
     return struct {
-        /// Owning context (its allocator backs the present-set storage).
-        ctx: *Context,
+        /// The shared reactive context every family entry's cell lives in — the
+        /// family rides on it (its thread-safety derives from the context + the
+        /// present-set `mutex`, exactly like lazily-rs `ThreadSafeReactiveFamily`
+        /// over `ThreadSafeContext`).
+        tsctx: *ThreadSafeContext,
         /// This family's materialization mode (immutable after build).
         mode: MaterializationMode,
-        /// Canonical per-key value producer (a pure factory — no captured
-        /// context reads, so it needs no lock of its own).
+        /// Canonical per-key value producer (a pure factory).
         factory: Factory(K, V),
-        /// Currently-allocated entries (the "present" set) and their cached
-        /// value. Guarded by `mutex`; grows on materialize, never shrinks.
-        materialized: HashMapFor(K, V),
+        /// Present set: key → the handle of its reactive cell in `tsctx`.
+        /// Guarded by `mutex`; grows on materialize, never shrinks.
+        materialized: HashMapFor(K, TsHandle(V)),
         /// First-materialization order of the present set. Guarded by `mutex`.
         order: std.ArrayList(K),
         allocator: std.mem.Allocator,
-        /// Serializes every present-set access. The confluence proof is what
-        /// lets one lock guard the whole value axis.
+        /// Serializes the present-set map (`tsctx` serializes the cells). The
+        /// confluence proof is what lets one lock guard the whole value axis.
         mutex: ParkingMutex,
 
         const Self = @This();
@@ -76,18 +80,18 @@ pub fn ThreadSafeReactiveFamily(comptime K: type, comptime V: type, comptime ent
         pub const kind: EntryKind = entry_kind;
 
         fn build(
-            ctx: *Context,
+            tsctx: *ThreadSafeContext,
             mode: MaterializationMode,
             keys: []const K,
             factory: Factory(K, V),
         ) !Self {
             var self = Self{
-                .ctx = ctx,
+                .tsctx = tsctx,
                 .mode = mode,
                 .factory = factory,
-                .materialized = HashMapFor(K, V).init(ctx.allocator),
+                .materialized = HashMapFor(K, TsHandle(V)).init(tsctx.allocator),
                 .order = .empty,
-                .allocator = ctx.allocator,
+                .allocator = tsctx.allocator,
                 .mutex = ParkingMutex.init(),
             };
             for (keys) |key| {
@@ -95,7 +99,7 @@ pub fn ThreadSafeReactiveFamily(comptime K: type, comptime V: type, comptime ent
                 // entry only under eager. (No lock needed at build: no other
                 // thread can observe the family before it is returned.)
                 if (entry_kind == .cell or mode == .eager) {
-                    try self.materializeKeyLocked(key);
+                    _ = try self.materializeKeyLocked(key);
                 }
             }
             return self;
@@ -103,19 +107,19 @@ pub fn ThreadSafeReactiveFamily(comptime K: type, comptime V: type, comptime ent
 
         /// Build an **eager** family: every declared key's node is allocated now
         /// ([`MaterializationMode.eager`], the default).
-        pub fn eager(ctx: *Context, keys: []const K, factory: Factory(K, V)) !Self {
-            return build(ctx, .eager, keys, factory);
+        pub fn eager(tsctx: *ThreadSafeContext, keys: []const K, factory: Factory(K, V)) !Self {
+            return build(tsctx, .eager, keys, factory);
         }
 
         /// Build a **lazy** family: derived (slot) entries are deferred to first
         /// read; input (cell) entries in `keys` are still materialized at build.
-        pub fn lazy(ctx: *Context, keys: []const K, factory: Factory(K, V)) !Self {
-            return build(ctx, .lazy, keys, factory);
+        pub fn lazy(tsctx: *ThreadSafeContext, keys: []const K, factory: Factory(K, V)) !Self {
+            return build(tsctx, .lazy, keys, factory);
         }
 
         /// Build a family in the **default** mode (eager). Alias for [`eager`].
-        pub fn new(ctx: *Context, keys: []const K, factory: Factory(K, V)) !Self {
-            return eager(ctx, keys, factory);
+        pub fn new(tsctx: *ThreadSafeContext, keys: []const K, factory: Factory(K, V)) !Self {
+            return eager(tsctx, keys, factory);
         }
 
         pub fn deinit(self: *Self) void {
@@ -123,23 +127,26 @@ pub fn ThreadSafeReactiveFamily(comptime K: type, comptime V: type, comptime ent
             self.materialized.deinit();
         }
 
-        /// Materialize `key` if absent, caching its canonical value and recording
-        /// first-materialization order. Caller MUST hold `mutex` (or be building).
-        /// A warm key is a no-op — the present set only grows.
-        fn materializeKeyLocked(self: *Self, key: K) !void {
-            if (self.materialized.contains(key)) return; // warm: already allocated.
-            const value = self.factory.call(key);
-            try self.materialized.put(key, value);
+        /// Materialize `key` if absent: allocate a real reactive cell in `tsctx`
+        /// seeded with the canonical value, record it + first-materialization
+        /// order, and return its handle. Caller MUST hold `mutex` (or be
+        /// building). A warm key returns the cached handle — the present set only
+        /// grows.
+        fn materializeKeyLocked(self: *Self, key: K) !TsHandle(V) {
+            if (self.materialized.get(key)) |h| return h; // warm.
+            const handle = try self.tsctx.cell(V, self.factory.call(key));
+            try self.materialized.put(key, handle);
             try self.order.append(self.allocator, key);
+            return handle;
         }
 
-        /// Get `key`'s value, materializing it on first access (the lazy pull)
-        /// under the lock. Under eager an entry is already present.
+        /// Get `key`'s value, materializing its cell on first access (the lazy
+        /// pull) under the lock. Under eager an entry is already present.
         pub fn get(self: *Self, key: K) !V {
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.materializeKeyLocked(key);
-            return self.materialized.get(key).?;
+            const handle = try self.materializeKeyLocked(key);
+            return self.tsctx.getCell(V, handle);
         }
 
         /// Observe `key`'s value — the transparency law: identical under either
@@ -148,15 +155,15 @@ pub fn ThreadSafeReactiveFamily(comptime K: type, comptime V: type, comptime ent
             return self.get(key);
         }
 
-        /// Overwrite an input **cell** entry's value (cells are writable inputs).
-        /// Materializes the entry if absent, then caches the new value without
-        /// re-ordering. Compile error on a slot family.
+        /// Overwrite an input **cell** entry's value (cells are writable inputs)
+        /// through the reactive context, so dependents recompute. Materializes the
+        /// entry if absent. Compile error on a slot family.
         pub fn set(self: *Self, key: K, value: V) !void {
             if (entry_kind != .cell) @compileError("ThreadSafeReactiveFamily.set is only valid on cell (input) families");
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.materializeKeyLocked(key);
-            try self.materialized.put(key, value);
+            const handle = try self.materializeKeyLocked(key);
+            self.tsctx.setCell(V, handle, value);
         }
 
         /// Whether `key` is currently materialized (present). Non-reactive.
@@ -237,9 +244,9 @@ test "lazily/thread_safe_reactive_family: default mode is eager" {
 }
 
 test "lazily/thread_safe_reactive_family: eager cell family materializes all at build" {
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var fam = try CellFamBool.eager(ctx, &.{ 1, 2, 3 }, Factory(u32, bool).pure(alwaysTrue));
+    var fam = try CellFamBool.eager(&ctx, &.{ 1, 2, 3 }, Factory(u32, bool).pure(alwaysTrue));
     defer fam.deinit();
 
     try testing.expectEqual(EntryKind.cell, fam.entryKind());
@@ -253,9 +260,9 @@ test "lazily/thread_safe_reactive_family: eager cell family materializes all at 
 }
 
 test "lazily/thread_safe_reactive_family: lazy slot family defers until read" {
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var fam = try SlotFam.lazy(ctx, &.{}, Factory(u32, u32).pure(timesTen));
+    var fam = try SlotFam.lazy(&ctx, &.{}, Factory(u32, u32).pure(timesTen));
     defer fam.deinit();
 
     try testing.expectEqual(MaterializationMode.lazy, fam.mode);
@@ -267,19 +274,19 @@ test "lazily/thread_safe_reactive_family: lazy slot family defers until read" {
 }
 
 test "lazily/thread_safe_reactive_family: lazy cell entries still materialize at build" {
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var fam = try CellFamBool.lazy(ctx, &.{ 7, 8 }, Factory(u32, bool).pure(alwaysTrue));
+    var fam = try CellFamBool.lazy(&ctx, &.{ 7, 8 }, Factory(u32, bool).pure(alwaysTrue));
     defer fam.deinit();
     try testing.expectEqual(@as(usize, 2), fam.presentCount());
 }
 
 test "lazily/thread_safe_reactive_family: observational transparency eager == lazy" {
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var eager_fam = try SlotFam.eager(ctx, &.{ 1, 2, 3 }, Factory(u32, u32).pure(timesTwo));
+    var eager_fam = try SlotFam.eager(&ctx, &.{ 1, 2, 3 }, Factory(u32, u32).pure(timesTwo));
     defer eager_fam.deinit();
-    var lazy_fam = try SlotFam.lazy(ctx, &.{ 1, 2, 3 }, Factory(u32, u32).pure(timesTwo));
+    var lazy_fam = try SlotFam.lazy(&ctx, &.{ 1, 2, 3 }, Factory(u32, u32).pure(timesTwo));
     defer lazy_fam.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| {
         try testing.expectEqual(try eager_fam.observe(k), try lazy_fam.observe(k));
@@ -287,9 +294,9 @@ test "lazily/thread_safe_reactive_family: observational transparency eager == la
 }
 
 test "lazily/thread_safe_reactive_family: present set grows monotonically" {
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var fam = try SlotFam.lazy(ctx, &.{}, Factory(u32, u32).pure(identity));
+    var fam = try SlotFam.lazy(&ctx, &.{}, Factory(u32, u32).pure(identity));
     defer fam.deinit();
     _ = try fam.observe(5);
     _ = try fam.observe(5); // repeat: no growth
@@ -301,9 +308,9 @@ test "lazily/thread_safe_reactive_family: present set grows monotonically" {
 }
 
 test "lazily/thread_safe_reactive_family: cell family set overwrites value in place" {
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var fam = try CellFamBool.eager(ctx, &.{ 10, 20 }, Factory(u32, bool).pure(alwaysTrue));
+    var fam = try CellFamBool.eager(&ctx, &.{ 10, 20 }, Factory(u32, bool).pure(alwaysTrue));
     defer fam.deinit();
     try testing.expectEqual(true, try fam.observe(20));
     try fam.set(20, false);
@@ -334,9 +341,9 @@ const Soak = struct {
 
 test "lazily/thread_safe_reactive_family: concurrent materialization is confluent" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    const ctx = try Context.init(testing.allocator);
+    var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var fam = try SlotFam.lazy(ctx, &.{}, Factory(u32, u32).pure(timesTwo));
+    var fam = try SlotFam.lazy(&ctx, &.{}, Factory(u32, u32).pure(timesTwo));
     defer fam.deinit();
 
     const N = 4;
