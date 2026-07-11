@@ -35,12 +35,90 @@ pub const CapabilityHandshake = struct {
     }
 };
 
+/// Which pluggable blob backend resolves a descriptor (zero-copy transport,
+/// `#lzzcpy`). Mirrors lazily-rs `BlobBackendKind` and lazily-go
+/// `BlobBackendKind`. The discriminant order (`shm=0`, `arrow=1`, `in_process=2`)
+/// is the `BlobRouter` slot index — a receiver routes resolution by this kind
+/// (the `resolve_wrong_backend` theorem). `shm` is the default so every legacy
+/// descriptor (no `backend` field on the wire) validates unchanged.
+pub const BlobBackendKind = enum(u2) {
+    /// POSIX shared-memory region (`shm_open` + `mmap`) — the default,
+    /// cross-process on one host.
+    shm = 0,
+    /// Apache Arrow IPC stream bytes — columnar/analytics payloads.
+    arrow = 1,
+    /// In-process arena (single address space — FFI host ↔ same-process binding).
+    in_process = 2,
+
+    /// The wire discriminator string (`schemas/defs.json#/$defs/ShmBlobRef`).
+    pub fn toString(self: BlobBackendKind) []const u8 {
+        return switch (self) {
+            .shm => "shm",
+            .arrow => "arrow",
+            .in_process => "in_process",
+        };
+    }
+
+    /// Parse a wire discriminator string; unknown values normalize to `.shm`
+    /// (the backward-compatible default).
+    pub fn fromString(text: []const u8) BlobBackendKind {
+        if (std.mem.eql(u8, text, "arrow")) return .arrow;
+        if (std.mem.eql(u8, text, "in_process")) return .in_process;
+        return .shm;
+    }
+
+    /// Whether this is the default backend (`shm`) — omitted from the wire.
+    pub fn isDefault(self: BlobBackendKind) bool {
+        return self == .shm;
+    }
+
+    /// The `BlobRouter` slot index for this kind.
+    pub fn routerIndex(self: BlobBackendKind) usize {
+        return @intFromEnum(self);
+    }
+};
+
+/// Descriptor into a blob backend (zero-copy transport). The standard fields
+/// locate and integrity-check a byte range within the backend's resolved
+/// buffer; `backend` selects which pluggable backend resolves it. `backend` is
+/// optional on the wire and defaults to `.shm`, so legacy descriptors round-trip
+/// unchanged and the shared-memory blob path is a strict subset of the transport.
 pub const ShmBlobRef = struct {
     offset: u64,
     len: u64,
     generation: u64,
     epoch: u64,
     checksum: u64,
+    backend: BlobBackendKind = .shm,
+
+    /// Return a copy of this descriptor tagged with `kind`.
+    pub fn withBackend(self: ShmBlobRef, kind: BlobBackendKind) ShmBlobRef {
+        var out = self;
+        out.backend = kind;
+        return out;
+    }
+
+    /// Serialize as `{ offset, len, generation, epoch, checksum[, backend] }`.
+    /// `backend` is emitted only when non-default (`!= .shm`) so descriptors on
+    /// the shared-memory path serialize identically to the pre-transport form.
+    pub fn jsonStringify(self: ShmBlobRef, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("offset");
+        try jw.write(self.offset);
+        try jw.objectField("len");
+        try jw.write(self.len);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("epoch");
+        try jw.write(self.epoch);
+        try jw.objectField("checksum");
+        try jw.write(self.checksum);
+        if (!self.backend.isDefault()) {
+            try jw.objectField("backend");
+            try jw.write(self.backend.toString());
+        }
+        try jw.endObject();
+    }
 };
 
 /// Bytes reserved before every shared-memory blob payload (matches lazily-rs).
@@ -178,7 +256,12 @@ pub const ShmBlobArena = struct {
         }
 
         const header = try readHeader(self.bytes, offset);
-        if (!std.meta.eql(header, descriptor)) return error.DescriptorMismatch;
+        // The `backend` discriminator is a wire-only routing tag — the arena
+        // stores only the shared-memory header fields, so normalize it out of
+        // the descriptor before comparing against the reconstructed header.
+        var want = descriptor;
+        want.backend = .shm;
+        if (!std.meta.eql(header, want)) return error.DescriptorMismatch;
 
         const payload_offset = offset + SHM_BLOB_HEADER_LEN;
         const payload = self.bytes[payload_offset .. payload_offset + len];
@@ -213,7 +296,7 @@ fn readHeader(bytes: []const u8, offset: usize) ShmBlobArenaError!ShmBlobRef {
 }
 
 /// FNV-1a (64-bit) non-cryptographic checksum, matching lazily-rs.
-fn checksumFnv(payload: []const u8) u64 {
+pub fn checksumFnv(payload: []const u8) u64 {
     var hash: u64 = FNV_OFFSET_BASIS;
     for (payload) |b| hash = (hash ^ @as(u64, b)) *% FNV_PRIME;
     return hash;
@@ -951,12 +1034,17 @@ fn parseNodeOnlyOp(value: std.json.Value) !DeltaOp.NodeOnlyOp {
 }
 
 fn parseShmBlobRef(value: std.json.Value) !ShmBlobRef {
+    const backend: BlobBackendKind = if (objectGet(value, "backend")) |b|
+        BlobBackendKind.fromString(try asString(b))
+    else
+        .shm;
     return .{
         .offset = try asU64(try field(value, "offset")),
         .len = try asU64(try field(value, "len")),
         .generation = try asU64(try field(value, "generation")),
         .epoch = try asU64(try field(value, "epoch")),
         .checksum = try asU64(try field(value, "checksum")),
+        .backend = backend,
     };
 }
 
@@ -1083,6 +1171,45 @@ test "lazily/ipc: delta_shared_blob fixture" {
     try std.testing.expectEqual(@as(u64, 40), payload.offset);
     try std.testing.expectEqual(@as(u64, 17), payload.len);
     try std.testing.expectEqual(@as(u64, 9), payload.epoch);
+}
+
+test "lazily/ipc: delta_zero_copy_arrow fixture (backend discriminator)" {
+    var parsed = try assertFixtureRoundTripFromFile("delta_zero_copy_arrow.json");
+    defer parsed.deinit();
+    const message = parsed.message;
+    const delta = message.Delta;
+    const payload = delta.ops[0].SlotValue.payload.SharedBlob;
+    try std.testing.expectEqual(@as(u64, 40), payload.offset);
+    try std.testing.expectEqual(@as(u64, 17), payload.len);
+    try std.testing.expectEqual(@as(u64, 9), payload.epoch);
+    // The optional `backend` discriminator (#lzzcpy) routes this descriptor to
+    // the Apache Arrow backend rather than the default shared-memory backend.
+    try std.testing.expectEqual(BlobBackendKind.arrow, payload.backend);
+}
+
+test "lazily/ipc: ShmBlobRef backend defaults to shm and omits from wire" {
+    // A default-backend descriptor serializes without a `backend` field, so the
+    // shared-memory blob path is wire-identical to the pre-transport form.
+    const default_blob = ShmBlobRef{
+        .offset = 0,
+        .len = 4,
+        .generation = 1,
+        .epoch = 0,
+        .checksum = 123,
+    };
+    try std.testing.expectEqual(BlobBackendKind.shm, default_blob.backend);
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, default_blob, .{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "backend") == null);
+
+    // A non-default descriptor emits the discriminator.
+    const arrow_json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        default_blob.withBackend(.arrow),
+        .{},
+    );
+    defer std.testing.allocator.free(arrow_json);
+    try std.testing.expect(std.mem.indexOf(u8, arrow_json, "\"backend\":\"arrow\"") != null);
 }
 
 test "lazily/ipc: ShmBlobArena write/read round-trip" {

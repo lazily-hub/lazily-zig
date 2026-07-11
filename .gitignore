@@ -6,3 +6,4 @@ zig-out/
 .local
 *.iml
 
+.tsift/

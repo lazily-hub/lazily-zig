@@ -22,7 +22,7 @@ notes and platform carve-outs lives in
 | Feature | Rust | Python | Kotlin | JS | Dart | Zig | Go | C++ |
 | --------- | :----: | :------: | :------: | :--: | :----: | :---: | :--: | :---: |
 | Reactive graph — `Cell` / `Slot` / `Signal` / `Effect` / memo / batch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Reactive family (`ReactiveFamily`) — keyed cell/slot family + materialization mode (`#lzmatmode`) | ✅ | — | ✅ | ✅ | — | ✅ | — | ✅ |
+| Reactive family (`ReactiveFamily`) — keyed cell/slot family + materialization mode (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Thread-safe context (lock-backed) | ✅ | ✅ | ✅ | — | — | ✅ | ✅ | ✅ |
 | Async reactive context | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Flat state machine | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -40,7 +40,7 @@ notes and platform carve-outs lives in
 | Registers (LWW / MV) + `PnCounter` + `CellCrdt` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | IPC wire — `Snapshot` + `Delta` + `CrdtSync` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Shared-memory blob path (`ShmBlobArena`) | ✅ | ✅ | ✅ | ~ | ~ | ✅ | ✅ | ✅ |
-| Cross-process zero-copy transport (`BlobBackend` / shm / arrow) | ✅ | — | — | — | — | — | — | ✅ |
+| Cross-process zero-copy transport (`BlobBackend` / shm / arrow) | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ |
 | Distributed CRDT plane (`CrdtPlaneRuntime` / anti-entropy) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Distributed plane — WebRTC transport + signaling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | State projection / mirror | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -60,7 +60,8 @@ replayed by in-source deterministic tests in each module.
 
 | Module | Surface |
 |--------|---------|
-| `src/lazily/ipc.zig` | Shared lazily IPC wire types (`IpcMessage`, `Snapshot`, `Delta`, `DeltaOp`, `NodeSnapshot`, `NodeState`, `ShmBlobArena`, `CapabilityHandshake`, `CrdtSync`). Round-trips the canonical fixtures using the same externally-tagged JSON shape as lazily-rs. |
+| `src/lazily/ipc.zig` | Shared lazily IPC wire types (`IpcMessage`, `Snapshot`, `Delta`, `DeltaOp`, `NodeSnapshot`, `NodeState`, `ShmBlobArena`, `ShmBlobRef` with the optional `backend` discriminator, `CapabilityHandshake`, `CrdtSync`). Round-trips the canonical fixtures using the same externally-tagged JSON shape as lazily-rs. |
+| `src/lazily/transport.zig` | Cross-process zero-copy transport (`#lzzcpy`): the `BlobBackend` adapter seam (vtable), `InProcessBackend` (wraps `ShmBlobArena`), `ArrowBackend` (Arrow IPC stream bytes), `ShmBackend` (genuine POSIX `shm_open`+`mmap` region, Linux — cross-process), `spillValue`/`spillState`/`spillMessage` policy + `resolveValue`, and the receiver-side `BlobRouter` (routes a descriptor to the backend of its `backend` kind). The backend-agnostic laws (`resolve_write` identity, `resolve_wrong_backend`, ABA generation safety, checksum rejection) are proven in `../lazily-formal/LazilyFormal/ZeroCopyTransport.lean` and replayed as in-source tests. |
 | `src/lazily/context.zig` | Reactive `Context` (lazy cache + mutex), `Slot`, `TrackingFrame`, `Context.batch(run)` boundary, and always-on `Instrumentation` counters (`node_allocations`, `slot_recomputes`, `dependency_edges_*`, `effect_queue_*`). |
 | `src/lazily/cell.zig` / `signal.zig` / `effect.zig` | `Cell` / `Signal` (eager, memo-guarded) / `Effect` (scheduled side effect) — the 4 reactive primitives. |
 | `src/lazily/collection.zig` | `CellMap` / `CellFamily` with atomic move and three-signal (value/membership/order) independence. |
