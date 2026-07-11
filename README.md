@@ -23,6 +23,9 @@ notes and platform carve-outs lives in
 | --------- | :----: | :------: | :------: | :--: | :----: | :---: | :--: | :---: |
 | Reactive graph — `Cell` / `Slot` / `Signal` / `Effect` / memo / batch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Reactive family (`ReactiveFamily`) — keyed cell/slot family + materialization mode (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Thread-safe reactive family (`ThreadSafeReactiveFamily`) — `Send + Sync` keyed family + materialization confluence (`#lzmatmode`) | ✅ | — | — | — | — | ✅ | — | — |
+| Async reactive family (`AsyncReactiveFamily`) — keyed family + eventual transparency (`#lzmatmode`) | ✅ | — | — | — | — | ✅ | — | — |
+| Reactive family sync — membership propagation + materialize-on-ingest + derived-aggregate transparency (`#lzfamilysync`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
 | Thread-safe context (lock-backed) | ✅ | ✅ | ✅ | — | — | ✅ | ✅ | ✅ |
 | Async reactive context | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Flat state machine | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -39,8 +42,8 @@ notes and platform carve-outs lives in
 | Lossless tree — concurrent merge convergence | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Registers (LWW / MV) + `PnCounter` + `CellCrdt` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | IPC wire — `Snapshot` + `Delta` + `CrdtSync` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Shared-memory blob path (`ShmBlobArena`) | ✅ | ✅ | ✅ | ~ | ~ | ✅ | ✅ | ✅ |
-| Cross-process zero-copy transport (`BlobBackend` / shm / arrow) | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ |
+| Shared-memory blob path (`ShmBlobArena`) | ✅ | ✅ | ✅ | ✅ | ~ | ✅ | ✅ | ✅ |
+| Cross-process zero-copy transport (`BlobBackend` / shm / arrow) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Distributed CRDT plane (`CrdtPlaneRuntime` / anti-entropy) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Distributed plane — WebRTC transport + signaling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | State projection / mirror | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -49,7 +52,7 @@ notes and platform carve-outs lives in
 | C-ABI FFI boundary | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ |
 | Permission boundary (`PeerPermissions` / `RemoteOp`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Capability negotiation (`SessionHandshake`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Instrumentation / benchmarks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Instrumentation / benchmarks | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ |
 <!-- coverage-table:end -->
 
 ## lazily-spec compliance
@@ -66,6 +69,8 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/cell.zig` / `signal.zig` / `effect.zig` | `Cell` / `Signal` (eager, memo-guarded) / `Effect` (scheduled side effect) — the 4 reactive primitives. |
 | `src/lazily/collection.zig` | `CellMap` / `CellFamily` with atomic move and three-signal (value/membership/order) independence. |
 | `src/lazily/reactive_family.zig` | `ReactiveFamily` — unified keyed reactive family (`#lzmatmode`) over a comptime `EntryKind` (`cell` input / `slot` derived) + `MaterializationMode` (eager default / lazy opt-in). Observationally transparent eager vs lazy; deferral-not-deallocation present-set monotonicity; entry-kind orthogonal to mode. Replays `../lazily-spec/conformance/materialization/*.json`. |
+| `src/lazily/thread_safe_reactive_family.zig` | `ThreadSafeReactiveFamily` (`ThreadSafeCellFamily`/`ThreadSafeSlotFamily`) — the `Send + Sync` flavor (`#lzmatmode`): present-set state behind a `ParkingMutex` so a keyed family can be shared across threads. Same three laws plus **materialization confluence** (present set + observed values order-independent under concurrent materialization; `lazily-formal` `materialize_present_comm`/`materialize_observe_comm`). |
+| `src/lazily/async_reactive_family.zig` | `AsyncReactiveFamily` (`AsyncCellFamily`/`AsyncSlotFamily`) — the async flavor (`#lzmatmode`): a **resolution axis** (`drive` resolves a pending slot; `observe` returns `?V`, `null` while pending) giving **eventual transparency** (`lazily-formal` `AsyncMaterialization`). Cell entries resolve at build. |
 | `src/lazily/cell_tree.zig` | `CellTree` — ordered keyed tree composing `CellMap` per level (atomic child move, per-level reactivity). |
 | `src/lazily/reconcile.zig` | LIS-move-minimized keyed reconciliation op-set (`DiffOp`, `reconcile`, `longestIncreasingSubsequence`). |
 | `src/lazily/sem_tree.zig` | `SemTree` — memoized semantic tree; an edit recomputes only the ancestor chain (sibling isolation + memo guard). |
@@ -73,7 +78,7 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/crdt.zig` | `Hlc`, `LwwRegister`, `MvRegister`, `PnCounter`, `VersionVector`, `StampFrontier`, `OpId`. |
 | `src/lazily/text_crdt.zig` | `TextCrdt` — RGA/origin-tree character CRDT with `version_vector` / `delta_since` / `apply_delta`. |
 | `src/lazily/seq_crdt.zig` | `SeqCrdt` — move-aware sequence CRDT (fractional-index positions, three independent LWW registers per entry). |
-| `src/lazily/crdt_plane.zig` | `CrdtPlane` (HLC + membership + stability watermark), `OpLog` (idempotent dedup), `CrdtPlaneRuntime` (anti-entropy, `syncFrame`/`ingest`). |
+| `src/lazily/crdt_plane.zig` | `CrdtPlane` (HLC + membership + stability watermark), `OpLog` (idempotent dedup), `CrdtPlaneRuntime` (anti-entropy, `syncFrame`/`ingest`) + reactive family-granularity sync (`#lzfamilysync`): `registerFamilyLww`/`familySetLww`/`familyKeys`/`familyValueLww`/`membershipEpoch` — an inbound keyed op for an unregistered family entry **materializes** it on ingest (never dropped). Replays `../lazily-spec/conformance/familysync/materialize_on_ingest.json`. |
 | `src/lazily/state_mirror.zig` | `StateGraphMirror` — read-only projection of a remote graph from `Snapshot`/`Delta` messages. |
 | `src/lazily/webrtc_transport.zig` | The portable WebRTC seam: `DataChannel` vtable, permission-filtering `WebRtcSink` / verbatim `WebRtcSource`, `InMemoryDataChannel` loopback pair. The concrete native backend is a consumer-provided adapter. |
 | `src/lazily/signaling.zig` | Signaling protocol wire types (`ClientMessage`/`ServerMessage`) + in-process `SignalingRoom` (anti-spoof `from` stamping). |
