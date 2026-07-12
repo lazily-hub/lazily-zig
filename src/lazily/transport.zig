@@ -500,6 +500,8 @@ pub const SpilledMessage = struct {
             .Snapshot => |s| self.allocator.free(s.nodes),
             .Delta => |d| self.allocator.free(d.ops),
             .CrdtSync => |c| self.allocator.free(c.ops),
+            // Reliable-sync control frames carry no node content — nothing owned.
+            .ResyncRequest, .OutboxAck => {},
         }
         self.owns = false;
     }
@@ -578,6 +580,14 @@ pub fn spillMessage(
                 .spilled = total,
                 .allocator = allocator,
             };
+        },
+        // Reliable-sync control frames have no value/state sites: spilling is the
+        // identity. Return the message as-is, owning nothing.
+        .ResyncRequest, .OutboxAck => return .{
+            .message = message,
+            .spilled = 0,
+            .allocator = allocator,
+            .owns = false,
         },
     }
 }

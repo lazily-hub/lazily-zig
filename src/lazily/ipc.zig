@@ -854,10 +854,71 @@ fn parseCrdtOps(allocator: std.mem.Allocator, value: std.json.Value) ![]const Cr
     }
 }
 
+/// Reliable-sync reverse-channel control frame (`#lzsync`, spec § ResyncCoordinator):
+/// request a covering `Snapshot` on a detected gap. Carries no node content, so it
+/// is permission-filter- and blob-spill-transparent (receiver -> sender).
+pub const ResyncRequest = struct {
+    /// The requesting receiver's `last_epoch`; the sender replies with a
+    /// `Snapshot { epoch >= from_epoch }`.
+    from_epoch: u64,
+
+    pub fn fromJson(value: std.json.Value) !ResyncRequest {
+        return .{ .from_epoch = try asU64(try field(value, "from_epoch")) };
+    }
+
+    pub fn jsonStringify(self: ResyncRequest, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from_epoch");
+        try jw.write(self.from_epoch);
+        try jw.endObject();
+    }
+};
+
+/// Reliable-sync reverse-channel control frame (`#lzsync`, spec § DurableOutbox):
+/// prove receipt through `through_epoch`. Advances the sender's outbox retention
+/// cursor and doubles as the reconnect resume cursor (receiver -> sender).
+pub const OutboxAck = struct {
+    /// Highest epoch the receiver has fully applied.
+    through_epoch: u64,
+
+    pub fn fromJson(value: std.json.Value) !OutboxAck {
+        return .{ .through_epoch = try asU64(try field(value, "through_epoch")) };
+    }
+
+    pub fn jsonStringify(self: OutboxAck, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("through_epoch");
+        try jw.write(self.through_epoch);
+        try jw.endObject();
+    }
+};
+
 pub const IpcMessage = union(enum) {
     Snapshot: Snapshot,
     Delta: Delta,
     CrdtSync: CrdtSync,
+    ResyncRequest: ResyncRequest,
+    OutboxAck: OutboxAck,
+
+    /// The [`IpcMessage.ResyncRequest`] control frame for `from_epoch`.
+    pub fn resyncRequest(from_epoch: u64) IpcMessage {
+        return .{ .ResyncRequest = .{ .from_epoch = from_epoch } };
+    }
+
+    /// The [`IpcMessage.OutboxAck`] control frame for `through_epoch`.
+    pub fn outboxAck(through_epoch: u64) IpcMessage {
+        return .{ .OutboxAck = .{ .through_epoch = through_epoch } };
+    }
+
+    /// Whether this is a reliable-sync reverse-channel control frame
+    /// (`ResyncRequest` / `OutboxAck`) — no node content, so permission
+    /// filtering and blob spilling are the identity on it.
+    pub fn isControl(self: IpcMessage) bool {
+        return switch (self) {
+            .ResyncRequest, .OutboxAck => true,
+            else => false,
+        };
+    }
 
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !IpcMessage {
         const tagged = try singleField(value);
@@ -869,6 +930,12 @@ pub const IpcMessage = union(enum) {
         }
         if (std.mem.eql(u8, tagged.name, "CrdtSync")) {
             return .{ .CrdtSync = try CrdtSync.fromJson(allocator, tagged.value) };
+        }
+        if (std.mem.eql(u8, tagged.name, "ResyncRequest")) {
+            return .{ .ResyncRequest = try ResyncRequest.fromJson(tagged.value) };
+        }
+        if (std.mem.eql(u8, tagged.name, "OutboxAck")) {
+            return .{ .OutboxAck = try OutboxAck.fromJson(tagged.value) };
         }
         return error.UnknownIpcMessage;
     }
@@ -900,6 +967,14 @@ pub const IpcMessage = union(enum) {
             .CrdtSync => |crdt| {
                 try jw.objectField("CrdtSync");
                 try jw.write(crdt);
+            },
+            .ResyncRequest => |req| {
+                try jw.objectField("ResyncRequest");
+                try jw.write(req);
+            },
+            .OutboxAck => |ack| {
+                try jw.objectField("OutboxAck");
+                try jw.write(ack);
             },
         }
         try jw.endObject();

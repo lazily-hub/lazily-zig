@@ -20,6 +20,9 @@ pub const LazilyFfiMessageKind = enum(u32) {
     Snapshot = 1,
     Delta = 2,
     CrdtSync = 3,
+    // Reliable-sync (`#lzsync`) reverse-channel control frames.
+    ResyncRequest = 4,
+    OutboxAck = 5,
 };
 
 pub const AllocatorMode = enum(u32) {

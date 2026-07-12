@@ -137,6 +137,10 @@ pub const WebRtcSink = struct {
                 const filtered = try c.filterReadable(allocator, readable);
                 return .{ .CrdtSync = filtered };
             },
+            // Reliable-sync control frames carry no node content — permission
+            // filtering is the identity, so they pass through verbatim (nothing
+            // freshly allocated, so `freeMessage` is a no-op on them).
+            .ResyncRequest, .OutboxAck => return message,
         }
     }
 };
@@ -184,6 +188,8 @@ fn freeMessage(allocator: std.mem.Allocator, message: ipc.IpcMessage) void {
             allocator.free(c.ops);
             allocator.free(c.frontier);
         },
+        // Control frames own nothing (identity pass-through in filterMessage).
+        .ResyncRequest, .OutboxAck => {},
     }
 }
 

@@ -177,6 +177,8 @@ pub const StateGraphMirror = struct {
             .Snapshot => |s| try self.applySnapshot(s),
             .Delta => |d| try self.applyDelta(d),
             .CrdtSync => {}, // CRDT plane is a separate feature surface
+            // Reliable-sync control frames are handled by the sender driver.
+            .ResyncRequest, .OutboxAck => {},
         }
     }
 
