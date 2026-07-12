@@ -41,7 +41,7 @@
 //! This mirrors the single-threaded `Context` kernel's `setCell_equal_preserves`
 //! theorem (`lazily-formal/LazilyFormal/Reactive.lean`), the same law the Rust
 //! shell gets from `Context::set_cell`'s `PartialEq` guard. The Zig port's
-//! collection (`collection.zig`) expresses the analogous independence via
+//! map (`reactive_map.zig`) expresses the analogous independence via
 //! `membership_version` / `order_version`; the queue uses five per-reader-kind
 //! counters.
 //!

@@ -20,7 +20,7 @@ const std = @import("std");
 /// `AsyncContext(u32)` is the historical instantiation. Slot computes take a
 /// `*anyopaque` userdata pointer + a call fn (the Zig closure-emulation idiom),
 /// so a per-key family entry can compute a value that depends on its runtime
-/// key — the missing capability that lets an `AsyncReactiveFamily` ride real
+/// key — the missing capability that lets an `AsyncReactiveMap` ride real
 /// async slots instead of a private value-cache.
 
 pub const AsyncSlotState = enum { empty, computing, resolved, err };

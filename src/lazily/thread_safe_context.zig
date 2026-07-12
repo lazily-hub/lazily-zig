@@ -15,7 +15,7 @@
 //! nodes by a runtime `u64` id, with **type-erased storage** (a boxed value plus
 //! a monomorphic-per-`T` recompute/free thunk generated at the typed call site,
 //! the same "typed free function stored in an erased slot" idiom the sync engine
-//! uses). This is what lets `ThreadSafeReactiveFamily` allocate a real reactive
+//! uses). This is what lets `ThreadSafeReactiveMap` allocate a real reactive
 //! cell per key.
 //!
 //! Reactivity is **lazy** (like `Context`): a `setCell` marks transitive

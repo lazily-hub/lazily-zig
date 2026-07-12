@@ -1,5 +1,4 @@
 const std = @import("std");
-const collection = @import("collection.zig");
 const cell_tree = @import("cell_tree.zig");
 
 /// Keyed reconciliation diff op. Mirrors lazily-rs `DiffOp` (`reconcile.rs`).
