@@ -86,6 +86,28 @@ pub const QueuePopError = queue.QueuePopError;
 pub const merge = @import("./lazily/merge.zig");
 pub const MergePolicy = merge.MergePolicy;
 pub const MergeCell = merge.MergeCell;
+
+// #relaycell Phases 2–6 — RelayCell conflating relay + SpillStore + Transport +
+// Outbox/Inbox roles + Rate/Window/Expiry/Priority/Keyed policies.
+pub const relay = @import("./lazily/relay.zig");
+pub const BoundDim = relay.BoundDim;
+pub const Overflow = relay.Overflow;
+pub const IngressOutcome = relay.IngressOutcome;
+pub const RelayConfigError = relay.RelayConfigError;
+pub const BackpressurePolicy = relay.BackpressurePolicy;
+pub const RelayCell = relay.RelayCell;
+pub const SpillMode = relay.SpillMode;
+pub const SpillPage = relay.SpillPage;
+pub const SpillStore = relay.SpillStore;
+pub const InProcTransport = relay.InProcTransport;
+pub const FramedTransport = relay.FramedTransport;
+pub const Outbox = relay.Outbox;
+pub const Inbox = relay.Inbox;
+pub const RatePolicy = relay.RatePolicy;
+pub const WindowPolicy = relay.WindowPolicy;
+pub const ExpiryPolicy = relay.ExpiryPolicy;
+pub const PriorityStorage = relay.PriorityStorage;
+pub const KeyedRelay = relay.KeyedRelay;
 pub const NodeKey = ipc.NodeKey;
 pub const WireStamp = ipc.WireStamp;
 pub const CrdtOp = ipc.CrdtOp;
