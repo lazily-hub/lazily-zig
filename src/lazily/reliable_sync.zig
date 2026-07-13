@@ -282,6 +282,12 @@ pub fn StoredOutbox(comptime StoreType: type) type {
             return self.acked_through;
         }
 
+        fn refreshCursor(self: *Self) !u64 {
+            const persisted = try self.store.loadCursor();
+            if (persisted > self.acked_through) self.acked_through = persisted;
+            return self.acked_through;
+        }
+
         pub fn append(self: *Self, epoch: u64, message: IpcMessage) !void {
             const frame = try message.encodeJsonAlloc(self.store.allocator);
             defer self.store.allocator.free(frame);
@@ -289,17 +295,19 @@ pub fn StoredOutbox(comptime StoreType: type) type {
         }
 
         pub fn ackThrough(self: *Self, epoch: u64) !void {
-            if (epoch > self.acked_through) {
-                try self.store.saveCursor(epoch);
-                self.acked_through = epoch;
+            const persisted = try self.refreshCursor();
+            const target = @max(epoch, persisted);
+            if (target > self.acked_through) {
+                try self.store.saveCursor(target);
+                self.acked_through = target;
             }
-            try self.store.deleteThrough(self.acked_through);
+            try self.store.deleteThrough(target);
         }
 
         /// Decode into `allocator`. Use an arena when messages contain owned
         /// strings/slices; destroying the arena releases the full replay batch.
         pub fn replayFrom(self: *Self, allocator: std.mem.Allocator, cursor: u64) ![]OutboxEntry {
-            const effective = @max(cursor, self.acked_through);
+            const effective = @max(cursor, try self.refreshCursor());
             const stored = try self.store.scanAfter(allocator, effective);
             defer {
                 for (stored) |entry| allocator.free(entry.frame);
@@ -321,7 +329,7 @@ pub fn StoredOutbox(comptime StoreType: type) type {
         }
 
         pub fn retainedEpochs(self: *Self, allocator: std.mem.Allocator) ![]u64 {
-            const stored = try self.store.scanAfter(allocator, self.acked_through);
+            const stored = try self.store.scanAfter(allocator, try self.refreshCursor());
             defer {
                 for (stored) |entry| allocator.free(entry.frame);
                 allocator.free(stored);
@@ -550,7 +558,12 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
     defer parsed.deinit();
     try std.testing.expectEqualStrings("ReliableSync", parsed.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("OutboxStore", parsed.value.object.get("model").?.string);
-    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("scenarios").?.array.items.len);
+    const scenarios = parsed.value.object.get("scenarios").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), scenarios.len);
+    try std.testing.expectEqualStrings(
+        "stale handle cannot regress serialized cursor",
+        scenarios[3].object.get("name").?.string,
+    );
 
     var unordered = InMemoryStore.init(allocator);
     defer unordered.deinit();
@@ -621,6 +634,46 @@ test "FileOutboxStore survives restart and rejects stale cursor regression" {
     defer freeStoredFrames(allocator, retained);
     try std.testing.expectEqual(@as(usize, 2), retained.len);
     try std.testing.expectEqualSlices(u64, &.{ 11, 12 }, &.{ retained[0].epoch, retained[1].epoch });
+}
+
+test "StoredOutbox replays canonical stale-handle cursor serialization" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture_outbox_store, .{});
+    defer parsed.deinit();
+    const scenario = parsed.value.object.get("scenarios").?.array.items[3].object;
+    const saves = scenario.get("save_cursor").?.array.items;
+    const expected: u64 = @intCast(scenario.get("expect").?.object.get("loaded_cursor").?.integer);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/serialized-cursor.bin",
+        .{tmp.sub_path},
+    );
+    defer allocator.free(path);
+
+    var stale_store = try FileOutboxStore.init(allocator, std.testing.io, path);
+    defer stale_store.deinit();
+    var current_store = try FileOutboxStore.init(allocator, std.testing.io, path);
+    defer current_store.deinit();
+    var stale = try FileOutbox.init(&stale_store);
+    var current = try FileOutbox.init(&current_store);
+
+    for (saves) |save| {
+        const handle = save.object.get("handle").?.string;
+        const epoch: u64 = @intCast(save.object.get("epoch").?.integer);
+        if (std.mem.eql(u8, handle, "current")) {
+            try current.ackThrough(epoch);
+        } else {
+            try stale.ackThrough(epoch);
+        }
+    }
+    try std.testing.expectEqual(expected, stale.ackedThrough());
+
+    var reopened_store = try FileOutboxStore.init(allocator, std.testing.io, path);
+    defer reopened_store.deinit();
+    try std.testing.expectEqual(expected, try reopened_store.loadCursor());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
