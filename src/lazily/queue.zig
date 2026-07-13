@@ -137,16 +137,18 @@ pub const QueuePopError = error{
 /// reader kind, not a storage property (the shell derives `is_empty` from
 /// `len()`). See `lazily-spec/cell-model.md` § "Storage backend contract".
 ///
-/// Required method signatures on `S`:
+/// Minimal required method signatures on `S` (Phase 0 #relaycell):
 /// ```text
 /// pub fn tryPush(self: *S, value: T) QueuePushError!void;
 /// pub fn tryPop(self: *S) QueuePopError!T;
-/// pub fn peek(self: *const S) ?T;
 /// pub fn len(self: *const S) usize;
-/// pub fn capacity(self: *const S) ?usize;
 /// pub fn isClosed(self: *const S) bool;
 /// pub fn close(self: *S) void;
 /// ```
+/// Optional capabilities (detected via `@hasDecl`): a backend MAY also expose
+/// `pub fn peek(self: *const S) ?T` to gain a `head` reader, and
+/// `pub fn capacity(self: *const S) ?usize` to gain a bounded `is_full` reader.
+/// A backend that implements neither (a raw channel) is fully conforming.
 
 // ---------------------------------------------------------------------------
 // VecDequeStorage — the reference unbounded/bounded backend
@@ -255,32 +257,6 @@ pub fn VecDequeStorage(comptime T: type) type {
 }
 
 // ---------------------------------------------------------------------------
-// Equality helpers — PartialEq guard for the reader-kind counters
-// ---------------------------------------------------------------------------
-
-/// Value equality used by the reader-kind `PartialEq` guard. For string element
-/// types, compare contents (so two equal strings at different addresses are
-/// considered the same head value); for everything else, `std.meta.eql`. This
-/// mirrors lazily-rs `PartialEq` on `T` (Rust `String: PartialEq` compares
-/// content, not identity).
-fn valuesEqual(comptime T: type, a: T, b: T) bool {
-    switch (@typeInfo(T)) {
-        .pointer => |p| {
-            if (p.size == .slice and p.child == u8) return std.mem.eql(u8, a, b);
-            return a == b;
-        },
-        else => return std.meta.eql(a, b),
-    }
-}
-
-/// Optional-aware equality for the `head` reader kind (`null` when empty).
-fn headEqual(comptime T: type, a: ?T, b: ?T) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return valuesEqual(T, a.?, b.?);
-}
-
-// ---------------------------------------------------------------------------
 // QueueCell — the reactive shell
 // ---------------------------------------------------------------------------
 
@@ -315,18 +291,17 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
     return struct {
         ctx: *Context,
         storage: S,
-
-        // Cached reader-kind values — re-derived from storage after each op.
-        head_val: ?T = null,
-        len_val: usize = 0,
-        is_empty_val: bool = true,
-        is_full_val: bool = false,
-        closed_val: bool = false,
+        // Cached bound (Phase 0 #relaycell): capacity is an OPTIONAL, fixed
+        // backend capability; null when the backend is unbounded or has no
+        // `capacity` decl.
+        cap: ?usize = null,
 
         // Reader-kind version counters — bumped ONLY when the corresponding
-        // cached value genuinely changes. This is the reader-kind independence
-        // law: a push to non-empty does not bump head; a pop always does (head
-        // value changes); close only bumps closed.
+        // reader value provably changes on an op, computed from the transition
+        // (op + pre-op len), NOT by deriving the value. This is the reader-kind
+        // independence law: a push to non-empty does not bump head; a pop always
+        // does; close only bumps closed. Reads derive live from storage on
+        // demand — nothing is materialized eagerly (§5 demand-driven).
         head_version: u64 = 0,
         len_version: u64 = 0,
         is_empty_version: u64 = 0,
@@ -335,44 +310,34 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
 
         const Self = @This();
 
-        /// Build a queue over an arbitrary `QueueStorage` backend. The shell
-        /// initializes its reader-kind values from the backend's current state.
+        // `peek` and `capacity` are OPTIONAL storage capabilities (Phase 0
+        // #relaycell): a raw-channel backend implements neither. A backend with
+        // no `peek` has no `head` reader (it is trivially null).
+        const has_peek = @hasDecl(S, "peek");
+        const has_capacity = @hasDecl(S, "capacity");
+
+        /// Build a queue over an arbitrary `QueueStorage` backend. Caches the
+        /// (fixed) bound; reader values are derived on demand, not at init.
         pub fn init(ctx: *Context, storage: S) Self {
-            var self = Self{ .ctx = ctx, .storage = storage };
-            // Derive the initial reader-kind values WITHOUT recording them as
-            // invalidations (an initial derivation is not a transition). Counter
-            // baseline is the post-init state, so the first op's invalidation is
-            // measured from this baseline.
-            self.syncContent();
-            return self;
+            const cap = if (has_capacity) storage.capacity() else null;
+            return Self{ .ctx = ctx, .storage = storage, .cap = cap };
         }
 
-        /// Re-derive the reader-kind values from storage, bumping a counter only
-        /// when the value genuinely changed. This is the reader-kind
-        /// independence law. `closed` is intentionally NOT touched here: it only
-        /// changes via [`close`](Self.close).
-        fn syncContent(self: *Self) void {
-            const new_head = self.storage.peek();
-            const new_len = self.storage.len();
-            const new_is_empty = new_len == 0;
-            const new_is_full = if (self.storage.capacity()) |c| new_len >= c else false;
-
-            if (!headEqual(T, self.head_val, new_head)) {
-                self.head_val = new_head;
-                self.head_version += 1;
+        /// Bump the version of exactly the reader-kinds whose value provably
+        /// changed on a successful op that took the queue from `len_before` to
+        /// `len_after`. No reader value is derived here — the transition alone
+        /// decides which counters advance (exact for any FIFO), so no `peek` is
+        /// needed. `head_changed` is passed by the caller because head depends on
+        /// op direction, not just len (a pop always changes head; a push changes
+        /// it only from empty). `closed` is never touched here; only
+        /// [`close`](Self.close) bumps it.
+        fn invalidateReaders(self: *Self, len_before: usize, len_after: usize, head_changed: bool) void {
+            self.len_version += 1; // len always changes on a successful op
+            if ((len_before == 0) != (len_after == 0)) self.is_empty_version += 1;
+            if (self.cap) |c| {
+                if ((len_before >= c) != (len_after >= c)) self.is_full_version += 1;
             }
-            if (self.len_val != new_len) {
-                self.len_val = new_len;
-                self.len_version += 1;
-            }
-            if (self.is_empty_val != new_is_empty) {
-                self.is_empty_val = new_is_empty;
-                self.is_empty_version += 1;
-            }
-            if (self.is_full_val != new_is_full) {
-                self.is_full_val = new_is_full;
-                self.is_full_version += 1;
-            }
+            if (head_changed) self.head_version += 1;
         }
 
         // -- mutating ops --
@@ -388,8 +353,10 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// `is_empty` readers as appropriate; `is_full` when transitioning onto
         /// capacity. Does not touch `closed`.
         pub fn tryPush(self: *Self, value: T) QueuePushError!void {
+            const len_before = self.storage.len();
             try self.storage.tryPush(value);
-            self.syncContent();
+            // Head changes on a push only when the queue was empty.
+            self.invalidateReaders(len_before, len_before + 1, len_before == 0);
         }
 
         /// Remove and return the head element.
@@ -402,8 +369,10 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// `is_empty` (when transitioning to empty) readers as appropriate;
         /// `is_full` when transitioning off capacity.
         pub fn tryPop(self: *Self) QueuePopError!T {
+            const len_before = self.storage.len();
             const v = try self.storage.tryPop();
-            self.syncContent();
+            // A successful pop always advances head and decrements len.
+            self.invalidateReaders(len_before, len_before - 1, true);
             return v;
         }
 
@@ -417,10 +386,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         pub fn close(self: *Self) void {
             if (self.storage.isClosed()) return;
             self.storage.close();
-            if (!self.closed_val) {
-                self.closed_val = true;
-                self.closed_version += 1;
-            }
+            self.closed_version += 1;
         }
 
         // -- reactive reader-kind reads --
@@ -429,19 +395,20 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// empty. A reader is invalidated when the head value *changes* — every
         /// pop, and a push only when transitioning from empty.
         pub fn head(self: *const Self) ?T {
-            return self.head_val;
+            if (has_peek) return self.storage.peek();
+            return null; // no peek capability → no head reader
         }
 
         /// Reactive read of the number of buffered elements. Invalidated
         /// whenever the count changes (every successful push/pop).
         pub fn len(self: *const Self) usize {
-            return self.len_val;
+            return self.storage.len();
         }
 
         /// Reactive emptiness check. Invalidated only on the empty ↔ non-empty
         /// transition.
         pub fn isEmpty(self: *const Self) bool {
-            return self.is_empty_val;
+            return self.storage.len() == 0;
         }
 
         /// Reactive fullness check (only meaningful when the backend is
@@ -451,13 +418,14 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// version and the producer observes capacity recovery. For an unbounded
         /// backend this is always `false` and never invalidates.
         pub fn isFull(self: *const Self) bool {
-            return self.is_full_val;
+            if (self.cap) |c| return self.storage.len() >= c;
+            return false;
         }
 
         /// Reactive read of the closed flag. Invalidated only on the open →
         /// closed transition.
         pub fn isClosed(self: *const Self) bool {
-            return self.closed_val;
+            return self.storage.isClosed();
         }
 
         // -- reader-kind version counters (conformance observation) --
@@ -492,9 +460,10 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
 
         // -- non-reactive storage access --
 
-        /// The backend's capacity, or `null` if unbounded.
+        /// The backend's capacity, or `null` if unbounded. Cached at
+        /// construction (capacity is a fixed backend property).
         pub fn capacity(self: *const Self) ?usize {
-            return self.storage.capacity();
+            return self.cap;
         }
     };
 }
@@ -1065,4 +1034,74 @@ test "lazily/queue conformance: queuecell_closure_lifecycle" {
     defer parsed.deinit();
 
     try runFixture(ctx, parsed.value);
+}
+
+// A raw-channel-style backend implementing ONLY the required contract —
+// tryPush / tryPop / len / isClosed / close, no peek, no capacity. It proves the
+// minimal contract (Phase 0 #relaycell): fully conforming, with no head reader
+// (trivially null) and never full.
+const MinimalFifoI32 = struct {
+    buf: std.ArrayList(i32),
+    closed: bool,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return .{ .buf = .empty, .closed = false, .allocator = allocator };
+    }
+    pub fn deinit(self: *Self) void {
+        self.buf.deinit(self.allocator);
+    }
+    pub fn tryPush(self: *Self, value: i32) QueuePushError!void {
+        if (self.closed) return error.Closed;
+        self.buf.append(self.allocator, value) catch return;
+    }
+    pub fn tryPop(self: *Self) QueuePopError!i32 {
+        if (self.buf.items.len == 0) return if (self.closed) error.Closed else error.Empty;
+        return self.buf.orderedRemove(0);
+    }
+    pub fn len(self: *const Self) usize {
+        return self.buf.items.len;
+    }
+    pub fn isClosed(self: *const Self) bool {
+        return self.closed;
+    }
+    pub fn close(self: *Self) void {
+        self.closed = true;
+    }
+    // NB: no peek, no capacity.
+};
+
+test "lazily/queue: raw-channel backend conforms to minimal contract (#relaycell)" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    var q = QueueCell(i32, MinimalFifoI32).init(ctx, MinimalFifoI32.init(allocator));
+    defer q.storage.deinit();
+
+    try std.testing.expect(q.isEmpty());
+
+    const len_before = q.lenVersion();
+    try q.tryPush(1);
+    try q.tryPush(2);
+    try std.testing.expectEqual(@as(usize, 2), q.len());
+    try std.testing.expect(q.lenVersion() > len_before); // reader stays reactive
+
+    // No peek → no head reader (null); no capacity → never full.
+    try std.testing.expectEqual(@as(?i32, null), q.head());
+    try std.testing.expect(!q.isFull());
+    try std.testing.expectEqual(@as(?usize, null), q.capacity());
+
+    // FIFO drain from tryPop alone.
+    try std.testing.expectEqual(@as(i32, 1), try q.tryPop());
+    try std.testing.expectEqual(@as(i32, 2), try q.tryPop());
+    try std.testing.expect(q.isEmpty());
+
+    // Closure lifecycle: Closed distinct from Empty; push-after-close rejected.
+    q.close();
+    try std.testing.expect(q.isClosed());
+    try std.testing.expectError(error.Closed, q.tryPush(3));
+    try std.testing.expectError(error.Closed, q.tryPop());
 }
