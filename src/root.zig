@@ -86,6 +86,11 @@ pub const TopicDurability = queue.TopicDurability;
 pub const TopicSnapshot = queue.TopicSnapshot;
 pub const TopicSubscribeOutcome = queue.TopicSubscribeOutcome;
 pub const TopicSubscriptionSnapshot = queue.TopicSubscriptionSnapshot;
+pub const work_queue = @import("./lazily/work_queue.zig");
+pub const WorkQueueCell = work_queue.WorkQueueCell;
+pub const WorkQueueDeadLetterReason = work_queue.WorkQueueDeadLetterReason;
+pub const WorkQueueError = work_queue.WorkQueueError;
+pub const WorkQueueVersions = work_queue.WorkQueueVersions;
 
 // #relaycell Phase 1 — merge algebra + MergeCell.
 pub const merge = @import("./lazily/merge.zig");

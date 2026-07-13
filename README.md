@@ -35,6 +35,7 @@ notes and platform carve-outs lives in
 | Stable-id alignment (manufactured identity) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Reactive queue (`QueueCell` SPSC/MPSC + `QueueStorage` adapter) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Broadcast topic (`TopicCell`) — independent cursors + durable replay + safe GC (`#lztopiccell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Competing-consumer work queue (`WorkQueueCell`) — exclusive leases + ack/nack + redelivery + DLQ (`#lzworkqueue`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Merge algebra + `MergeCell` — associative `MergePolicy` (`KeepLatest`/`Sum`/`Max`/`SetUnion`/`RawFifo`), `Cell ≡ MergeCell<KeepLatest>`, `Reactive`/`Source` split (`#relaycell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | RelayCell — conflating relay + `BackpressurePolicy` + `SpillStore` + `Transport` + Inbox/Outbox + Rate/Window/Expiry/Priority/keyed policies (`#relaycell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Free-text character CRDT (`TextCrdt`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -302,6 +303,20 @@ pub fn build(b: *std.Build) void {
 ```
 
 Also wrap the allocator passed into `Context.init` with `std.heap.ThreadSafeAllocator`. See the [ThreadSafeAllocator source code](https://codeberg.org/ziglang/zig/src/branch/master/lib/std/heap/ThreadSafeAllocator.zig).
+
+## Competing-consumer work queue
+
+`WorkQueueCell(T)` provides exclusive FIFO claims, visibility deadlines,
+worker-scoped acknowledgements, tail retries, and bounded dead-letter handling.
+Item ids remain stable across retries; every claim gets a fresh delivery id.
+
+```zig
+var work = try lazily.WorkQueueCell([]const u8).init(allocator, 10, 3);
+defer work.deinit();
+_ = try work.push("job");
+const delivery = (try work.claim("worker-a", 100)).?;
+std.debug.assert(work.ack("worker-a", delivery.delivery_id));
+```
 
 ## Example Usage
 
