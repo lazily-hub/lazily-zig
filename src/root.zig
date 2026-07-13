@@ -81,6 +81,11 @@ pub const QueueVersions = queue.QueueVersions;
 pub const VecDequeStorage = queue.VecDequeStorage;
 pub const QueuePushError = queue.QueuePushError;
 pub const QueuePopError = queue.QueuePopError;
+
+// #relaycell Phase 1 — merge algebra + MergeCell.
+pub const merge = @import("./lazily/merge.zig");
+pub const MergePolicy = merge.MergePolicy;
+pub const MergeCell = merge.MergeCell;
 pub const NodeKey = ipc.NodeKey;
 pub const WireStamp = ipc.WireStamp;
 pub const CrdtOp = ipc.CrdtOp;
