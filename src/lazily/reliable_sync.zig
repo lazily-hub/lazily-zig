@@ -248,6 +248,381 @@ pub const InMemoryOutbox = struct {
     }
 };
 
+/// One serialized frame returned by an `OutboxStore`.
+pub const StoredOutboxFrame = struct {
+    epoch: u64,
+    frame: []u8,
+};
+
+/// Compile-time structural check for the five-operation byte store contract.
+pub fn OutboxStore(comptime Store: type) type {
+    inline for (.{ "put", "deleteThrough", "scanAfter", "loadCursor", "saveCursor" }) |name| {
+        if (!@hasDecl(Store, name)) {
+            @compileError(@typeName(Store) ++ " is missing OutboxStore." ++ name);
+        }
+    }
+    return Store;
+}
+
+/// The shared serialization/cursor/prune/replay protocol over a byte store.
+/// `StoredOutbox` avoids colliding with RelayCell's existing `Outbox(T)` facade.
+pub fn StoredOutbox(comptime StoreType: type) type {
+    const Store = OutboxStore(StoreType);
+    return struct {
+        const Self = @This();
+
+        store: *Store,
+        acked_through: u64,
+
+        pub fn init(store: *Store) !Self {
+            return .{ .store = store, .acked_through = try store.loadCursor() };
+        }
+
+        pub fn ackedThrough(self: Self) u64 {
+            return self.acked_through;
+        }
+
+        pub fn append(self: *Self, epoch: u64, message: IpcMessage) !void {
+            const frame = try message.encodeJsonAlloc(self.store.allocator);
+            defer self.store.allocator.free(frame);
+            try self.store.put(epoch, frame);
+        }
+
+        pub fn ackThrough(self: *Self, epoch: u64) !void {
+            if (epoch > self.acked_through) {
+                try self.store.saveCursor(epoch);
+                self.acked_through = epoch;
+            }
+            try self.store.deleteThrough(self.acked_through);
+        }
+
+        /// Decode into `allocator`. Use an arena when messages contain owned
+        /// strings/slices; destroying the arena releases the full replay batch.
+        pub fn replayFrom(self: *Self, allocator: std.mem.Allocator, cursor: u64) ![]OutboxEntry {
+            const effective = @max(cursor, self.acked_through);
+            const stored = try self.store.scanAfter(allocator, effective);
+            defer {
+                for (stored) |entry| allocator.free(entry.frame);
+                allocator.free(stored);
+            }
+            var out = std.ArrayList(OutboxEntry).empty;
+            errdefer out.deinit(allocator);
+            for (stored) |entry| {
+                const value = try std.json.parseFromSliceLeaky(
+                    std.json.Value,
+                    allocator,
+                    entry.frame,
+                    .{ .allocate = .alloc_always },
+                );
+                const message = try IpcMessage.fromJson(allocator, value);
+                try out.append(allocator, .{ .epoch = entry.epoch, .message = message });
+            }
+            return out.toOwnedSlice(allocator);
+        }
+
+        pub fn retainedEpochs(self: *Self, allocator: std.mem.Allocator) ![]u64 {
+            const stored = try self.store.scanAfter(allocator, self.acked_through);
+            defer {
+                for (stored) |entry| allocator.free(entry.frame);
+                allocator.free(stored);
+            }
+            const epochs = try allocator.alloc(u64, stored.len);
+            for (stored, epochs) |entry, *epoch| epoch.* = entry.epoch;
+            return epochs;
+        }
+
+        pub fn retainedLen(self: *Self) !usize {
+            const epochs = try self.retainedEpochs(self.store.allocator);
+            defer self.store.allocator.free(epochs);
+            return epochs.len;
+        }
+    };
+}
+
+/// Ordered process-local byte store used to conformance-test `StoredOutbox`.
+pub const InMemoryStore = struct {
+    allocator: std.mem.Allocator,
+    entries: std.AutoHashMap(u64, []u8),
+    cursor: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) InMemoryStore {
+        return .{ .allocator = allocator, .entries = std.AutoHashMap(u64, []u8).init(allocator) };
+    }
+
+    pub fn deinit(self: *InMemoryStore) void {
+        var iter = self.entries.valueIterator();
+        while (iter.next()) |frame| self.allocator.free(frame.*);
+        self.entries.deinit();
+    }
+
+    pub fn put(self: *InMemoryStore, epoch: u64, frame: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, frame);
+        errdefer self.allocator.free(copy);
+        if (try self.entries.fetchPut(epoch, copy)) |old| self.allocator.free(old.value);
+    }
+
+    pub fn deleteThrough(self: *InMemoryStore, epoch: u64) !void {
+        var doomed = std.ArrayList(u64).empty;
+        defer doomed.deinit(self.allocator);
+        var iter = self.entries.keyIterator();
+        while (iter.next()) |stored| {
+            if (stored.* <= epoch) try doomed.append(self.allocator, stored.*);
+        }
+        for (doomed.items) |stored| {
+            if (self.entries.fetchRemove(stored)) |removed| self.allocator.free(removed.value);
+        }
+    }
+
+    pub fn scanAfter(self: *InMemoryStore, allocator: std.mem.Allocator, cursor: u64) ![]StoredOutboxFrame {
+        var out = std.ArrayList(StoredOutboxFrame).empty;
+        errdefer {
+            for (out.items) |entry| allocator.free(entry.frame);
+            out.deinit(allocator);
+        }
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            if (entry.key_ptr.* > cursor) {
+                try out.append(allocator, .{
+                    .epoch = entry.key_ptr.*,
+                    .frame = try allocator.dupe(u8, entry.value_ptr.*),
+                });
+            }
+        }
+        std.mem.sort(StoredOutboxFrame, out.items, {}, storedFrameLessThan);
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn loadCursor(self: *InMemoryStore) !u64 {
+        return self.cursor;
+    }
+
+    pub fn saveCursor(self: *InMemoryStore, epoch: u64) !void {
+        self.cursor = @max(self.cursor, epoch);
+    }
+};
+
+const file_record_put: u8 = 1;
+const file_record_delete: u8 = 2;
+const file_record_cursor: u8 = 3;
+const file_record_header_len = 17;
+
+/// Durable append-only binary journal adapter. Every write takes an OS-level
+/// exclusive file lock. Cursor records are folded with `max`, so stale handles
+/// cannot overwrite a newer acknowledgement.
+pub const FileOutboxStore = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []u8,
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !FileOutboxStore {
+        if (std.fs.path.dirname(path)) |parent| {
+            if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
+        }
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        file.close(io);
+        return .{ .allocator = allocator, .io = io, .path = try allocator.dupe(u8, path) };
+    }
+
+    pub fn deinit(self: *FileOutboxStore) void {
+        self.allocator.free(self.path);
+    }
+
+    pub fn put(self: *FileOutboxStore, epoch: u64, frame: []const u8) !void {
+        try self.appendRecord(file_record_put, epoch, frame);
+    }
+
+    pub fn deleteThrough(self: *FileOutboxStore, epoch: u64) !void {
+        try self.appendRecord(file_record_delete, epoch, &.{});
+    }
+
+    pub fn saveCursor(self: *FileOutboxStore, epoch: u64) !void {
+        try self.appendRecord(file_record_cursor, epoch, &.{});
+    }
+
+    pub fn loadCursor(self: *FileOutboxStore) !u64 {
+        const data = try self.readAll(self.allocator);
+        defer self.allocator.free(data);
+        var cursor: u64 = 0;
+        var offset: usize = 0;
+        while (nextFileRecord(data, &offset)) |record| {
+            if (record.op == file_record_cursor) cursor = @max(cursor, record.epoch);
+        }
+        return cursor;
+    }
+
+    pub fn scanAfter(self: *FileOutboxStore, allocator: std.mem.Allocator, cursor_arg: u64) ![]StoredOutboxFrame {
+        const data = try self.readAll(allocator);
+        defer allocator.free(data);
+        var entries = std.AutoHashMap(u64, []const u8).init(allocator);
+        defer entries.deinit();
+        var deleted_through: u64 = 0;
+        var offset: usize = 0;
+        while (nextFileRecord(data, &offset)) |record| switch (record.op) {
+            file_record_put => try entries.put(record.epoch, record.frame),
+            file_record_delete => deleted_through = @max(deleted_through, record.epoch),
+            else => {},
+        };
+        const cursor = @max(cursor_arg, deleted_through);
+        var out = std.ArrayList(StoredOutboxFrame).empty;
+        errdefer {
+            for (out.items) |entry| allocator.free(entry.frame);
+            out.deinit(allocator);
+        }
+        var iter = entries.iterator();
+        while (iter.next()) |entry| {
+            if (entry.key_ptr.* > cursor) {
+                try out.append(allocator, .{
+                    .epoch = entry.key_ptr.*,
+                    .frame = try allocator.dupe(u8, entry.value_ptr.*),
+                });
+            }
+        }
+        std.mem.sort(StoredOutboxFrame, out.items, {}, storedFrameLessThan);
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn appendRecord(self: *FileOutboxStore, op: u8, epoch: u64, frame: []const u8) !void {
+        var header: [file_record_header_len]u8 = undefined;
+        header[0] = op;
+        std.mem.writeInt(u64, header[1..9], epoch, .little);
+        std.mem.writeInt(u64, header[9..17], frame.len, .little);
+        var file = try std.Io.Dir.cwd().createFile(self.io, self.path, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+        });
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(self.io, &buffer);
+        try writer.seekTo(stat.size);
+        try writer.interface.writeAll(&header);
+        try writer.interface.writeAll(frame);
+        try writer.interface.flush();
+        try file.sync(self.io);
+    }
+
+    fn readAll(self: *FileOutboxStore, allocator: std.mem.Allocator) ![]u8 {
+        var file = try std.Io.Dir.cwd().openFile(self.io, self.path, .{ .lock = .shared });
+        defer file.close(self.io);
+        var buffer: [4096]u8 = undefined;
+        var reader = file.reader(self.io, &buffer);
+        return reader.interface.allocRemaining(allocator, .unlimited);
+    }
+};
+
+pub const FileOutbox = StoredOutbox(FileOutboxStore);
+
+const FileRecord = struct { op: u8, epoch: u64, frame: []const u8 };
+
+fn nextFileRecord(data: []const u8, offset: *usize) ?FileRecord {
+    if (data.len - offset.* < file_record_header_len) return null;
+    const start = offset.*;
+    const len = std.mem.readInt(u64, data[start + 9 ..][0..8], .little);
+    const frame_start = start + file_record_header_len;
+    const frame_end = std.math.add(usize, frame_start, @intCast(len)) catch return null;
+    if (frame_end > data.len) return null;
+    offset.* = frame_end;
+    return .{
+        .op = data[start],
+        .epoch = std.mem.readInt(u64, data[start + 1 ..][0..8], .little),
+        .frame = data[frame_start..frame_end],
+    };
+}
+
+fn storedFrameLessThan(_: void, a: StoredOutboxFrame, b: StoredOutboxFrame) bool {
+    return a.epoch < b.epoch;
+}
+
+const fixture_outbox_store = @embedFile("test/reliable-sync/outbox_store_protocol.json");
+
+fn freeStoredFrames(allocator: std.mem.Allocator, entries: []StoredOutboxFrame) void {
+    for (entries) |entry| allocator.free(entry.frame);
+    allocator.free(entries);
+}
+
+fn snapshotMessage(epoch: u64) IpcMessage {
+    return .{ .Snapshot = ipc.Snapshot.init(epoch, &.{}, &.{}, &.{}) };
+}
+
+test "OutboxStore protocol replays canonical ordered, monotone, and restart cases" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture_outbox_store, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ReliableSync", parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("OutboxStore", parsed.value.object.get("model").?.string);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("scenarios").?.array.items.len);
+
+    var unordered = InMemoryStore.init(allocator);
+    defer unordered.deinit();
+    try unordered.put(3, "three");
+    try unordered.put(1, "one");
+    try unordered.put(2, "two");
+    const ordered = try unordered.scanAfter(allocator, 0);
+    defer freeStoredFrames(allocator, ordered);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &.{ ordered[0].epoch, ordered[1].epoch, ordered[2].epoch });
+
+    var store = InMemoryStore.init(allocator);
+    defer store.deinit();
+    var outbox = try StoredOutbox(InMemoryStore).init(&store);
+    for (1..5) |epoch| try outbox.append(epoch, snapshotMessage(epoch));
+    try outbox.ackThrough(2);
+    try outbox.ackThrough(1);
+    try outbox.ackThrough(3);
+    try std.testing.expectEqual(@as(u64, 3), outbox.ackedThrough());
+    const retained = try outbox.retainedEpochs(allocator);
+    defer allocator.free(retained);
+    try std.testing.expectEqualSlices(u64, &.{4}, retained);
+
+    var replay_arena = std.heap.ArenaAllocator.init(allocator);
+    defer replay_arena.deinit();
+    const replay = try outbox.replayFrom(replay_arena.allocator(), 0);
+    try std.testing.expectEqual(@as(usize, 1), replay.len);
+    try std.testing.expectEqual(@as(u64, 4), replay[0].epoch);
+
+    var restarted_store = InMemoryStore.init(allocator);
+    defer restarted_store.deinit();
+    var before_restart = try StoredOutbox(InMemoryStore).init(&restarted_store);
+    for (10..13) |epoch| try before_restart.append(epoch, snapshotMessage(epoch));
+    try before_restart.ackThrough(10);
+    var after_restart = try StoredOutbox(InMemoryStore).init(&restarted_store);
+    try std.testing.expectEqual(@as(u64, 10), after_restart.ackedThrough());
+    const restart_retained = try after_restart.retainedEpochs(allocator);
+    defer allocator.free(restart_retained);
+    try std.testing.expectEqualSlices(u64, &.{ 11, 12 }, restart_retained);
+}
+
+test "FileOutboxStore survives restart and rejects stale cursor regression" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/outbox.bin",
+        .{tmp.sub_path},
+    );
+    defer allocator.free(path);
+
+    var current = try FileOutboxStore.init(allocator, std.testing.io, path);
+    defer current.deinit();
+    var stale = try FileOutboxStore.init(allocator, std.testing.io, path);
+    defer stale.deinit();
+    try current.put(10, "ten");
+    try current.put(11, "eleven");
+    try current.put(12, "twelve");
+    try current.saveCursor(10);
+    try current.deleteThrough(10);
+    try current.saveCursor(9);
+    try stale.saveCursor(3);
+
+    var reopened = try FileOutboxStore.init(allocator, std.testing.io, path);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 10), try reopened.loadCursor());
+    const retained = try reopened.scanAfter(allocator, 0);
+    defer freeStoredFrames(allocator, retained);
+    try std.testing.expectEqual(@as(usize, 2), retained.len);
+    try std.testing.expectEqualSlices(u64, &.{ 11, 12 }, &.{ retained[0].epoch, retained[1].epoch });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Liveness cells — OR-set + LWW register (ride the CrdtSync plane).
 // ─────────────────────────────────────────────────────────────────────────────

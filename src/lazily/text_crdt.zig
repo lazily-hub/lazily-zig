@@ -146,6 +146,11 @@ pub const TextCrdt = struct {
         return buf.toOwnedSlice(allocator);
     }
 
+    /// The visible lossless-tree value.
+    pub fn value(self: *const TextCrdt, allocator: std.mem.Allocator) ![]u8 {
+        return self.text(allocator);
+    }
+
     pub fn len(self: *const TextCrdt) !usize {
         const visible = try self.orderedIds(self.allocator, false);
         defer self.allocator.free(visible);
@@ -188,6 +193,11 @@ pub const TextCrdt = struct {
         const after = try self.text(self.allocator);
         defer self.allocator.free(after);
         return !std.mem.eql(u8, before, after);
+    }
+
+    /// Join another replica through the CrdtTree contract.
+    pub fn mergeFrom(self: *TextCrdt, other: *const TextCrdt) !bool {
+        return self.merge(other);
     }
 
     /// `peer -> greatest counter` over both insert ids and tombstone ids.

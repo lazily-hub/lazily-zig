@@ -39,7 +39,7 @@ notes and platform carve-outs lives in
 | RelayCell — conflating relay + `BackpressurePolicy` + `SpillStore` + `Transport` + Inbox/Outbox + Rate/Window/Expiry/Priority/keyed policies (`#relaycell`) | ✅ | — | — | — | — | — | — | — |
 | Free-text character CRDT (`TextCrdt`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TextCrdt` delta sync (`version_vector` / `delta_since` / `apply_delta`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `CrdtTree` lossless document contract (`#lzcrdttree`) | ✅ | — | ✅ | ✅ | — | — | — | — |
+| `CrdtTree` lossless document contract (`#lzcrdttree`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Move-aware sequence CRDT (`SeqCrdt`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Lossless tree CRDT core (`LosslessTreeCrdt`, M1) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Lossless tree — dotted-frontier anti-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -50,7 +50,7 @@ notes and platform carve-outs lives in
 | Cross-process zero-copy transport (`BlobBackend` / shm / arrow) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Distributed CRDT plane (`CrdtPlaneRuntime` / anti-entropy) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Reliable sync — resync coordinator + at-least-once durable outbox + OR-set/LWW liveness (`#lzsync`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Storage-independent durable outbox (`OutboxStore` + `Outbox<S>`, SQLite/IndexedDB adapters) | ✅ | — | ✅ | ✅ | — | — | — | — |
+| Storage-independent durable outbox (`OutboxStore` + shared outbox protocol; SQLite/Room/IndexedDB/file adapters) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Reliable-sync transport seam + full-duplex `SyncDriver` loop (`IpcSink`/`IpcSource`, `#sync-driver`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Distributed plane — WebRTC transport + signaling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | State projection / mirror | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -84,8 +84,10 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/stable_id.zig` | Manufactured identity for text (FNV-1a content hashes, in-band anchors, word-LCS similarity alignment). |
 | `src/lazily/crdt.zig` | `Hlc`, `LwwRegister`, `MvRegister`, `PnCounter`, `VersionVector`, `StampFrontier`, `OpId`. |
 | `src/lazily/text_crdt.zig` | `TextCrdt` — RGA/origin-tree character CRDT with `version_vector` / `delta_since` / `apply_delta`. |
+| `src/lazily/crdt_tree.zig` | `CrdtTree(T)` — compile-time lossless document contract covering frontier, delta, value, and idempotent merge operations; implemented by `TextCrdt`. |
 | `src/lazily/seq_crdt.zig` | `SeqCrdt` — move-aware sequence CRDT (fractional-index positions, three independent LWW registers per entry). |
 | `src/lazily/crdt_plane.zig` | `CrdtPlane` (HLC + membership + stability watermark), `OpLog` (idempotent dedup), `CrdtPlaneRuntime` (anti-entropy, `syncFrame`/`ingest`) + reactive family-granularity sync (`#lzfamilysync`): `registerFamilyLww`/`familySetLww`/`familyKeys`/`familyValueLww`/`membershipEpoch` — an inbound keyed op for an unregistered family entry **materializes** it on ingest (never dropped). Replays `../lazily-spec/conformance/familysync/materialize_on_ingest.json`. |
+| `src/lazily/reliable_sync.zig` | Reliable-sync coordinator plus `OutboxStore`, shared `StoredOutbox(S)` protocol, `InMemoryStore`, and a locked append-only `FileOutboxStore` whose persisted cursor folds with `max`. |
 | `src/lazily/state_mirror.zig` | `StateGraphMirror` — read-only projection of a remote graph from `Snapshot`/`Delta` messages. |
 | `src/lazily/webrtc_transport.zig` | The portable WebRTC seam: `DataChannel` vtable, permission-filtering `WebRtcSink` / verbatim `WebRtcSource`, `InMemoryDataChannel` loopback pair. The concrete native backend is a consumer-provided adapter. |
 | `src/lazily/signaling.zig` | Signaling protocol wire types (`ClientMessage`/`ServerMessage`) + in-process `SignalingRoom` (anti-spoof `from` stamping). |
@@ -226,15 +228,17 @@ new)` diffs two keyed sequences by stable key and emits the move-minimized
 
 ### CRDTs
 
-The CRDT suite is in `src/lazily/crdt.zig`, `text_crdt.zig`, and
-`seq_crdt.zig`:
+The CRDT suite is in `src/lazily/crdt.zig`, `text_crdt.zig`,
+`crdt_tree.zig`, and `seq_crdt.zig`:
 
 - `LwwRegister(V)` — last-writer-wins by HLC stamp; ties go to the incumbent.
 - `MvRegister(V)` — multi-value; concurrent writes surface as a set, a causal
   write collapses them.
 - `PnCounter` — per-peer increment/decrement tallies merged by per-peer max.
 - `TextCrdt` — RGA/origin-tree character CRDT with sticky-min tombstones;
-  `version_vector` / `delta_since` / `apply_delta` for delta sync.
+`version_vector` / `delta_since` / `apply_delta` for delta sync.
+- `CrdtTree(T)` — the structural `#lzcrdttree` contract; `TextCrdt` provides
+  identity-preserving empty-frontier snapshots and merge/value aliases.
 - `SeqCrdt(Id, V)` — move-aware sequence CRDT; each element is three
   independent LWW registers (value, fractional-index position, deleted), so a
   move is a single LWW reassignment (no delete+reinsert duplication) and a
