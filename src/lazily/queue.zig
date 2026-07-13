@@ -561,6 +561,9 @@ pub fn TopicCell(comptime T: type) type {
                 if (saved_sub.cursor < self.base_offset or saved_sub.cursor > tail) {
                     return error.CursorOutsideRetainedLog;
                 }
+                if (saved_sub.durability == .ephemeral and !saved_sub.connected) {
+                    return error.DisconnectedEphemeralSubscription;
+                }
                 const owned_id = try allocator.dupe(u8, saved_sub.subscriber_id);
                 errdefer allocator.free(owned_id);
                 try self.subscriptions.put(owned_id, .{
@@ -635,6 +638,7 @@ pub fn TopicCell(comptime T: type) type {
         /// Read the retained suffix without advancing this subscriber's cursor.
         pub fn readStream(self: *const Self, subscriber_id: []const u8) ![]const T {
             const sub = self.subscriptions.get(subscriber_id) orelse return error.SubscriptionNotFound;
+            if (!sub.connected) return self.elements.items[0..0];
             return self.elements.items[sub.cursor - self.base_offset ..];
         }
 
@@ -646,6 +650,7 @@ pub fn TopicCell(comptime T: type) type {
         /// Advance only the named subscriber and its reader version.
         pub fn advance(self: *Self, subscriber_id: []const u8, count: usize) !usize {
             const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
+            if (!sub.connected or sub.cursor == self.tailOffset()) return sub.cursor;
             if (count > self.tailOffset() - sub.cursor) return error.AdvancePastTail;
             if (count != 0) {
                 sub.cursor += count;
@@ -788,6 +793,45 @@ test "lazily/topic: ephemeral disconnect does not hold GC" {
     try std.testing.expectEqual(@as(usize, 1), topic.gc());
     _ = try topic.subscribe("viewer", .ephemeral);
     try std.testing.expectEqual(topic.tailOffset(), topic.subscription("viewer").?.cursor);
+}
+
+test "lazily/topic: tail and offline advance are no-ops" {
+    var topic = TopicCell([]const u8).init(std.testing.allocator);
+    defer topic.deinit();
+    _ = try topic.subscribe("worker", .durable);
+    _ = try topic.publish("a");
+    try std.testing.expectEqual(@as(usize, 1), try topic.advance("worker", 1));
+    try std.testing.expectEqual(@as(usize, 1), try topic.advance("worker", 1));
+
+    try topic.disconnect("worker");
+    _ = try topic.publish("b");
+    try std.testing.expectEqual(@as(usize, 0), (try topic.readStream("worker")).len);
+    try std.testing.expectEqual(@as(usize, 1), try topic.advance("worker", 1));
+    try std.testing.expectEqual(@as(usize, 1), topic.subscription("worker").?.cursor);
+
+    try topic.reconnect("worker");
+    try std.testing.expectEqualSlices([]const u8, &[_][]const u8{"b"}, try topic.readStream("worker"));
+    try std.testing.expectEqual(@as(usize, 1), topic.gc());
+    try std.testing.expectEqual(@as(usize, 1), topic.baseOffset());
+    try std.testing.expectEqual(@as(usize, 1), topic.subscription("worker").?.cursor);
+}
+
+test "lazily/topic: snapshot rejects disconnected ephemeral subscription" {
+    const invalid = TopicSnapshot([]const u8){
+        .allocator = std.testing.allocator,
+        .base_offset = 0,
+        .elements = @constCast(&[_][]const u8{}),
+        .subscriptions = @constCast(&[_]TopicSubscriptionSnapshot{.{
+            .subscriber_id = "viewer",
+            .cursor = 0,
+            .durability = .ephemeral,
+            .connected = false,
+        }}),
+    };
+    try std.testing.expectError(
+        error.DisconnectedEphemeralSubscription,
+        TopicCell([]const u8).initFromSnapshot(std.testing.allocator, invalid),
+    );
 }
 
 test "lazily/queue: SPSC FIFO basic" {
