@@ -491,6 +491,246 @@ pub fn newBounded(comptime T: type, ctx: *Context, capacity: usize) QueueCell(T,
 }
 
 // ===========================================================================
+// TopicCell — broadcast log with independent absolute cursors (#lztopiccell)
+// ===========================================================================
+
+pub const TopicDurability = enum { durable, ephemeral };
+
+pub const TopicSubscribeOutcome = enum { subscribed, reconnected, already_subscribed };
+
+pub const TopicSubscriptionSnapshot = struct {
+    subscriber_id: []const u8,
+    cursor: usize,
+    durability: TopicDurability,
+    connected: bool,
+};
+
+pub fn TopicSnapshot(comptime T: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        base_offset: usize,
+        elements: []T,
+        subscriptions: []TopicSubscriptionSnapshot,
+
+        const Self = @This();
+
+        pub fn deinit(self: *Self) void {
+            for (self.subscriptions) |subscription| {
+                self.allocator.free(subscription.subscriber_id);
+            }
+            self.allocator.free(self.subscriptions);
+            self.allocator.free(self.elements);
+        }
+    };
+}
+
+const TopicSubscription = struct {
+    cursor: usize,
+    durability: TopicDurability,
+    connected: bool,
+    reader_version: u64,
+};
+
+/// Broadcast topic whose stable subscribers own independent absolute cursors.
+/// Durable offline subscriptions retain data; ephemeral subscriptions disappear
+/// on disconnect. `gc` drops only the prefix below the slowest durable cursor,
+/// so it never increments any subscriber reader version.
+pub fn TopicCell(comptime T: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        base_offset: usize = 0,
+        elements: std.ArrayList(T) = .empty,
+        subscriptions: std.StringHashMap(TopicSubscription),
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{
+                .allocator = allocator,
+                .subscriptions = std.StringHashMap(TopicSubscription).init(allocator),
+            };
+        }
+
+        pub fn initFromSnapshot(allocator: std.mem.Allocator, saved: TopicSnapshot(T)) !Self {
+            var self = Self.init(allocator);
+            errdefer self.deinit();
+            self.base_offset = saved.base_offset;
+            try self.elements.appendSlice(allocator, saved.elements);
+            const tail = self.tailOffset();
+            for (saved.subscriptions) |saved_sub| {
+                if (saved_sub.cursor < self.base_offset or saved_sub.cursor > tail) {
+                    return error.CursorOutsideRetainedLog;
+                }
+                const owned_id = try allocator.dupe(u8, saved_sub.subscriber_id);
+                errdefer allocator.free(owned_id);
+                try self.subscriptions.put(owned_id, .{
+                    .cursor = saved_sub.cursor,
+                    .durability = saved_sub.durability,
+                    .connected = saved_sub.connected,
+                    .reader_version = 0,
+                });
+            }
+            return self;
+        }
+
+        pub fn deinit(self: *Self) void {
+            var iterator = self.subscriptions.keyIterator();
+            while (iterator.next()) |subscriber_id| self.allocator.free(subscriber_id.*);
+            self.subscriptions.deinit();
+            self.elements.deinit(self.allocator);
+        }
+
+        /// Start a cursor at the tail, or resume an offline durable subscriber.
+        pub fn subscribe(self: *Self, subscriber_id: []const u8, durability: TopicDurability) !TopicSubscribeOutcome {
+            if (self.subscriptions.getPtr(subscriber_id)) |sub| {
+                if (sub.connected) return .already_subscribed;
+                if (sub.durability != .durable) return error.EphemeralCannotReconnect;
+                sub.connected = true;
+                sub.reader_version += 1;
+                return .reconnected;
+            }
+            const owned_id = try self.allocator.dupe(u8, subscriber_id);
+            errdefer self.allocator.free(owned_id);
+            try self.subscriptions.put(owned_id, .{
+                .cursor = self.tailOffset(),
+                .durability = durability,
+                .connected = true,
+                .reader_version = 1,
+            });
+            return .subscribed;
+        }
+
+        pub fn reconnect(self: *Self, subscriber_id: []const u8) !void {
+            const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
+            if (sub.durability != .durable) return error.EphemeralCannotReconnect;
+            if (!sub.connected) {
+                sub.connected = true;
+                sub.reader_version += 1;
+            }
+        }
+
+        pub fn disconnect(self: *Self, subscriber_id: []const u8) !void {
+            const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
+            if (!sub.connected) return;
+            if (sub.durability == .ephemeral) {
+                const removed = self.subscriptions.fetchRemove(subscriber_id).?;
+                self.allocator.free(removed.key);
+                return;
+            }
+            sub.connected = false;
+            sub.reader_version += 1;
+        }
+
+        /// Append a value and invalidate every connected reader independently.
+        pub fn publish(self: *Self, value: T) !usize {
+            const offset = self.tailOffset();
+            try self.elements.append(self.allocator, value);
+            var iterator = self.subscriptions.valueIterator();
+            while (iterator.next()) |sub| {
+                if (sub.connected) sub.reader_version += 1;
+            }
+            return offset;
+        }
+
+        /// Read the retained suffix without advancing this subscriber's cursor.
+        pub fn readStream(self: *const Self, subscriber_id: []const u8) ![]const T {
+            const sub = self.subscriptions.get(subscriber_id) orelse return error.SubscriptionNotFound;
+            return self.elements.items[sub.cursor - self.base_offset ..];
+        }
+
+        pub fn read(self: *const Self, subscriber_id: []const u8) !?T {
+            const stream = try self.readStream(subscriber_id);
+            return if (stream.len == 0) null else stream[0];
+        }
+
+        /// Advance only the named subscriber and its reader version.
+        pub fn advance(self: *Self, subscriber_id: []const u8, count: usize) !usize {
+            const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
+            if (count > self.tailOffset() - sub.cursor) return error.AdvancePastTail;
+            if (count != 0) {
+                sub.cursor += count;
+                sub.reader_version += 1;
+            }
+            return sub.cursor;
+        }
+
+        /// Drop the safe prefix. Cursor offsets stay absolute; no reader changes.
+        pub fn gc(self: *Self) usize {
+            var frontier = self.tailOffset();
+            var iterator = self.subscriptions.valueIterator();
+            while (iterator.next()) |sub| {
+                if (sub.durability == .durable and sub.cursor < frontier) {
+                    frontier = sub.cursor;
+                }
+            }
+            const removed = frontier - self.base_offset;
+            var index: usize = 0;
+            while (index < removed) : (index += 1) _ = self.elements.orderedRemove(0);
+            self.base_offset = frontier;
+            return removed;
+        }
+
+        pub fn restart(self: *Self) void {
+            _ = self;
+        }
+
+        pub fn baseOffset(self: *const Self) usize {
+            return self.base_offset;
+        }
+
+        pub fn tailOffset(self: *const Self) usize {
+            return self.base_offset + self.elements.items.len;
+        }
+
+        pub fn items(self: *const Self) []const T {
+            return self.elements.items;
+        }
+
+        pub fn subscription(self: *const Self, subscriber_id: []const u8) ?TopicSubscriptionSnapshot {
+            const found = self.subscriptions.get(subscriber_id) orelse return null;
+            return .{
+                .subscriber_id = subscriber_id,
+                .cursor = found.cursor,
+                .durability = found.durability,
+                .connected = found.connected,
+            };
+        }
+
+        pub fn readerVersion(self: *const Self, subscriber_id: []const u8) ?u64 {
+            const found = self.subscriptions.get(subscriber_id) orelse return null;
+            return found.reader_version;
+        }
+
+        pub fn snapshot(self: *const Self, allocator: std.mem.Allocator) !TopicSnapshot(T) {
+            const elements = try allocator.dupe(T, self.elements.items);
+            errdefer allocator.free(elements);
+            const subscriptions = try allocator.alloc(TopicSubscriptionSnapshot, self.subscriptions.count());
+            errdefer allocator.free(subscriptions);
+            var initialized: usize = 0;
+            errdefer for (subscriptions[0..initialized]) |saved_sub| allocator.free(saved_sub.subscriber_id);
+
+            var iterator = self.subscriptions.iterator();
+            while (iterator.next()) |entry| {
+                const subscriber_id = try allocator.dupe(u8, entry.key_ptr.*);
+                subscriptions[initialized] = .{
+                    .subscriber_id = subscriber_id,
+                    .cursor = entry.value_ptr.cursor,
+                    .durability = entry.value_ptr.durability,
+                    .connected = entry.value_ptr.connected,
+                };
+                initialized += 1;
+            }
+            return .{
+                .allocator = allocator,
+                .base_offset = self.base_offset,
+                .elements = elements,
+                .subscriptions = subscriptions,
+            };
+        }
+    };
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 //
@@ -499,6 +739,56 @@ pub fn newBounded(comptime T: type, ctx: *Context, capacity: usize) QueueCell(T,
 // sharing). The conformance block replays the executable fixtures at
 // `../lazily-spec/conformance/collections/queuecell_*.json` — the cross-language
 // parity layer — asserting the exact reader-kind `invalidates` matrix.
+
+test "lazily/topic: broadcast cursors are independent" {
+    var topic = TopicCell([]const u8).init(std.testing.allocator);
+    defer topic.deinit();
+    try std.testing.expectEqual(TopicSubscribeOutcome.subscribed, try topic.subscribe("alice", .durable));
+    _ = try topic.subscribe("bob", .durable);
+    try std.testing.expectEqual(@as(usize, 0), try topic.publish("a"));
+    try std.testing.expectEqual(@as(usize, 1), try topic.publish("b"));
+    _ = try topic.advance("alice", 1);
+    try std.testing.expectEqualSlices([]const u8, &[_][]const u8{"b"}, try topic.readStream("alice"));
+    try std.testing.expectEqualSlices([]const u8, &[_][]const u8{ "a", "b" }, try topic.readStream("bob"));
+}
+
+test "lazily/topic: durable replay and safe GC" {
+    const allocator = std.testing.allocator;
+    var topic = TopicCell([]const u8).init(allocator);
+    defer topic.deinit();
+    _ = try topic.subscribe("fast", .durable);
+    _ = try topic.subscribe("slow", .durable);
+    _ = try topic.publish("a");
+    _ = try topic.publish("b");
+    _ = try topic.advance("fast", 2);
+    _ = try topic.advance("slow", 1);
+    try topic.disconnect("slow");
+    _ = try topic.publish("c");
+    try std.testing.expectEqual(@as(usize, 1), topic.gc());
+    try topic.reconnect("slow");
+    try std.testing.expectEqualSlices([]const u8, &[_][]const u8{ "b", "c" }, try topic.readStream("slow"));
+
+    var saved = try topic.snapshot(allocator);
+    defer saved.deinit();
+    var restored = try TopicCell([]const u8).initFromSnapshot(allocator, saved);
+    defer restored.deinit();
+    try std.testing.expectEqual(topic.baseOffset(), restored.baseOffset());
+    try std.testing.expectEqualSlices([]const u8, topic.items(), restored.items());
+}
+
+test "lazily/topic: ephemeral disconnect does not hold GC" {
+    var topic = TopicCell([]const u8).init(std.testing.allocator);
+    defer topic.deinit();
+    _ = try topic.subscribe("durable", .durable);
+    _ = try topic.subscribe("viewer", .ephemeral);
+    _ = try topic.publish("a");
+    _ = try topic.advance("durable", 1);
+    try topic.disconnect("viewer");
+    try std.testing.expect(topic.subscription("viewer") == null);
+    try std.testing.expectEqual(@as(usize, 1), topic.gc());
+    _ = try topic.subscribe("viewer", .ephemeral);
+    try std.testing.expectEqual(topic.tailOffset(), topic.subscription("viewer").?.cursor);
+}
 
 test "lazily/queue: SPSC FIFO basic" {
     const allocator = std.testing.allocator;

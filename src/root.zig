@@ -81,6 +81,11 @@ pub const QueueVersions = queue.QueueVersions;
 pub const VecDequeStorage = queue.VecDequeStorage;
 pub const QueuePushError = queue.QueuePushError;
 pub const QueuePopError = queue.QueuePopError;
+pub const TopicCell = queue.TopicCell;
+pub const TopicDurability = queue.TopicDurability;
+pub const TopicSnapshot = queue.TopicSnapshot;
+pub const TopicSubscribeOutcome = queue.TopicSubscribeOutcome;
+pub const TopicSubscriptionSnapshot = queue.TopicSubscriptionSnapshot;
 
 // #relaycell Phase 1 — merge algebra + MergeCell.
 pub const merge = @import("./lazily/merge.zig");
