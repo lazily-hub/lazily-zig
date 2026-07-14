@@ -92,6 +92,103 @@ pub const WorkQueueDeadLetterReason = work_queue.WorkQueueDeadLetterReason;
 pub const WorkQueueError = work_queue.WorkQueueError;
 pub const WorkQueueVersions = work_queue.WorkQueueVersions;
 
+// #lztime temporal source primitives (TimerCell/IntervalCell/CronCell/DeadlineCell).
+pub const temporal = @import("./lazily/temporal.zig");
+pub const ManualClock = temporal.ManualClock;
+pub const TimerCore = temporal.TimerCore;
+pub const TimerCell = temporal.TimerCell;
+pub const IntervalCore = temporal.IntervalCore;
+pub const IntervalCell = temporal.IntervalCell;
+pub const CronCore = temporal.CronCore;
+pub const CronCell = temporal.CronCell;
+pub const DeadlineState = temporal.DeadlineState;
+pub const DeadlineCore = temporal.DeadlineCore;
+pub const DeadlineCell = temporal.DeadlineCell;
+
+// #lzrateshape source operators (Debounce/Throttle/Sample/ProbabilisticSample).
+pub const rateshape = @import("./lazily/rateshape.zig");
+pub const DebounceCore = rateshape.DebounceCore;
+pub const DebounceCell = rateshape.DebounceCell;
+pub const ThrottleEdge = rateshape.ThrottleEdge;
+pub const ThrottleCore = rateshape.ThrottleCore;
+pub const ThrottleCell = rateshape.ThrottleCell;
+pub const SampleMode = rateshape.SampleMode;
+pub const SampleCore = rateshape.SampleCore;
+pub const SampleCell = rateshape.SampleCell;
+pub const SampleRng = rateshape.SampleRng;
+pub const Lcg = rateshape.Lcg;
+pub const ProbabilisticSampleCore = rateshape.ProbabilisticSampleCore;
+pub const ProbabilisticSampleCell = rateshape.ProbabilisticSampleCell;
+
+// #lzmemb membership + phi-accrual failure detection.
+pub const membership = @import("./lazily/membership.zig");
+pub const PeerState = membership.PeerState;
+pub const PeerChangeEvent = membership.PeerChangeEvent;
+pub const MembershipConfig = membership.MembershipConfig;
+pub const PhiAccrual = membership.PhiAccrual;
+pub const MembershipCore = membership.MembershipCore;
+pub const MembershipCell = membership.MembershipCell;
+
+// #lzcoord distributed coordination (lease/leader/lock/semaphore/barrier+quorum).
+pub const coordination = @import("./lazily/coordination.zig");
+pub const LeaseCore = coordination.LeaseCore;
+pub const LeaseCell = coordination.LeaseCell;
+pub const LeaderRole = coordination.LeaderRole;
+pub const LeaderCell = coordination.LeaderCell;
+pub const LockCell = coordination.LockCell;
+pub const SemaphoreCore = coordination.SemaphoreCore;
+pub const SemaphoreCell = coordination.SemaphoreCell;
+pub const BarrierCore = coordination.BarrierCore;
+pub const BarrierCell = coordination.BarrierCell;
+
+// #lzpresence presence + ephemeral plane.
+pub const presence = @import("./lazily/presence.zig");
+pub const Ephemeral = presence.Ephemeral;
+pub const Durable = presence.Durable;
+pub const EphemeralValue = presence.EphemeralValue;
+pub const EphemeralCore = presence.EphemeralCore;
+pub const EphemeralCell = presence.EphemeralCell;
+pub const EphemeralMapCore = presence.EphemeralMapCore;
+pub const PresentMapCell = presence.PresentMapCell;
+pub const PresenceCell = presence.PresenceCell;
+pub const AwarenessCell = presence.AwarenessCell;
+
+// #lzwindow stream windowing (tumbling count/time, sliding, session).
+pub const windowing = @import("./lazily/windowing.zig");
+pub const TumblingCountCore = windowing.TumblingCountCore;
+pub const TumblingTimeCore = windowing.TumblingTimeCore;
+pub const SlidingCore = windowing.SlidingCore;
+pub const SessionCore = windowing.SessionCore;
+pub const TumblingCountWindow = windowing.TumblingCountWindow;
+pub const TumblingTimeWindow = windowing.TumblingTimeWindow;
+pub const SlidingWindow = windowing.SlidingWindow;
+pub const SessionWindow = windowing.SessionWindow;
+
+// #lzresilience fault-tolerance (circuit breaker/retry/bulkhead/timeout).
+pub const resilience = @import("./lazily/resilience.zig");
+pub const BreakerState = resilience.BreakerState;
+pub const CircuitBreakerCore = resilience.CircuitBreakerCore;
+pub const CircuitBreakerCell = resilience.CircuitBreakerCell;
+pub const RetryPolicyCore = resilience.RetryPolicyCore;
+pub const RetryPolicyCell = resilience.RetryPolicyCell;
+pub const BulkheadCore = resilience.BulkheadCore;
+pub const BulkheadCell = resilience.BulkheadCell;
+pub const TimeoutCore = resilience.TimeoutCore;
+pub const TimeoutCell = resilience.TimeoutCell;
+
+// #lzservice embedded-service plane (health/readiness/discovery/registry).
+pub const service = @import("./lazily/service.zig");
+pub const Health = service.Health;
+pub const HealthCore = service.HealthCore;
+pub const HealthCell = service.HealthCell;
+pub const ReadinessCore = service.ReadinessCore;
+pub const ReadinessCell = service.ReadinessCell;
+pub const DiscoveryCore = service.DiscoveryCore;
+pub const DiscoveryCell = service.DiscoveryCell;
+pub const RegistryOp = service.RegistryOp;
+pub const ServiceRegistryCore = service.ServiceRegistryCore;
+pub const ServiceRegistry = service.ServiceRegistry;
+
 // #relaycell Phase 1 — merge algebra + MergeCell.
 pub const merge = @import("./lazily/merge.zig");
 pub const MergePolicy = merge.MergePolicy;
