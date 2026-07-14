@@ -61,14 +61,14 @@ notes and platform carve-outs lives in
 | Permission boundary (`PeerPermissions` / `RemoteOp`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Capability negotiation (`SessionHandshake`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Instrumentation / benchmarks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Temporal sources — `TimerCell` / `IntervalCell` / `CronCell` / `DeadlineCell` over a logical clock (`#lztime`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Rate-shaping operators — `DebounceCell` / `ThrottleCell` / `SampleCell` / `ProbabilisticSampleCell` (`#lzrateshape`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Membership + failure detection — `MembershipCell` (SWIM + Phi-accrual) / `PeerSet` / `PeerChangeEvent` (`#lzmemb`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Distributed coordination — `LeaseCell` / `LeaderCell` / `LockCell` / `SemaphoreCell` / `BarrierCell`+`QuorumCell` (`#lzcoord`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Presence + ephemeral plane — `PresenceCell` / `AwarenessCell` / `EphemeralCell` + `Ephemeral`/`Durable` markers (`#lzpresence`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Stream windowing — `TumblingWindow` / `SlidingWindow` / `SessionWindow` over the merge algebra (`#lzwindow`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Fault tolerance — `CircuitBreakerCell` / `RetryPolicyCell` / `BulkheadCell` / `TimeoutCell` (`#lzresilience`) | ✅ | — | ✅ | ✅ | — | — | — | — |
-| Embedded-service plane — `HealthCell` / `ReadinessCell` / `DiscoveryCell` / `ServiceRegistry` (`#lzservice`) | ✅ | — | ✅ | ✅ | — | — | — | — |
+| Temporal sources — `TimerCell` / `IntervalCell` / `CronCell` / `DeadlineCell` over a logical clock (`#lztime`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Rate-shaping operators — `DebounceCell` / `ThrottleCell` / `SampleCell` / `ProbabilisticSampleCell` (`#lzrateshape`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Membership + failure detection — `MembershipCell` (SWIM + Phi-accrual) / `PeerSet` / `PeerChangeEvent` (`#lzmemb`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Distributed coordination — `LeaseCell` / `LeaderCell` / `LockCell` / `SemaphoreCell` / `BarrierCell`+`QuorumCell` (`#lzcoord`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Presence + ephemeral plane — `PresenceCell` / `AwarenessCell` / `EphemeralCell` + `Ephemeral`/`Durable` markers (`#lzpresence`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Stream windowing — `TumblingWindow` / `SlidingWindow` / `SessionWindow` over the merge algebra (`#lzwindow`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Fault tolerance — `CircuitBreakerCell` / `RetryPolicyCell` / `BulkheadCell` / `TimeoutCell` (`#lzresilience`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
+| Embedded-service plane — `HealthCell` / `ReadinessCell` / `DiscoveryCell` / `ServiceRegistry` (`#lzservice`) | ✅ | — | ✅ | ✅ | — | ✅ | — | — |
 <!-- coverage-table:end -->
 
 ## lazily-spec compliance
@@ -97,6 +97,14 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/seq_crdt.zig` | `SeqCrdt` — move-aware sequence CRDT (fractional-index positions, three independent LWW registers per entry). |
 | `src/lazily/crdt_plane.zig` | `CrdtPlane` (HLC + membership + stability watermark), `OpLog` (idempotent dedup), `CrdtPlaneRuntime` (anti-entropy, `syncFrame`/`ingest`) + reactive family-granularity sync (`#lzfamilysync`): `registerFamilyLww`/`familySetLww`/`familyKeys`/`familyValueLww`/`membershipEpoch` — an inbound keyed op for an unregistered family entry **materializes** it on ingest (never dropped). Replays `../lazily-spec/conformance/familysync/materialize_on_ingest.json`. |
 | `src/lazily/reliable_sync.zig` | Reliable-sync coordinator plus `OutboxStore`, shared `StoredOutbox(S)` protocol, `InMemoryStore`, and a locked append-only `FileOutboxStore` whose persisted cursor folds with `max`. |
+| `src/lazily/temporal.zig` | Temporal sources (`#lztime`): `TimerCore`/`TimerCell`, `IntervalCore`/`IntervalCell`, `CronCore`/`CronCell`, `DeadlineCore`/`DeadlineCell(T)` over a monotone logical clock (`ManualClock`). Each pure compute core is split from a reactive cell whose per-reader version counter bumps only on an actual fire/expiry edge. Replays `../lazily-spec/conformance/temporal/*.json`. |
+| `src/lazily/rateshape.zig` | Rate-shaping source operators (`#lzrateshape`): `DebounceCell`, `ThrottleCell` (Leading/Trailing), `SampleCell` (Count/Time), `ProbabilisticSampleCell` (+`Lcg`/`SampleRng`). The lifted relay policies (`RatePolicy`/`WindowPolicy`/`ExpiryPolicy`) live in `relay.zig` and are not duplicated here. A dropped input never invalidates the `output` reader. Replays `../lazily-spec/conformance/rateshape/*.json`. |
+| `src/lazily/membership.zig` | Membership + failure detection (`#lzmemb`): `PhiAccrual` (Akka logistic phi), SWIM `MembershipCore`/`MembershipCell` (`PeerState` Alive/Suspect/Dead/Left, `PeerChangeEvent`). The `PeerSet` reader invalidates only when the alive set changes. Replays `../lazily-spec/conformance/membership/*.json`. |
+| `src/lazily/coordination.zig` | Distributed coordination (`#lzcoord`): `LeaseCore`/`LeaseCell` (monotone fencing token), `LeaderCell`, `LockCell`, `SemaphoreCore`/`SemaphoreCell`, `BarrierCore`/`BarrierCell` (+`quorum` = strict majority). Salient reader (holder/leader/lock/permits/is_open) invalidates only on change. Replays `../lazily-spec/conformance/coordination/*.json`. |
+| `src/lazily/presence.zig` | Presence + ephemeral plane (`#lzpresence`): `EphemeralCore`/`EphemeralCell` (single value + TTL), `EphemeralMapCore`, `PresenceCell`/`AwarenessCell` (per-peer TTL map) + `Ephemeral`/`Durable` marker parity. The live-view reader invalidates only on a live-view change. Replays `../lazily-spec/conformance/presence/*.json`. |
+| `src/lazily/windowing.zig` | Stream windowing (`#lzwindow`): `TumblingCountWindow`, `TumblingTimeWindow`, `SlidingWindow`, `SessionWindow` — window aggregation reuses the `merge.MergePolicy` algebra (the aggregate is the associative fold). The `output` reader projects the last emitted aggregate. Replays `../lazily-spec/conformance/windowing/*.json`. |
+| `src/lazily/resilience.zig` | Fault-tolerance primitives (`#lzresilience`): `CircuitBreakerCore`/`CircuitBreakerCell` (`BreakerState` Closed/Open/HalfOpen over a sliding window), `RetryPolicyCell` (exponential backoff), `BulkheadCell` (bounded pool), `TimeoutCell` (deadline edge). Replays `../lazily-spec/conformance/resilience/*.json`. |
+| `src/lazily/service.zig` | Embedded-service plane (`#lzservice`): `HealthCell` (worst-component aggregate), `ReadinessCell` (all-conditions gate), `DiscoveryCell(P)` (service→endpoint + membership eviction), `ServiceRegistry` (durable log + replay projection). Composed reader invalidates only on change. Replays `../lazily-spec/conformance/service/*.json`. |
 | `src/lazily/state_mirror.zig` | `StateGraphMirror` — read-only projection of a remote graph from `Snapshot`/`Delta` messages. |
 | `src/lazily/webrtc_transport.zig` | The portable WebRTC seam: `DataChannel` vtable, permission-filtering `WebRtcSink` / verbatim `WebRtcSource`, `InMemoryDataChannel` loopback pair. The concrete native backend is a consumer-provided adapter. |
 | `src/lazily/signaling.zig` | Signaling protocol wire types (`ClientMessage`/`ServerMessage`) + in-process `SignalingRoom` (anti-spoof `from` stamping). |
