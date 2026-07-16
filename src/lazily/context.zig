@@ -339,40 +339,52 @@ pub fn valueFnCacheKey(valueFn: anytype) usize {
 /// sensitive snapshot-then-clear-then-iterate control flow is unchanged. Access
 /// is always serialized by `ctx.mutex`, exactly as the map was.
 pub const SlotEdgeSet = struct {
-    /// Inline slots before spilling to a map. 4 covers the low-degree common
-    /// case (spreadsheet fan-in/out is 2, diamond/multi-subscriber test graphs
-    /// are ≤3) while keeping the per-slot footprint modest (4 pointers = 32
-    /// bytes/direction). Higher-degree nodes (e.g. one source feeding many
-    /// dependents) spill to a heap `AutoHashMap`.
-    pub const inline_cap: usize = 4;
+    /// Inline edges before spilling. 2 mirrors lazily-rs `EdgeVec = SmallVec<[SlotId; 2]>`
+    /// (`#lzvecedge`): reactive graphs are overwhelmingly degree 2-3 (a
+    /// spreadsheet formula reads 2-3 cells, diamond/multi-subscriber test
+    /// graphs are ≤3), so 2 inline covers the common case with the smallest
+    /// per-slot footprint (2 pointers = 16 bytes/direction). Higher-degree
+    /// nodes (one source feeding many dependents) spill to a heap ArrayList.
+    pub const inline_cap: usize = 2;
 
     // NOTE: no stored `allocator` field. It was 16 bytes/direction (a vtable
     // pair) paid by every edge set even though it is needed only on the rare
-    // inline→map spill. The spill allocator is now passed to `getOrPut` from
-    // the owning Slot's `ctx.allocator` (~640 MB saved at 10M-node scale).
+    // inline→spill transition. The spill allocator is passed to `getOrPut`/
+    // `deinit` from the owning Slot's `ctx.allocator`.
     buf: [inline_cap]*Slot = undefined,
     len: usize = 0,
-    map: ?std.AutoHashMap(*Slot, void) = null,
+    /// Spill store: a growable `ArrayList(*Slot)` with linear dedup, replacing
+    /// the former `AutoHashMap(*Slot, void)` spill (`#lzvecedge`). Linear
+    /// `contains` on a small set is cache-friendlier and faster than
+    /// hash+probe (no hashing, no bucket chain), matching lazily-rs `EdgeVec` /
+    /// `edge_insert` (`SmallVec<[SlotId;2]>` + linear `contains`). Only the
+    /// rare high-fan-out node spills; while spilled, `len` is held at 0 and
+    /// `buf` is unused.
+    spill: ?std.ArrayList(*Slot) = null,
 
     pub fn init() SlotEdgeSet {
         return .{};
     }
 
-    pub fn deinit(self: *SlotEdgeSet) void {
-        if (self.map) |*m| m.deinit();
+    pub fn deinit(self: *SlotEdgeSet, allocator: std.mem.Allocator) void {
+        if (self.spill) |*s| s.deinit(allocator);
         self.* = undefined;
     }
 
     pub fn count(self: *const SlotEdgeSet) usize {
-        return if (self.map) |*m| m.count() else self.len;
+        return if (self.spill) |*s| s.items.len else self.len;
     }
 
     /// Dedup-add `key`. Mirrors `AutoHashMap.getOrPut` for the graph's use
-    /// (callers only rely on the dedup side effect). Spills inline→map when the
-    /// inline buffer is full. `allocator` is used only on the (rare) spill.
+    /// (callers only rely on the dedup side effect). Spills inline→ArrayList
+    /// when the inline buffer is full. `allocator` is used only on the (rare)
+    /// spill and its amortized growth.
     pub fn getOrPut(self: *SlotEdgeSet, key: *Slot, allocator: std.mem.Allocator) !void {
-        if (self.map) |*m| {
-            _ = try m.getOrPut(key);
+        if (self.spill) |*s| {
+            for (s.items) |e| {
+                if (e == key) return; // already present
+            }
+            try s.append(allocator, key);
             return;
         }
         for (self.buf[0..self.len]) |e| {
@@ -383,22 +395,30 @@ pub const SlotEdgeSet = struct {
             self.len += 1;
             return;
         }
-        // Inline buffer full — spill to a heap map (allocate ONCE, then reuse).
-        var m = std.AutoHashMap(*Slot, void).init(allocator);
-        errdefer m.deinit();
-        try m.ensureTotalCapacity(inline_cap + 1);
-        for (self.buf[0..self.len]) |e| {
-            m.putAssumeCapacity(e, {});
-        }
-        m.putAssumeCapacity(key, {});
-        self.map = m;
+        // Inline buffer full — spill to a heap ArrayList (allocate ONCE, then
+        // reuse). Copy the inline entries in, then add the new key.
+        var s = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty;
+        errdefer s.deinit(allocator);
+        try s.ensureTotalCapacity(allocator, inline_cap + 1);
+        for (self.buf[0..self.len]) |e| s.appendAssumeCapacity(e);
+        s.appendAssumeCapacity(key);
+        self.spill = s;
         self.len = 0;
     }
 
-    /// Remove `key` if present; returns whether it was. Inline path uses
+    /// Remove `key` if present; returns whether it was. Both paths use
     /// swap-remove (set is unordered; all iteration sites snapshot first).
     pub fn remove(self: *SlotEdgeSet, key: *Slot) bool {
-        if (self.map) |*m| return m.remove(key);
+        if (self.spill) |*s| {
+            for (s.items, 0..) |e, i| {
+                if (e == key) {
+                    s.items[i] = s.items[s.items.len - 1];
+                    _ = s.pop();
+                    return true;
+                }
+            }
+            return false;
+        }
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
             if (self.buf[i] == key) {
@@ -411,20 +431,29 @@ pub const SlotEdgeSet = struct {
     }
 
     pub fn clearRetainingCapacity(self: *SlotEdgeSet) void {
-        if (self.map) |*m| m.clearRetainingCapacity();
+        if (self.spill) |*s| s.clearRetainingCapacity();
         self.len = 0;
     }
 
     /// Iterator matching `AutoHashMap.keyIterator()`: `next()` yields
     /// `*(*Slot)` (a pointer to the stored key), so existing call sites'
-    /// `ptr.*` continues to work.
+    /// `ptr.*` continues to work. The returned pointer is stable for the
+    /// duration of a snapshot-then-clear iterate cycle (the only mutation
+    /// callers perform after iteration is `clearRetainingCapacity`, which
+    /// keeps the backing but resets length).
     pub const KeyIterator = struct {
         set: *SlotEdgeSet,
         idx: usize = 0,
-        map_it: ?std.AutoHashMap(*Slot, void).KeyIterator = null,
 
         pub fn next(self: *KeyIterator) ?*(*Slot) {
-            if (self.map_it) |*mi| return mi.next();
+            if (self.set.spill) |*s| {
+                if (self.idx < s.items.len) {
+                    const p = &s.items[self.idx];
+                    self.idx += 1;
+                    return p;
+                }
+                return null;
+            }
             if (self.idx < self.set.len) {
                 const p = &self.set.buf[self.idx];
                 self.idx += 1;
@@ -435,7 +464,6 @@ pub const SlotEdgeSet = struct {
     };
 
     pub fn keyIterator(self: *SlotEdgeSet) KeyIterator {
-        if (self.map) |*m| return .{ .set = self, .map_it = m.keyIterator() };
         return .{ .set = self };
     }
 };
@@ -900,8 +928,8 @@ pub const Slot = struct {
             }
             self.storage = null;
         }
-        self.change_subscribers.deinit();
-        self.parents.deinit();
+        self.change_subscribers.deinit(self.ctx.allocator);
+        self.parents.deinit(self.ctx.allocator);
         self.ctx.allocator.destroy(self);
     }
 
@@ -1297,23 +1325,23 @@ fn fakeSlot(i: usize) *Slot {
 test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, clear" {
     const a = std.testing.allocator;
     var set = SlotEdgeSet.init();
-    defer set.deinit();
+    defer set.deinit(a);
 
-    // Fill exactly to inline capacity — stays inline (no map).
+    // Fill exactly to inline capacity — stays inline (no spill).
     var i: usize = 0;
     while (i < SlotEdgeSet.inline_cap) : (i += 1) try set.getOrPut(fakeSlot(i), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
-    try std.testing.expect(set.map == null);
+    try std.testing.expect(set.spill == null);
 
     // Dedup: re-adding an existing key does not grow the set.
     try set.getOrPut(fakeSlot(0), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
-    try std.testing.expect(set.map == null);
+    try std.testing.expect(set.spill == null);
 
-    // One more distinct key spills to a heap map, preserving every entry.
+    // One more distinct key spills to the heap ArrayList, preserving every entry.
     try set.getOrPut(fakeSlot(SlotEdgeSet.inline_cap), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap + 1, set.count());
-    try std.testing.expect(set.map != null);
+    try std.testing.expect(set.spill != null);
 
     // Iterate: every inserted key appears exactly once.
     var seen: usize = 0;
@@ -1329,7 +1357,7 @@ test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, cl
     }
     try std.testing.expectEqual(SlotEdgeSet.inline_cap + 1, seen);
 
-    // Remove from the spilled map; second remove reports absence.
+    // Remove from the spilled ArrayList; second remove reports absence.
     try std.testing.expect(set.remove(fakeSlot(0)));
     try std.testing.expect(!set.remove(fakeSlot(0)));
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
@@ -1341,31 +1369,29 @@ test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, cl
 test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no spill" {
     const a = std.testing.allocator;
     var set = SlotEdgeSet.init();
-    defer set.deinit();
+    defer set.deinit(a);
 
+    // Fill exactly to inline capacity (2) — stays inline.
     try set.getOrPut(fakeSlot(0), a);
     try set.getOrPut(fakeSlot(1), a);
-    try set.getOrPut(fakeSlot(2), a);
-    try std.testing.expect(set.map == null);
-    try std.testing.expectEqual(@as(usize, 3), set.count());
+    try std.testing.expect(set.spill == null);
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
 
-    // Swap-remove the middle entry: the other two survive, still inline.
-    try std.testing.expect(set.remove(fakeSlot(1)));
-    try std.testing.expect(!set.remove(fakeSlot(1)));
-    try std.testing.expectEqual(@as(usize, 2), set.count());
+    // Swap-remove one entry: the survivor stays, still inline.
+    try std.testing.expect(set.remove(fakeSlot(0)));
+    try std.testing.expect(!set.remove(fakeSlot(0)));
+    try std.testing.expectEqual(@as(usize, 1), set.count());
 
-    // Both survivors still resolve via iteration.
-    var have0 = false;
-    var have2 = false;
+    // The survivor still resolves via iteration.
+    var have1 = false;
     var it = set.keyIterator();
     while (it.next()) |ptr| {
-        if (ptr.* == fakeSlot(0)) have0 = true;
-        if (ptr.* == fakeSlot(2)) have2 = true;
+        if (ptr.* == fakeSlot(1)) have1 = true;
     }
-    try std.testing.expect(have0 and have2);
+    try std.testing.expect(have1);
 
     // Re-adding fills the freed inline slot without ever spilling.
-    try set.getOrPut(fakeSlot(1), a);
-    try std.testing.expectEqual(@as(usize, 3), set.count());
-    try std.testing.expect(set.map == null);
+    try set.getOrPut(fakeSlot(0), a);
+    try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
+    try std.testing.expect(set.spill == null);
 }
