@@ -223,6 +223,7 @@ pub fn main() !void {
             var arena = std.heap.ArenaAllocator.init(base);
             const a = arena.allocator();
             const ctx = try Context.init(a);
+            try ctx.initDense(2 * n + 1);
             const t0 = nowNs();
             try buildInputs(ctx, a, n);
             const t1 = nowNs();
@@ -240,6 +241,7 @@ pub fn main() !void {
             var arena = std.heap.ArenaAllocator.init(base);
             const a = arena.allocator();
             const ctx = try Context.init(a);
+            try ctx.initDense(2 * n + 1);
             try buildInputs(ctx, a, n);
             const t0 = nowNs();
             sink = readAllFormulas(ctx, n);
@@ -255,6 +257,7 @@ pub fn main() !void {
         var arena = std.heap.ArenaAllocator.init(base);
         const a = arena.allocator();
         const ctx = try Context.init(a);
+        try ctx.initDense(2 * n + 1);
         try buildInputs(ctx, a, n);
         sink = readAllFormulas(ctx, n); // warm the whole sheet once
 
@@ -288,6 +291,7 @@ pub fn main() !void {
         var arena = std.heap.ArenaAllocator.init(base);
         const a = arena.allocator();
         const ctx = try Context.init(a);
+        try ctx.initDense(2 * n + 1);
         try buildInputs(ctx, a, n);
         sink = readAllFormulas(ctx, n); // warm once
 

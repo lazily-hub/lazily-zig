@@ -26,6 +26,13 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     // Function pointer -> cached result
     cache: std.AutoHashMap(usize, *Slot),
+    // Optional dense direct-indexed cache for the keyed (runtime-integer-key)
+    // path. When non-null, `cacheLookup`/`cachePublish`/`cacheRemove` consult it
+    // first, turning a hot keyed read into a single indexed load instead of a
+    // hash probe of the 2N-entry `cache` (the dominant cost at 10M-node scale).
+    // Opt-in via `initDense`; null by default so the function-pointer-keyed path
+    // and all default callers are byte-identical to the map-only model.
+    dense_cache: ?[]?*Slot = null,
     // Use a real Mutex if thread_safe is true, otherwise use a "no-op" struct
     mutex: if (build_options.thread_safe) GraphMutex else struct {
         pub fn lock(_: *@This()) void {}
@@ -98,6 +105,56 @@ pub const Context = struct {
         return ctx;
     }
 
+    /// Pre-size the hash-map cache. Eliminates the ~log2(N) rehash storms that
+    /// dominate `cold_full_recalc` when the cache grows from empty to 2N entries.
+    pub fn ensureCacheCapacity(self: *Context, capacity: usize) !void {
+        try self.cache.ensureTotalCapacity(@intCast(capacity));
+    }
+
+    /// Opt into a dense direct-indexed cache keyed by `0..=max_key`. After this,
+    /// keyed reads whose `cache_key <= max_key` are a single indexed load
+    /// (`dense_cache[key]`) instead of a hash probe. Keys outside the range, and
+    /// the function-pointer-keyed path (sparse address keys), fall back to the
+    /// hash map. The map is also pre-sized so its fallback path avoids rehashing.
+    pub fn initDense(self: *Context, max_key: usize) !void {
+        const slots = try self.allocator.alloc(?*Slot, max_key + 1);
+        @memset(slots, null);
+        self.dense_cache = slots;
+        try self.cache.ensureTotalCapacity(@intCast(max_key + 1));
+    }
+
+    /// Look up a cached slot. Dense array first (if enabled and in range), then
+    /// the hash map. Always called under `mutex`.
+    pub fn cacheLookup(self: *Context, key: usize) ?*Slot {
+        if (self.dense_cache) |arr| {
+            if (key < arr.len) return arr[key];
+        }
+        return self.cache.get(key);
+    }
+
+    /// Remove a cache entry from whichever store holds it. Always under `mutex`.
+    pub fn cacheRemove(self: *Context, key: usize) void {
+        if (self.dense_cache) |arr| {
+            if (key < arr.len) arr[key] = null;
+        }
+        _ = self.cache.remove(key);
+    }
+
+    /// Publish a freshly-materialized slot under `key`. The caller must have
+    /// already confirmed (via `cacheLookup`) that no entry exists — this is safe
+    /// because the whole materialization runs under the reentrant `mutex`.
+    /// Dense store wins when enabled and in range; otherwise the hash map.
+    pub fn cachePublish(self: *Context, key: usize, slot: *Slot) !void {
+        if (self.dense_cache) |arr| {
+            if (key < arr.len) {
+                arr[key] = slot;
+                return;
+            }
+        }
+        const gop = try self.cache.getOrPut(key);
+        gop.value_ptr.* = slot;
+    }
+
     pub fn deinit(self: *Context) void {
         self.mutex.lock();
         // The mutex is not unlocked due to this being deinit which deallocates self.
@@ -108,6 +165,15 @@ pub const Context = struct {
             context_slot.destroyUnlocked(false);
         }
         self.cache.deinit();
+
+        // Dense-cache entries are NOT duplicated in the hash map, so destroy any
+        // slots held only by the dense array before freeing it.
+        if (self.dense_cache) |arr| {
+            for (arr) |maybe_slot| {
+                if (maybe_slot) |slot| slot.destroyUnlocked(false);
+            }
+            self.allocator.free(arr);
+        }
         self.pending_recompute.deinit(self.allocator);
 
         // Free orphaned slots (stale-removed from cache but kept alive because
@@ -138,7 +204,7 @@ pub const Context = struct {
         const cache_key = valueFnCacheKey(fnc);
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.cache.get(cache_key);
+        return self.cacheLookup(cache_key);
     }
 
     /// Drain the pending-recompute queue. Called outside the graph mutex so that
@@ -270,13 +336,16 @@ pub const SlotEdgeSet = struct {
     /// dependents) spill to a heap `AutoHashMap`.
     pub const inline_cap: usize = 4;
 
-    allocator: std.mem.Allocator,
+    // NOTE: no stored `allocator` field. It was 16 bytes/direction (a vtable
+    // pair) paid by every edge set even though it is needed only on the rare
+    // inline→map spill. The spill allocator is now passed to `getOrPut` from
+    // the owning Slot's `ctx.allocator` (~640 MB saved at 10M-node scale).
     buf: [inline_cap]*Slot = undefined,
     len: usize = 0,
     map: ?std.AutoHashMap(*Slot, void) = null,
 
-    pub fn init(allocator: std.mem.Allocator) SlotEdgeSet {
-        return .{ .allocator = allocator };
+    pub fn init() SlotEdgeSet {
+        return .{};
     }
 
     pub fn deinit(self: *SlotEdgeSet) void {
@@ -290,8 +359,8 @@ pub const SlotEdgeSet = struct {
 
     /// Dedup-add `key`. Mirrors `AutoHashMap.getOrPut` for the graph's use
     /// (callers only rely on the dedup side effect). Spills inline→map when the
-    /// inline buffer is full.
-    pub fn getOrPut(self: *SlotEdgeSet, key: *Slot) !void {
+    /// inline buffer is full. `allocator` is used only on the (rare) spill.
+    pub fn getOrPut(self: *SlotEdgeSet, key: *Slot, allocator: std.mem.Allocator) !void {
         if (self.map) |*m| {
             _ = try m.getOrPut(key);
             return;
@@ -305,7 +374,7 @@ pub const SlotEdgeSet = struct {
             return;
         }
         // Inline buffer full — spill to a heap map (allocate ONCE, then reuse).
-        var m = std.AutoHashMap(*Slot, void).init(self.allocator);
+        var m = std.AutoHashMap(*Slot, void).init(allocator);
         errdefer m.deinit();
         try m.ensureTotalCapacity(inline_cap + 1);
         for (self.buf[0..self.len]) |e| {
@@ -439,8 +508,8 @@ pub const Slot = struct {
             .mode = mode,
             .storage = null,
             .ptr_size = ptr_size,
-            .change_subscribers = SlotEdgeSet.init(ctx.allocator),
-            .parents = SlotEdgeSet.init(ctx.allocator),
+            .change_subscribers = SlotEdgeSet.init(),
+            .parents = SlotEdgeSet.init(),
             .deinitPayload = deinitPayload,
             .free = if (mode == .indirect) free else null,
         };
@@ -502,22 +571,23 @@ pub const Slot = struct {
             },
         }
 
-        // Dedup + publish in one hash lookup (`#lzcachegop`). If another thread
-        // (or a re-entrant valueFn) already published a slot for this cache_key,
-        // discard `self` — use `destroySelf(true)` (recurse=true) so the new
-        // slot's parent edges are unsubscribed (`destroySelf(false)` left
-        // dangling references in parents' `change_subscribers`, a pre-existing
-        // bug surfaced by the reentrant lock change, since valueFn now actually
-        // registers edges before we reach this dedup check under a held lock).
-        // Otherwise, `self` is the winner: write it into the entry we just
-        // reserved. `getOrPut` folds the former `get` + `put` (two hashes of the
-        // 2N-entry cache per materialization) into one.
-        const gop = try ctx.cache.getOrPut(cache_key);
-        if (gop.found_existing) {
+        // Dedup + publish in one lookup (`#lzcachegop`, now dense-aware). If
+        // another thread (or a re-entrant valueFn) already published a slot for
+        // this cache_key, discard `self` — use `destroySelf(true)` (recurse=true)
+        // so the new slot's parent edges are unsubscribed (`destroySelf(false)`
+        // left dangling references in parents' `change_subscribers`, a
+        // pre-existing bug surfaced by the reentrant lock change, since valueFn
+        // now actually registers edges before we reach this dedup check under a
+        // held lock). Otherwise, `self` is the winner: publish it. This whole
+        // block runs under the reentrant `mutex`, so check-then-publish is race-
+        // free. `cachePublish` writes to the dense array when enabled (one indexed
+        // store) instead of a hash `getOrPut` — folding the former `get` + `put`
+        // (two hashes of the 2N-entry cache per materialization) into one.
+        if (ctx.cacheLookup(cache_key)) |existing| {
             self.destroySelf(true);
-            return gop.value_ptr.*;
+            return existing;
         }
-        gop.value_ptr.* = self;
+        try ctx.cachePublish(cache_key, self);
         return self;
     }
 
@@ -559,8 +629,8 @@ pub const Slot = struct {
     }
 
     pub fn subscribeChangeUnlocked(self: *Slot, child: *Slot) !void {
-        try self.change_subscribers.getOrPut(child);
-        try child.parents.getOrPut(self);
+        try self.change_subscribers.getOrPut(child, self.ctx.allocator);
+        try child.parents.getOrPut(self, self.ctx.allocator);
         self.ctx.bump("dependency_edges_added");
     }
 
@@ -710,7 +780,7 @@ pub const Slot = struct {
     pub fn destroyUnlocked(self: *Slot, recurse: ?bool) void {
         // Remove from cache if not already cleared by Context.deinit
         if (self.cache_key) |cache_key| {
-            _ = self.ctx.cache.remove(cache_key);
+            self.ctx.cacheRemove(cache_key);
         } else {
             unreachable;
         }
@@ -1181,22 +1251,22 @@ fn fakeSlot(i: usize) *Slot {
 
 test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, clear" {
     const a = std.testing.allocator;
-    var set = SlotEdgeSet.init(a);
+    var set = SlotEdgeSet.init();
     defer set.deinit();
 
     // Fill exactly to inline capacity — stays inline (no map).
     var i: usize = 0;
-    while (i < SlotEdgeSet.inline_cap) : (i += 1) try set.getOrPut(fakeSlot(i));
+    while (i < SlotEdgeSet.inline_cap) : (i += 1) try set.getOrPut(fakeSlot(i), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
     try std.testing.expect(set.map == null);
 
     // Dedup: re-adding an existing key does not grow the set.
-    try set.getOrPut(fakeSlot(0));
+    try set.getOrPut(fakeSlot(0), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
     try std.testing.expect(set.map == null);
 
     // One more distinct key spills to a heap map, preserving every entry.
-    try set.getOrPut(fakeSlot(SlotEdgeSet.inline_cap));
+    try set.getOrPut(fakeSlot(SlotEdgeSet.inline_cap), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap + 1, set.count());
     try std.testing.expect(set.map != null);
 
@@ -1225,12 +1295,12 @@ test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, cl
 
 test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no spill" {
     const a = std.testing.allocator;
-    var set = SlotEdgeSet.init(a);
+    var set = SlotEdgeSet.init();
     defer set.deinit();
 
-    try set.getOrPut(fakeSlot(0));
-    try set.getOrPut(fakeSlot(1));
-    try set.getOrPut(fakeSlot(2));
+    try set.getOrPut(fakeSlot(0), a);
+    try set.getOrPut(fakeSlot(1), a);
+    try set.getOrPut(fakeSlot(2), a);
     try std.testing.expect(set.map == null);
     try std.testing.expectEqual(@as(usize, 3), set.count());
 
@@ -1250,7 +1320,7 @@ test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no sp
     try std.testing.expect(have0 and have2);
 
     // Re-adding fills the freed inline slot without ever spilling.
-    try set.getOrPut(fakeSlot(1));
+    try set.getOrPut(fakeSlot(1), a);
     try std.testing.expectEqual(@as(usize, 3), set.count());
     try std.testing.expect(set.map == null);
 }

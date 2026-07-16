@@ -66,7 +66,7 @@ pub fn slotKeyed(
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
 
-        if (ctx.cache.get(cache_key)) |cached_slot| {
+        if (ctx.cacheLookup(cache_key)) |cached_slot| {
             if (cached_slot.storage != null and !cached_slot.stale) {
                 // Fresh cached value — return it.
                 const current_slot: ?*Slot = currentSlotFor(ctx);
@@ -80,7 +80,7 @@ pub fn slotKeyed(
             // storage pointer may be held by a reader on another thread.
             // It's freed at Context.deinit.
             if (cached_slot.stale) {
-                _ = ctx.cache.remove(cache_key);
+                ctx.cacheRemove(cache_key);
                 ctx.orphaned_slots.append(ctx.allocator, cached_slot) catch {};
             }
         }
