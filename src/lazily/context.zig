@@ -60,6 +60,14 @@ pub const Context = struct {
     // destroy-on-invalidate UAF that caused SEGV under concurrent same-cell
     // writes. Bounded by the number of invalidation cycles between deinits.
     orphaned_slots: std.ArrayList(*Slot),
+    // Reusable DFS worklist for the invalidation/destroy cascades
+    // (`#lziterbfs`, the #lzbatchborrow port). Grown once on first use and
+    // reused across `invalidateSlotUnlocked` / `emitChangeUnlocked` /
+    // `destroySelf` calls, replacing the per-cascade-level
+    // `allocator.alloc(*Slot, count)` snapshots those functions used to take.
+    // Always empty on entry (each cascade drains it to completion under
+    // `mutex`); the trailing `defer clearRetainingCapacity()` is a safety net.
+    cascade_scratch: std.ArrayList(*Slot),
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
@@ -101,6 +109,7 @@ pub const Context = struct {
             ).init(allocator),
             .pending_recompute = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
             .orphaned_slots = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
+            .cascade_scratch = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
         };
         return ctx;
     }
@@ -183,6 +192,7 @@ pub const Context = struct {
             slot.destroySelf(false);
         }
         self.orphaned_slots.deinit(self.allocator);
+        self.cascade_scratch.deinit(self.allocator);
 
         // Capture the post-deinit hook before freeing self: `destroy(self)`
         // deallocates the Context struct via `allocator`, and the hook owns
@@ -695,32 +705,64 @@ pub const Slot = struct {
         const subscriber_count = self.change_subscribers.count();
         if (subscriber_count == 0) return;
 
-        // Snapshot dependents to avoid iteration-during-mutation.
-        const subscribers = self.ctx.allocator.alloc(*Slot, subscriber_count) catch return;
-        defer self.ctx.allocator.free(subscribers);
+        // Iterative cascade (`#lziterbfs`, the #lzbatchborrow port): seed the
+        // shared worklist with this slot's direct dependents, then drain. This
+        // replaces the per-call `allocator.alloc(*Slot, count)` snapshot the
+        // recursive version took; the Context-owned `cascade_scratch` is grown
+        // once and reused.
+        //
+        // The snapshot-before-iterate invariant that fixed #lzuafix is
+        // preserved: `self.change_subscribers` is drained into the worklist
+        // and cleared BEFORE any dependent is processed, so a re-entrant
+        // unsubscribe cannot mutate the set mid-iteration. (`on_invalidate`
+        // hooks only mutate `s.stale` + `pending_recompute`, never the
+        // parent's edge set, so the live drain is safe.)
+        const ctx = self.ctx;
+        const wl = &ctx.cascade_scratch;
+        std.debug.assert(wl.items.len == 0); // always empty on entry
+        defer wl.clearRetainingCapacity();
 
-        var i: usize = 0;
-        var iter = self.change_subscribers.keyIterator();
-        while (iter.next()) |ptr| {
-            subscribers[i] = ptr.*;
-            i += 1;
+        {
+            var iter = self.change_subscribers.keyIterator();
+            while (iter.next()) |ptr| {
+                const dependent_slot = ptr.*;
+                _ = dependent_slot.parents.remove(self);
+                if (dependent_slot.on_invalidate) |hook| {
+                    hook(dependent_slot);
+                } else {
+                    wl.append(ctx.allocator, dependent_slot) catch {};
+                }
+            }
+            self.change_subscribers.clearRetainingCapacity();
         }
 
-        // Clear the map first — prevents nested unsubscribeChangeUnlocked from
-        // mutating the map during iteration.
-        self.change_subscribers.clearRetainingCapacity();
+        drainCascadeWorklist(ctx);
+    }
 
-        for (subscribers) |dependent_slot| {
-            // Clean up the parent edge on the dependent side.
-            _ = dependent_slot.parents.remove(self);
+    /// Drain `ctx.cascade_scratch` as an iterative DFS invalidation worklist
+    /// (`#lziterbfs`). Each pop is marked stale (idempotency guard skips
+    /// already-stale nodes, handling diamonds), then its dependents are pushed.
+    /// A node's `change_subscribers` is cleared after its children are pushed,
+    /// so children processing (deferred to future pops) never observes a
+    /// half-iterated set — the snapshot-before-iterate invariant from #lzuafix.
+    fn drainCascadeWorklist(ctx: *Context) void {
+        const wl = &ctx.cascade_scratch;
+        while (wl.pop()) |node| {
+            if (node.stale) continue;
+            node.stale = true;
 
-            if (dependent_slot.on_invalidate) |hook| {
-                // Signal-backed slot: enqueue for deferred recompute, do NOT destroy.
-                hook(dependent_slot);
-            } else {
-                // Lazy slot: mark stale + cascade. Do NOT free (#lzinplace).
-                dependent_slot.invalidateSlotUnlocked();
+            if (node.change_subscribers.count() == 0) continue;
+            var iter = node.change_subscribers.keyIterator();
+            while (iter.next()) |ptr| {
+                const child = ptr.*;
+                _ = child.parents.remove(node);
+                if (child.on_invalidate) |hook| {
+                    hook(child);
+                } else {
+                    wl.append(ctx.allocator, child) catch {};
+                }
             }
+            node.change_subscribers.clearRetainingCapacity();
         }
     }
 
@@ -739,33 +781,14 @@ pub const Slot = struct {
     /// invalidation.
     pub fn invalidateSlotUnlocked(self: *Slot) void {
         if (self.stale) return; // already stale — skip (prevents infinite cascade)
-        self.stale = true;
 
-        // Cascade: mark all dependents stale too (their values transitively
-        // depend on this slot's now-stale value). Same snapshot + clear +
-        // iterate pattern as emitChangeUnlocked.
-        const sub_count = self.change_subscribers.count();
-        if (sub_count == 0) return;
+        const ctx = self.ctx;
+        const wl = &ctx.cascade_scratch;
+        std.debug.assert(wl.items.len == 0); // always empty on entry
+        defer wl.clearRetainingCapacity();
 
-        const subs = self.ctx.allocator.alloc(*Slot, sub_count) catch return;
-        defer self.ctx.allocator.free(subs);
-
-        var i: usize = 0;
-        var iter = self.change_subscribers.keyIterator();
-        while (iter.next()) |ptr| {
-            subs[i] = ptr.*;
-            i += 1;
-        }
-        self.change_subscribers.clearRetainingCapacity();
-
-        for (subs) |dependent_slot| {
-            _ = dependent_slot.parents.remove(self);
-            if (dependent_slot.on_invalidate) |hook| {
-                hook(dependent_slot);
-            } else {
-                dependent_slot.invalidateSlotUnlocked();
-            }
-        }
+        wl.append(ctx.allocator, self) catch return;
+        drainCascadeWorklist(ctx);
     }
 
     pub fn destroy(self: *Slot, recurse: ?bool) void {
@@ -791,64 +814,78 @@ pub const Slot = struct {
     /// Destroys the value and its subscribers recursively.
     /// Internal version: assumes ctx.mutex is ALREADY held.
     ///
-    /// Both edge maps (`parents` and `change_subscribers`) are snapshotted into
-    /// allocator-backed slices and cleared BEFORE iteration. This fixes an
-    /// iteration-during-mutation bug: `unsubscribeChangeUnlocked` removes from
-    /// `self.parents`, and the recursive `destroyUnlocked` on a dependent
-    /// calls back into `unsubscribeChangeUnlocked` which removes from
-    /// `self.change_subscribers` — both maps the loops were iterating.
-    /// Under contention this corrupted the hashmap into an infinite loop (the
-    /// `#lzuafix` hang). The snapshot-then-clear pattern is the same one
-    /// `emitChangeUnlocked` already uses for its subscriber cascade.
+    /// Iterative teardown (`#lziterbfs`): the transitive dependent cone is
+    /// pushed onto the shared `cascade_scratch` worklist and each node is
+    /// freed as it pops. This replaces the recursive `destroyUnlocked(true)`
+    /// cascade and the per-level `allocator.alloc(*Slot, count)` snapshots it
+    /// took on both edge maps.
+    ///
+    /// The snapshot-before-iterate invariant that fixed #lzuafix is preserved
+    /// *structurally* rather than via a snapshot buffer: child destruction is
+    /// deferred to a future pop, so the only mutations performed while
+    /// iterating a node's edge set land on *other* nodes' sets
+    /// (`parent.change_subscribers.remove(node)` for parents,
+    /// `dependent.parents.remove(node)` for subscribers). The iterated set is
+    /// cleared right after the drain, never mutated mid-iteration.
     pub fn destroySelf(self: *Slot, recurse: ?bool) void {
-        if (self.storage) |storage| {
-            if (recurse == null or recurse == true) {
-                // Snapshot + clear parents before unsubscribing (avoids
-                // mutation-during-iteration on self.parents).
-                const parent_count = self.parents.count();
-                if (parent_count > 0) {
-                    if (self.ctx.allocator.alloc(*Slot, parent_count)) |parents| {
-                        var i: usize = 0;
-                        var piter = self.parents.keyIterator();
-                        while (piter.next()) |ptr| {
-                            parents[i] = ptr.*;
-                            i += 1;
-                        }
-                        self.parents.clearRetainingCapacity();
-                        for (parents) |parent_slot| {
-                            parent_slot.unsubscribeChangeUnlocked(self);
-                        }
-                        self.ctx.allocator.free(parents);
-                    } else |_| {
-                        // OOM mid-destroy — clear and skip edge cleanup.
-                        // The slot still gets freed below.
-                        self.parents.clearRetainingCapacity();
+        if (recurse == false) {
+            self.destroySingleNodeUnlocked();
+            return;
+        }
+
+        const ctx = self.ctx;
+        const wl = &ctx.cascade_scratch;
+        std.debug.assert(wl.items.len == 0); // always empty on entry
+        defer wl.clearRetainingCapacity();
+
+        wl.append(ctx.allocator, self) catch {
+            // OOM seeding the worklist — at least free this node.
+            self.destroySingleNodeUnlocked();
+            return;
+        };
+
+        while (wl.pop()) |node| {
+            // Only a node with live storage owns edges to tear down (matches
+            // the original `if (self.storage) |storage|` guard).
+            if (node.storage != null) {
+                // Parents: drop the reverse edge on each parent. Iterating
+                // `node.parents` live is safe — `parent.change_subscribers`
+                // is a different set; `node.parents` itself is cleared after.
+                if (node.parents.count() > 0) {
+                    var piter = node.parents.keyIterator();
+                    while (piter.next()) |ptr| {
+                        const parent_slot = ptr.*;
+                        _ = parent_slot.change_subscribers.remove(node);
+                        ctx.bump("dependency_edges_removed");
                     }
+                    node.parents.clearRetainingCapacity();
                 }
 
-                // Snapshot + clear subscribers before recursive destroy (avoids
-                // mutation-during-iteration on self.change_subscribers).
-                const sub_count = self.change_subscribers.count();
-                if (sub_count > 0) {
-                    if (self.ctx.allocator.alloc(*Slot, sub_count)) |subs| {
-                        var i: usize = 0;
-                        var siter = self.change_subscribers.keyIterator();
-                        while (siter.next()) |ptr| {
-                            subs[i] = ptr.*;
-                            i += 1;
-                        }
-                        self.change_subscribers.clearRetainingCapacity();
-                        for (subs) |dependent_slot| {
-                            _ = dependent_slot.parents.remove(self);
-                            dependent_slot.destroyUnlocked(true);
-                        }
-                        self.ctx.allocator.free(subs);
-                    } else |_| {
-                        self.change_subscribers.clearRetainingCapacity();
+                // Subscribers: drop the reverse edge and enqueue the dependent
+                // for destruction. `cacheRemove` runs here so a re-entrant
+                // materialization cannot re-publish a doomed slot.
+                if (node.change_subscribers.count() > 0) {
+                    var siter = node.change_subscribers.keyIterator();
+                    while (siter.next()) |ptr| {
+                        const dependent_slot = ptr.*;
+                        _ = dependent_slot.parents.remove(node);
+                        if (dependent_slot.cache_key) |ck| ctx.cacheRemove(ck);
+                        wl.append(ctx.allocator, dependent_slot) catch {};
                     }
+                    node.change_subscribers.clearRetainingCapacity();
                 }
             }
 
+            node.destroySingleNodeUnlocked();
+        }
+    }
+
+    /// Free one slot's payload storage + edge-map backing + the slot struct
+    /// itself. No cascade, no reverse-edge cleanup. Used by both the
+    /// `recurse == false` fast path and the iterative `destroySelf` per-node
+    /// step.
+    fn destroySingleNodeUnlocked(self: *Slot) void {
+        if (self.storage) |storage| {
             if (self.deinitPayload) |deinitPayload| {
                 deinitPayload(self);
             }
@@ -1042,8 +1079,16 @@ pub fn popTracking(frame: *TrackingFrame) void {
 }
 
 /// Finds the most recent slot being computed for the given context ON THIS THREAD.
+///
+/// Fast path (`#lztrackfast`): the overwhelmingly common case is a single
+/// tracking frame whose `ctx` matches, so we check the stack top first and
+/// return in O(1) without walking the linked list. This mirrors lazily-rs
+/// `current_tracking_frame`, which reads only the stack top (O(1)). The walk
+/// is retained as the fallback for the rare interleaved-multi-context case.
 pub fn currentSlotFor(ctx: *Context) ?*Slot {
-    var it = tracking_top;
+    const top = tracking_top orelse return null;
+    if (top.ctx == ctx) return top.slot;
+    var it = top.prev;
     while (it) |f| : (it = f.prev) {
         if (f.ctx == ctx) return f.slot;
     }

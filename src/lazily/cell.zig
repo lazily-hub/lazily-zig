@@ -88,7 +88,6 @@ pub fn Cell(comptime T: type) type {
 
         pub fn deinit(self: *@This()) void {
             if (self.deinitCellValue) |deinit_fn| {
-                std.debug.print("Cell.deinit#1, deinit_fn={}\n", .{deinit_fn});
                 deinit_fn(self);
             }
             self.before_change_subscribers.deinit();
@@ -138,7 +137,15 @@ pub fn Cell(comptime T: type) type {
             // While inside a `batch(run)` boundary, defer the eager-recompute
             // flush so N `set` calls coalesce into one Signal/Effect rerun at
             // the outermost batch exit (`reactive-graph.md` § batch).
-            if (!self.ctx.isBatching()) {
+            //
+            // Store-without-cascade: skip the drain entirely when nothing is
+            // pending. A `set` whose invalidation cone held no eager
+            // Signal/Effect leaves `pending_recompute` empty, so entering
+            // `drainPendingRecompute` would just re-check the empty queue.
+            // Gating on the length avoids that call on every store (mirrors
+            // lazily-rs `set_cell`, which only flushes when invalidate returned
+            // true — i.e. when the cone actually contained an Effect).
+            if (!self.ctx.isBatching() and self.ctx.pending_recompute.items.len > 0) {
                 self.ctx.drainPendingRecompute();
             }
         }
