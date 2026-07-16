@@ -109,12 +109,18 @@ LAZILY_SCALE_N=5000000 zig build bench-scale   # Google Sheets 10M-cell workbook
 
 ### 1,000,000 rows (~2M cells)
 
+> Methodology note (v0.25.0): the standalone scale tables below are
+> **unpinned** `zig build bench-scale` runs (best of heavy reps; viewport =
+> avg of 1000 edits), matching the `Reproduce` recipe. The cross-language
+> comparison table further down is a separate **`taskset -c 4`-pinned, serial**
+> joint run, so its absolute zig numbers are larger — see that section.
+
 | Benchmark | Time | Per cell | What it measures |
 |-----------|-----:|---------:|------------------|
-| `build` | 120 ms | ~60 ns | Construct the N input nodes (formulas lazy, not yet materialized). |
-| `cold_full_recalc` | 275 ms | ~138 ns | First read of every formula — materializes all N formula slots + edges and computes them. |
-| `viewport_recalc` | **10.4 µs** | — | Edit one input, read only a 1,000-cell viewport. ~38,000× cheaper than a full recalc. |
-| `full_recalc_invalidate_all` | 403 ms | ~202 ns | Touch every input, then read every formula (worst-case full-sheet edit). |
+| `build` | 70.8 ms | ~35 ns | Construct the N input nodes (formulas lazy, not yet materialized). |
+| `cold_full_recalc` | 100 ms | ~50 ns | First read of every formula — materializes all N formula slots + edges and computes them. |
+| `viewport_recalc` | **9.2 µs** | — | Edit one input, read only a 1,000-cell viewport. ~21,000× cheaper than a full recalc. |
+| `full_recalc_invalidate_all` | 192 ms | ~96 ns | Touch every input, then read every formula (worst-case full-sheet edit). |
 
 ### 5,000,000 rows (10M cells — a full Google Sheets workbook)
 
@@ -124,14 +130,14 @@ input cells + 5,000,000 formula cells (`LAZILY_SCALE_N=5000000`, measured with
 
 | Benchmark | Time | Per cell | What it measures |
 |-----------|-----:|---------:|------------------|
-| `build` | 862 ms | ~86 ns | Build the 5M input nodes of a full 10M-cell workbook. |
-| `cold_full_recalc` | 2.29 s | ~229 ns | Materialize + compute all 5M formulas cold. |
-| `viewport_recalc` | **10.6 µs** | — | Edit one input, read a 1,000-cell viewport. ~297,000× cheaper than a full recalc. |
-| `full_recalc_invalidate_all` | 3.15 s | ~315 ns | Re-edit every input, recompute the whole workbook. |
+| `build` | 357 ms | ~36 ns | Build the 5M input nodes of a full 10M-cell workbook. |
+| `cold_full_recalc` | 555 ms | ~56 ns | Materialize + compute all 5M formulas cold. |
+| `viewport_recalc` | **9.5 µs** | — | Edit one input, read a 1,000-cell viewport. ~115,000× cheaper than a full recalc. |
+| `full_recalc_invalidate_all` | 1.08 s | ~108 ns | Re-edit every input, recompute the whole workbook. |
 
-So lazily-zig backs a **full-capacity Google Sheets workbook**: build ~0.86 s,
-full cold recompute ~2.3 s, and a one-cell edit + bounded-viewport read stays in
-the **~10-11 µs** range — because the lazy pull-based model leaves off-viewport
+So lazily-zig backs a **full-capacity Google Sheets workbook**: build ~0.36 s,
+full cold recompute ~0.56 s, and a one-cell edit + bounded-viewport read stays
+in the **~9–10 µs** range — because the lazy pull-based model leaves off-viewport
 formulas dirty and never recomputes them (only ~2 formulas actually recompute
 per edit, regardless of sheet size — the property a viewport-rendered
 spreadsheet needs).
@@ -150,8 +156,8 @@ you create, so the `scale` group measures the populated-cell path that matters.
 
 ### A note on viewport scaling
 
-lazily-zig's viewport recalc is **effectively size-independent** — ~10.4 µs at
-2M cells and ~10.6 µs at 10M cells. This matches lazily-rs's flat curve (and is
+lazily-zig's viewport recalc is **effectively size-independent** — ~9.2 µs at
+2M cells and ~9.5 µs at 10M cells. This matches lazily-rs's flat curve (and is
 *better* than lazily-go, whose viewport grows from ~25 µs to ~103 µs with sheet
 size). Two reasons:
 
@@ -164,7 +170,7 @@ size). Two reasons:
    latency does not grow meaningfully with total sheet size — no per-node
    identity hashing over a multi-GB structure.
 
-The `~38,000×` / `~297,000×` speedups above are `full_recalc / viewport` for the
+The `~21,000×` / `~115,000×` speedups above are `full_recalc / viewport` for the
 respective sizes: a bounded-viewport edit never pays for the off-viewport sheet.
 
 ### Honest caveats
@@ -416,6 +422,95 @@ with zero errors.
 This aligns lazily-zig's invalidation model with lazily-rs and lazily-py,
 which have always used invalidate-in-place (mark dirty, recompute on next
 read) rather than destroy-on-invalidate.
+
+## Optimizations Applied (v0.25.0)
+
+v0.25.0 ports two batches of proven lazily-rs patterns (`#lziterbfs`,
+`#lzvecedge`, `#lztrackfast`): an iterative DFS invalidation cascade and a
+cache-friendlier edge container. Both are algorithmic/layout changes that cut
+allocation churn on the hot invalidation and materialization paths.
+
+1. **Iterative DFS invalidation (`#lziterbfs`, the `#lzbatchborrow` port) —**
+   `invalidateSlotUnlocked` / `emitChangeUnlocked` / `destroySelf` now drive a
+   single Context-owned `cascade_scratch` worklist (grown once, reused) instead
+   of recursing and taking a per-cascade-level `allocator.alloc(*Slot, count)`
+   snapshot. The `#lzuafix` snapshot-before-iterate invariant is preserved
+   *structurally*: child processing is deferred to a future pop, so the only
+   mutations during an edge-set drain land on *other* nodes' sets, and each set
+   is cleared right after its drain. Diamond-DAG / 3-subscriber soak tests
+   (`slot.zig` ~361–495) still pass.
+
+2. **Store-without-cascade —** `Cell.set` gates `drainPendingRecompute` on
+   `pending_recompute.items.len > 0`, so a store whose invalidation cone held no
+   eager Signal/Effect skips the drain call entirely. Mirrors lazily-rs
+   `set_cell`, which only flushes when `invalidate` returned true.
+
+3. **Tracking-stack fast path (`#lztrackfast`) —** `currentSlotFor` checks the
+   stack top first and returns in O(1) for the common single-context case,
+   falling back to the linked-list walk only for interleaved multi-context
+   reads. Mirrors lazily-rs `current_tracking_frame`.
+
+4. **`SlotEdgeSet` drops the HashMap spill (`#lzvecedge`) —** the rare
+   high-fan-out node (≥3 distinct edges) now spills into a growable
+   `ArrayList(*Slot)` with linear dedup instead of an `AutoHashMap(*Slot, void)`.
+   On a degree-2–3 reactive graph, linear `contains` beats hash+probe (no
+   hashing, no bucket chain) and is cache-friendlier — matches lazily-rs
+   `EdgeVec = SmallVec<[SlotId;2]>` + `edge_insert`. `inline_cap` is lowered
+   4→2 (mirroring lazily-rs's SmallVec inline size), cutting per-slot edge
+   footprint from 32 B/direction to 16 B/direction.
+
+5. **Dropped a stray unconditional `std.debug.print` on every `Cell.deinit`.**
+
+### Scale A/B — unpinned `zig build bench-scale`, same machine, before vs after
+
+Both columns measured back-to-back on the reference machine (AMD Ryzen 9
+9950X3D, Linux, Zig 0.17.0-dev.892), unpinned (best of heavy reps; viewport =
+avg of 1000 edits). "before" = `b758d33` (v0.24.0); "after" = v0.25.0.
+
+#### 1,000,000 rows (~2M cells)
+
+| Benchmark | before | after | Δ |
+|-----------|-------:|------:|------:|
+| `build` | 76.7 ms | 70.8 ms | −8% |
+| `cold_full_recalc` | 112.3 ms | 100.4 ms | −11% |
+| `viewport_recalc` | 9.05 µs | 9.17 µs | ~flat |
+| `full_recalc_invalidate_all` | 228.6 ms | 191.6 ms | −16% |
+
+#### 5,000,000 rows (10M cells)
+
+| Benchmark | before | after | Δ |
+|-----------|-------:|------:|------:|
+| `build` | 401 ms | 357 ms | −11% |
+| `cold_full_recalc` | 568 ms | 555 ms | −2% |
+| `viewport_recalc` | 9.12 µs | 9.46 µs | ~flat |
+| `full_recalc_invalidate_all` | 1126 ms | 1084 ms | −4% |
+
+The wins concentrate at 1M and below, where per-node allocation + edge-map
+churn are a meaningful share of `cold_full_recalc` / `full_recalc_invalidate_all`
+and the iterative cascade removes the per-level snapshot alloc. At 10M cells the
+dominant cost is the global integer-keyed cache hash-probe (which grows with
+`N`), so the allocation wins wash out — exactly the regime the existing
+*Node-layout optimizations* note already calls out. `viewport_recalc` is flat
+across the board (it is bounded by ~1000 cache lookups, not the paths changed).
+
+The reactive-core micro-bench counters (`cached_reads`, `cold_first_get`,
+`set_cell_invalidation_fan_out_256`, `memo_equality_suppression`) are unchanged
+— the optimization preserves the exact work-counts, only the per-op allocation
+overhead dropped.
+
+### What v0.25.0 deliberately does NOT do
+
+- **Does not land the dense slotmap (item 5 of the plan).** The faithful
+  geometrically-grown `[]Slot` / `[]?Slot` node arena would relocate slots on
+  grow, which dangles the `*T` reader pointers into a slot's `inline_buf` that
+  `#lzinplace` (v1.0.0) explicitly keeps valid for readers on other threads —
+  reintroducing the destroy-on-invalidate SEGV class. A non-relocating
+  chunked-page arena is the safe variant, but on the ArenaAllocator-backed
+  scale bench (already bump-allocated) its measured benefit is marginal while
+  the global cache hash-probe dominates; deferred until that probe itself is
+  addressed. `SlotEdgeSet` therefore still stores `*Slot` (item 6a — compact
+  `SlotId` edges — depends on the slotmap's dense id resolver and is deferred
+  with it).
 
 ## Cross-language comparison (lazily-rs / lazily-cpp / lazily-zig)
 
