@@ -461,6 +461,27 @@ allocation churn on the hot invalidation and materialization paths.
 
 5. **Dropped a stray unconditional `std.debug.print` on every `Cell.deinit`.**
 
+6. **Stable-page node arena (`context.zig`, `#lzinplace` preserved) —** every
+   `Slot` now comes from a `SlotArena` of fixed `[PAGE_SIZE]Slot` pages
+   (512 slots/page, `PAGE_BITS = 9`) allocated once and never moved or
+   realloced, replacing per-slot `ctx.allocator.create(Slot)` /
+   `ctx.allocator.destroy(self)` in `Slot.initKeyed` /
+   `destroySingleNodeUnlocked`. Because pages never relocate on grow, every
+   `*Slot` — and every raw `*T` reader pointer aliasing a slot's `inline_buf`
+   (`Slot.get` for `.indirect` inline-eligible types) — stays valid for the
+   whole Context lifetime: `#lzinplace` is preserved by construction, and the
+   relocating-grow failure mode that sank the earlier dense-slotmap attempt is
+   structurally impossible. The arena (`pages` / `free_list` / `next_id`) is
+   Context state protected by the existing `ctx.mutex` (the same lock guarding
+   `cache` / `orphaned_slots` / `cascade_scratch`), so the `alloc` in
+   `Slot.initKeyed` moved inside the critical section. Free-list reuse mirrors
+   the pre-arena lifetime exactly: the only non-`deinit` caller of
+   `destroySingleNodeUnlocked` is the cache-race loser in `Slot.initKeyed` — a
+   slot that was never published to the cache and whose storage was never handed
+   to a reader — so recycling its memory cannot dangle a live `*T`. Orphaned /
+   stale slots (`invalidateSlotUnlocked` → `orphaned_slots`) are still NOT freed
+   until `Context.deinit`, matching the prior contract byte-for-byte.
+
 ### Scale A/B — unpinned `zig build bench-scale`, same machine, before vs after
 
 Both columns measured back-to-back on the reference machine (AMD Ryzen 9
@@ -497,6 +518,46 @@ The reactive-core micro-bench counters (`cached_reads`, `cold_first_get`,
 `set_cell_invalidation_fan_out_256`, `memo_equality_suppression`) are unchanged
 — the optimization preserves the exact work-counts, only the per-op allocation
 overhead dropped.
+
+### Stable-page node arena A/B — item 6, unpinned, same machine
+
+Measured back-to-back on the reference machine (`fe315d5` → with the
+stable-page arena). The win concentrates on `cold_full_recalc`
+(allocation-dominated materialization of N formula slots), exactly where the
+design points; `viewport_recalc` (cache-warm reads, no allocation) is flat, as
+expected. The 200k point is the most stable (shorter runs, less machine noise)
+and shows a clean, reproducible ~−20% on `cold_full_recalc`; at 1M the
+wall-clock noise band widens but the direction holds. `#lzinplace` regression
+guards all pass clean: the 4-thread × 5000-iteration concurrent set+get soak
+(`slot.zig`), and the diamond-DAG / 3-subscriber destroy↔unsubscribe soaks.
+
+#### 200,000 rows (~400k cells)
+
+| Benchmark | before (`fe315d5`) | with arena | Δ |
+|-----------|-------:|------:|------:|
+| `build` | 11.90 ms | ~11.1 ms | ~flat |
+| `cold_full_recalc` | 21.16 ms | 16.85 ms | **−20%** |
+| `viewport_recalc` | 9.05 µs | 9.09 µs | ~flat |
+| `full_recalc_invalidate_all` | 37.79 ms | ~37.5 ms | ~flat |
+
+#### 1,000,000 rows (~2M cells)
+
+| Benchmark | before (`fe315d5`) | with arena | Δ |
+|-----------|-------:|------:|------:|
+| `build` | 64.2 ms | ~62 ms | ~−3% |
+| `cold_full_recalc` | 100.3 ms | ~85 ms (best-of-reps) | **−15%** |
+| `viewport_recalc` | 9.07 µs | 9.01 µs | ~flat |
+| `full_recalc_invalidate_all` | 188.7 ms | ~179 ms | −5% |
+
+The micro-bench instrumentation counters are byte-identical to pre-arena
+(`cached_reads` = 0 allocs / 0 recomputes; `cold_first_get` = exactly 1
+node-alloc per cold materialization) — the arena changes per-op allocation
+overhead, not work. The optional `cacheRemove` dense-path hash-probe guard
+called out in the v0.25.0 investigation was **not** landed: it is safe for all
+conformant `initDense`-before-publish usage but has a subtle behavior change
+for publish-before-`initDense` (already-undefined) usage, so it was deferred
+under the v0.25.0 "correctness over micro-opts" stance; the batched page
+allocation is the load-bearing win.
 
 ### What v0.25.0 deliberately does NOT do
 

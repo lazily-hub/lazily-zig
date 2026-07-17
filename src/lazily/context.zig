@@ -21,9 +21,91 @@ const GraphMutex = if (builtin.zig_version.minor < 16)
 else
     @import("parking_mutex.zig").ReentrantMutex;
 
+/// Opaque identifier for a `Slot` living in a `SlotArena`. `raw = 0` is the
+/// null id (page 0, slot 0 is never handed out — `SlotArena.next_id` starts at
+/// 1). A `Slot` carries its own `id` so `destroySingleNodeUnlocked` can return
+/// it to the arena free-list without a pointer→page reverse lookup.
+const SlotId = struct { raw: u64 };
+
+/// Stable-page node arena (`#lzinplace` stable-address allocator for `Slot`).
+///
+/// Slots come from fixed-size pages (`[PAGE_SIZE]Slot`) that are allocated ONCE
+/// and never moved or realloced, so every `*Slot` — and every raw `*T` reader
+/// pointer that aliases a slot's `inline_buf` (`Slot.get` for `.indirect`
+/// inline-eligible types, context.zig `inline_ptr = &self.inline_buf`) — stays
+/// valid from publication until `Context.deinit`. Pages do not relocate on grow,
+/// which is the failure mode that sank a prior dense-slotmap attempt (a
+/// geometrically-grown `[]Slot` realloc+memcpy dangled the raw `*T` readers).
+///
+/// `alloc` returns a slot pulled from the reuse free-list first, then a fresh
+/// page slot. Reuse mirrors the pre-arena lifetime exactly: the only
+/// non-`deinit` caller of `destroySingleNodeUnlocked` (→ `free`) is the
+/// cache-race loser in `Slot.initKeyed` — a slot that was never published to the
+/// cache and whose storage was never handed to a reader — so recycling its
+/// memory cannot dangle a live `*T`. Stale/orphaned slots
+/// (`invalidateSlotUnlocked` → `orphaned_slots`) are NOT freed here until
+/// `Context.deinit`, matching the prior `#lzinplace` contract byte-for-byte.
+const SlotArena = struct {
+    pub const PAGE_BITS: u6 = 9;
+    pub const PAGE_SIZE: u32 = 1 << PAGE_BITS;
+    pub const PAGE_MASK: u32 = PAGE_SIZE - 1;
+
+    pages: std.ArrayList(*[PAGE_SIZE]Slot),
+    free_list: std.ArrayList(SlotId),
+    next_id: u64 = 1,
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) SlotArena {
+        return .{
+            .pages = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*[PAGE_SIZE]Slot).empty,
+            .free_list = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(SlotId).empty,
+            .allocator = allocator,
+        };
+    }
+
+    fn alloc(self: *SlotArena) !*Slot {
+        if (self.free_list.pop()) |id| {
+            const slot = self.addrOf(id.raw);
+            slot.id = id;
+            return slot;
+        }
+        const idx = self.next_id;
+        self.next_id += 1;
+        const page_idx: usize = @intCast(idx >> PAGE_BITS);
+        if (page_idx >= self.pages.items.len) {
+            try self.pages.append(self.allocator, try self.allocator.create([PAGE_SIZE]Slot));
+        }
+        const slot = self.addrOf(idx);
+        slot.id = .{ .raw = idx };
+        return slot;
+    }
+
+    fn addrOf(self: *SlotArena, id_raw: u64) *Slot {
+        const page_idx: usize = @intCast(id_raw >> PAGE_BITS);
+        const slot_idx: usize = @intCast(id_raw & @as(u64, PAGE_MASK));
+        return &self.pages.items[page_idx][slot_idx];
+    }
+
+    fn free(self: *SlotArena, id: SlotId) void {
+        self.free_list.append(self.allocator, id) catch {};
+    }
+
+    fn deinit(self: *SlotArena) void {
+        for (self.pages.items) |page| {
+            self.allocator.destroy(page);
+        }
+        self.pages.deinit(self.allocator);
+        self.free_list.deinit(self.allocator);
+    }
+};
+
 /// Context with lazy cache
 pub const Context = struct {
     allocator: std.mem.Allocator,
+    // Stable-page arena backing every `Slot` (`#lzinplace`). All `*Slot` and
+    // interior `*T`-into-`inline_buf` pointers are stable for the Context
+    // lifetime because arena pages are allocated once and never moved.
+    arena: SlotArena,
     // Function pointer -> cached result
     cache: std.AutoHashMap(usize, *Slot),
     // Optional dense direct-indexed cache for the keyed (runtime-integer-key)
@@ -103,6 +185,7 @@ pub const Context = struct {
         const ctx = try allocator.create(Context);
         ctx.* = .{
             .allocator = allocator,
+            .arena = SlotArena.init(allocator),
             .cache = std.AutoHashMap(
                 usize,
                 *Slot,
@@ -193,6 +276,12 @@ pub const Context = struct {
         }
         self.orphaned_slots.deinit(self.allocator);
         self.cascade_scratch.deinit(self.allocator);
+
+        // Free every arena page. This runs AFTER the cache + orphaned_slots
+        // teardown above (which called `destroySingleNodeUnlocked` on each slot,
+        // returning it to the arena free-list) — readers are gone at deinit, so
+        // releasing the pages is the `#lzinplace` end-of-life point.
+        self.arena.deinit();
 
         // Capture the post-deinit hook before freeing self: `destroy(self)`
         // deallocates the Context struct via `allocator`, and the hook owns
@@ -472,6 +561,7 @@ pub const Slot = struct {
     ctx: *Context,
     value_fn_ptr: ?*anyopaque,
     cache_key: ?usize = null,
+    id: SlotId = .{ .raw = 0 },
     storage: ?Storage,
     mode: Modes,
     /// Pointer classification for the cached value type (std.builtin.Type.Pointer.Size): .one, .many, .slice, .c
@@ -537,22 +627,13 @@ pub const Slot = struct {
         const mode = comptime Mode(T);
         const ptr_size = comptime Slot.PtrSize(T);
         const free = comptime Free(T);
-        const self = try ctx.allocator.create(Slot);
-        ctx.instrumentation.node_allocations += 1;
-        self.* = Slot{
-            .ctx = ctx,
-            .value_fn_ptr = null,
-            .cache_key = cache_key,
-            .mode = mode,
-            .storage = null,
-            .ptr_size = ptr_size,
-            .change_subscribers = SlotEdgeSet.init(),
-            .parents = SlotEdgeSet.init(),
-            .deinitPayload = deinitPayload,
-            .free = if (mode == .indirect) free else null,
-        };
 
-        // Hold the graph lock across subscribe → valueFn → cache-put.
+        // Hold the graph lock across slot allocation → subscribe → valueFn →
+        // cache-put. The arena (`pages`/`free_list`/`next_id`) and
+        // `instrumentation` are Context state protected by this mutex, exactly
+        // like `cache`/`orphaned_slots`/`cascade_scratch` — so the arena alloc
+        // must run under the lock (concurrent materializations race the arena;
+        // `#lzinplace` cross-thread soak in slot.zig exercises this).
         // `GraphMutex` is reentrant (`#lzparkingmutex`), so valueFn's internal
         // `cell()`/`slot()` calls (which re-lock `ctx.mutex`) are no-ops — they
         // just bump the depth counter. This closes the use-after-free race
@@ -562,6 +643,25 @@ pub const Slot = struct {
         // the cache-put would write a dangling pointer.
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
+
+        const self = try ctx.arena.alloc();
+        // `arena.alloc` stamps `self.id`; preserve it across the struct literal
+        // below (the literal re-initializes every field and would zero `id`).
+        const slot_id = self.id;
+        ctx.instrumentation.node_allocations += 1;
+        self.* = Slot{
+            .ctx = ctx,
+            .value_fn_ptr = null,
+            .cache_key = cache_key,
+            .id = slot_id,
+            .mode = mode,
+            .storage = null,
+            .ptr_size = ptr_size,
+            .change_subscribers = SlotEdgeSet.init(),
+            .parents = SlotEdgeSet.init(),
+            .deinitPayload = deinitPayload,
+            .free = if (mode == .indirect) free else null,
+        };
 
         const current_slot: ?*Slot = currentSlotFor(ctx);
         if (current_slot) |child_slot| {
@@ -930,7 +1030,7 @@ pub const Slot = struct {
         }
         self.change_subscribers.deinit(self.ctx.allocator);
         self.parents.deinit(self.ctx.allocator);
-        self.ctx.allocator.destroy(self);
+        self.ctx.arena.free(self.id);
     }
 
     pub const Modes = enum { literal, indirect };
