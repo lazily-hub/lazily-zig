@@ -54,6 +54,15 @@ const SlotArena = struct {
     free_list: std.ArrayList(SlotId),
     next_id: u64 = 1,
     allocator: std.mem.Allocator,
+    /// Inline free-stack (`#lzzigfreestack`): the recycler is LIFO and the
+    /// cache-race loser that drives `free()` is overwhelmingly bursty (a
+    /// re-entrant valueFn creating + discarding slots on the same thread), so a
+    /// 16-slot inline ring absorbs the churn with zero allocator calls. Spills
+    /// to `free_list` only when all 16 are live — a 17-deep burst on a single
+    /// page before any reader pulls. 16 mirrors `inline_cap * PAGE_SIZE / 256`
+    /// — well over the largest realistic reentrant burst the soak tests reach.
+    inline_free: [16]SlotId = undefined,
+    inline_free_len: u8 = 0,
 
     fn init(allocator: std.mem.Allocator) SlotArena {
         return .{
@@ -64,6 +73,15 @@ const SlotArena = struct {
     }
 
     fn alloc(self: *SlotArena) !*Slot {
+        // Pop inline free-stack first (`#lzzigfreestack`): avoids the
+        // `free_list.pop()` ArrayList touch on the common churn path.
+        if (self.inline_free_len > 0) {
+            self.inline_free_len -= 1;
+            const id = self.inline_free[self.inline_free_len];
+            const slot = self.addrOf(id.raw);
+            slot.id = id;
+            return slot;
+        }
         if (self.free_list.pop()) |id| {
             const slot = self.addrOf(id.raw);
             slot.id = id;
@@ -87,6 +105,13 @@ const SlotArena = struct {
     }
 
     fn free(self: *SlotArena, id: SlotId) void {
+        // Push inline first (`#lzzigfreestack`); spill to `free_list` only when
+        // the 16-entry stack is full.
+        if (self.inline_free_len < self.inline_free.len) {
+            self.inline_free[self.inline_free_len] = id;
+            self.inline_free_len += 1;
+            return;
+        }
         self.free_list.append(self.allocator, id) catch {};
     }
 
@@ -495,6 +520,24 @@ pub const SlotEdgeSet = struct {
         self.len = 0;
     }
 
+    /// Membership probe (`#lzzigcontainsfast`). Same linear scan `getOrPut`
+    /// performs before its insert, but without the write side effect — so the
+    /// cached-read subscribe site can short-circuit an already-tracked edge
+    /// without paying for the (cold-path) `getOrPut` bookkeeping on every hit.
+    /// Pointer-identity only (never dereferences `key`).
+    pub fn contains(self: *const SlotEdgeSet, key: *const Slot) bool {
+        if (self.spill) |*s| {
+            for (s.items) |e| {
+                if (e == key) return true;
+            }
+            return false;
+        }
+        for (self.buf[0..self.len]) |e| {
+            if (e == key) return true;
+        }
+        return false;
+    }
+
     /// Remove `key` if present; returns whether it was. Both paths use
     /// swap-remove (set is unordered; all iteration sites snapshot first).
     pub fn remove(self: *SlotEdgeSet, key: *Slot) bool {
@@ -731,7 +774,12 @@ pub const Slot = struct {
 
     pub const GetError = error{SlotMissingPtr};
 
-    pub fn get(self: Slot, comptime T: type) GetError!Result(T) {
+    /// `*const Slot` (`#lzzigslotconstptr`): the cached-read path holds the
+    /// slot via `*Slot` already (`cacheLookup` returns `?*Slot`), so taking the
+    /// parameter by pointer eliminates a 256-byte `Slot` memcpy on every warm
+    /// read. The body only reads `self.storage`, which auto-dereferences the
+    /// `*const` exactly as it did the by-value field access.
+    pub fn get(self: *const Slot, comptime T: type) GetError!Result(T) {
         const payload = if (self.storage) |storage| blk: {
             break :blk storage.payload;
         } else {
@@ -752,7 +800,7 @@ pub const Slot = struct {
 
     pub const GetPtrError = error{ LiteralHasNoPtr, SlotMissingPtr };
 
-    pub fn getPtr(self: Slot, comptime T: type) GetPtrError!*T {
+    pub fn getPtr(self: *const Slot, comptime T: type) GetPtrError!*T {
         const payload = if (self.storage) |storage| storage.payload else return error.SlotMissingPtr;
         return switch (comptime Mode(T)) {
             .literal => return error.LiteralHasNoPtr,

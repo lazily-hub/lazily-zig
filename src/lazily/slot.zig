@@ -71,7 +71,15 @@ pub fn slotKeyed(
                 // Fresh cached value — return it.
                 const current_slot: ?*Slot = currentSlotFor(ctx);
                 if (current_slot) |child_slot| {
-                    try cached_slot.subscribeChangeUnlocked(child_slot);
+                    // `#lzzigcontainsfast`: cached reads re-pull repeatedly
+                    // (the steady-state hit on a hot value); re-subscribing an
+                    // edge that's already tracked costs a `getOrPut` worth of
+                    // bookkeeping per read. Probe membership first — the
+                    // already-tracked case is the dominant one on cached reads
+                    // with an active tracking frame, so this halves the work.
+                    if (!cached_slot.change_subscribers.contains(child_slot)) {
+                        try cached_slot.subscribeChangeUnlocked(child_slot);
+                    }
                 }
                 return cached_slot.get(T);
             }

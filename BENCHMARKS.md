@@ -54,6 +54,9 @@ Counter deltas per scenario — lower means less work per op. Built `ReleaseFast
 | `cold_first_get` | 1,000 | 1,000 | — | — | — | — | Fresh `Context` + one slot per iteration: exactly **one node allocation** per cold materialization. |
 | `set_cell_invalidation_fan_out_256` | 1,000 | 0 | 0 | 0 | 0 | 0 | Invalidate a cell with 256 lazy dependents — invalidation destroys dependents lazily, so **no eager recompute** work is spent until something is re-read. |
 | `memo_equality_suppression` | 1,000 | 0 | 1,000 | 1,000 | 1,000 | 1 | An eager `Signal` whose recomputed value is unchanged: it **does** recompute (1 per set) and re-track its edge, but the memo guard keeps the effect-queue depth at 1 and suppresses the downstream cascade. |
+| `cached_reads_with_dependency` | 100,000 | 1 | 1 | 0 | 0 | 0 | Warm-cache slot re-reads with an active tracking frame (`#lzzigcontainsfast`). 100k cached re-reads of one inner slot inside an outer's valueFn; the `contains` fast path collapses 99,999 redundant `getOrPut` calls into a single first-time subscribe. `edges_added=1` (was 100,000 pre-`#lzzigcontainsfast`). |
+| `arena_churn_cache_race_loser` | 100,000 | 100,000 | 0 | 0 | 0 | 0 | Alloc/free churn driven by the cache-race loser (`#lzzigfreestack`): every iter allocates a fresh slot and immediately frees it. The 16-entry inline free-stack absorbs the burst with **zero** `free_list.append` allocator calls (steady-state ping-pong: `alloc` pops the stack, `free` pushes it). |
+| `crdt_mv_register_merge` | 100,000 | — | — | — | — | — | `MvRegister.mergeFrom` churn (`#lzzigcrdtstack`). 100k two-entry merges with no per-merge allocator syscall: the matched-flag buffer lives on the call stack (was a `std.heap.page_allocator` alloc per merge, taking the global allocator lock). |
 
 ### Notes
 
@@ -67,6 +70,15 @@ Counter deltas per scenario — lower means less work per op. Built `ReleaseFast
   source set (`recomputes=1000`) but the memo guard (`std.meta.eql`) keeps the
   effect-queue high-water mark at `1`, i.e. the equal-value result never fans
   out downstream.
+- `cached_reads_with_dependency`, `arena_churn_cache_race_loser`, and
+  `crdt_mv_register_merge` were added in the Phase 2 perf-quick-wins pass
+  (`#lzzigslotconstptr`, `#lzzigfreestack`, `#lzzigcrdtstack`,
+  `#lzzigcontainsfast`) to cover the three hot paths the quick wins touched:
+  the cached read (now `*const Slot` + `contains` fast path), the SlotArena
+  alloc/free churn (now 16-entry inline free-stack), and the CRDT merge (now
+  stack-buffered). Counter deltas show the structural wins; the allocator-
+  syscall avoidance (`#lzzigfreestack`, `#lzzigcrdtstack`) is invisible to
+  counters but visible under a real load profile.
 - These are single-threaded. The concurrency surfaces (`AsyncContext`,
   `SignalingRoom`, `CrdtPlaneRuntime`) are correctness-tested, not benchmarked
   here.

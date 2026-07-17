@@ -15,6 +15,9 @@ const Context = lazily.Context;
 const cell = lazily.cell;
 const slot = lazily.slot;
 const signal = lazily.signal;
+const Slot = lazily.Slot;
+const slotKeyed = lazily.slotKeyed;
+const MvRegister = lazily.MvRegister;
 
 const Inst = Context.Instrumentation;
 
@@ -145,6 +148,116 @@ pub fn main() !void {
             .effect_queue_pushes = after.effect_queue_pushes - before.effect_queue_pushes,
             .max_effect_queue_depth = after.max_effect_queue_depth,
         });
+    }
+
+    // cached_reads_with_dependency: warm-cache slot re-reads while a tracking
+    // frame is active. Exercises the `#lzzigslotconstptr` *const-Slot cached
+    // `get` AND `#lzzigcontainsfast` — every cached re-read of the inner slot
+    // by the outer valueFn walks the cached-read path with the outer slot's
+    // tracking frame pushed. Pre-fix this hit `getOrPut` on every cached read;
+    // the `contains` fast path makes the steady state `edges_added == 1` (one
+    // first-time subscribe, then 99,999 fast-path skips).
+    {
+        const ctx = try Context.init(allocator);
+        defer ctx.deinit();
+        const inner_fn = struct {
+            fn call(_: *Context) anyerror!u32 {
+                return 42;
+            }
+        }.call;
+        // Prime the cache: first pull materializes the inner slot.
+        _ = try slot(u32, ctx, inner_fn, null);
+        ctx.resetInstrumentation();
+        const before = ctx.instrumentationSnapshot();
+        // Materializing `outer` runs its valueFn, which performs 100,000
+        // cached reads of the inner slot — each walks the cached-read branch
+        // with `outer`'s tracking frame pushed.
+        const outer = try slot(u32, ctx, struct {
+            fn call(c: *Context) anyerror!u32 {
+                const inner_inner_fn = struct {
+                    fn call(_: *Context) anyerror!u32 {
+                        return 42;
+                    }
+                }.call;
+                var i: u64 = 0;
+                const n: u64 = 100_000;
+                while (i < n) : (i += 1) {
+                    _ = slot(u32, c, inner_inner_fn, null) catch return error.OutOfMemory;
+                }
+                return 0;
+            }
+        }.call, null);
+        _ = outer;
+        printHeader("cached_reads_with_dependency", 100_000);
+        printDelta(.{
+            .node_allocations = ctx.instrumentationSnapshot().node_allocations - before.node_allocations,
+            .slot_recomputes = ctx.instrumentationSnapshot().slot_recomputes - before.slot_recomputes,
+            .dependency_edges_added = ctx.instrumentationSnapshot().dependency_edges_added - before.dependency_edges_added,
+            .dependency_edges_removed = ctx.instrumentationSnapshot().dependency_edges_removed - before.dependency_edges_removed,
+            .effect_queue_pushes = ctx.instrumentationSnapshot().effect_queue_pushes - before.effect_queue_pushes,
+            .max_effect_queue_depth = ctx.instrumentationSnapshot().max_effect_queue_depth,
+        });
+    }
+
+    // arena_churn: cache-race-loser burst — every iter allocates a fresh slot
+    // and immediately frees it because the cache already holds the key. This is
+    // the production workload the `#lzzigfreestack` inline free-stack absorbs:
+    // alloc() and free() ping-pong with no `free_list.append` allocator calls
+    // for bursts ≤ 16 deep. `node_allocations` increments per fresh slot.
+    {
+        const ctx = try Context.init(allocator);
+        defer ctx.deinit();
+        const key: usize = 0x4242_4242;
+        // Prime the cache so every subsequent initKeyed at `key` is the loser.
+        const primed = try Slot.initKeyed(u32, ctx, key, struct {
+            fn call(_: *Context) anyerror!u32 {
+                return 42;
+            }
+        }.call, null);
+        _ = primed;
+        ctx.resetInstrumentation();
+        const before = ctx.instrumentationSnapshot();
+        const iters: u64 = 100_000;
+        var i: u64 = 0;
+        while (i < iters) : (i += 1) {
+            _ = Slot.initKeyed(u32, ctx, key, struct {
+                fn call(_: *Context) anyerror!u32 {
+                    return 42;
+                }
+            }.call, null) catch {};
+        }
+        printHeader("arena_churn_cache_race_loser", iters);
+        printDelta(.{
+            .node_allocations = ctx.instrumentationSnapshot().node_allocations - before.node_allocations,
+            .slot_recomputes = ctx.instrumentationSnapshot().slot_recomputes - before.slot_recomputes,
+            .dependency_edges_added = ctx.instrumentationSnapshot().dependency_edges_added - before.dependency_edges_added,
+            .dependency_edges_removed = ctx.instrumentationSnapshot().dependency_edges_removed - before.dependency_edges_removed,
+            .effect_queue_pushes = ctx.instrumentationSnapshot().effect_queue_pushes - before.effect_queue_pushes,
+            .max_effect_queue_depth = ctx.instrumentationSnapshot().max_effect_queue_depth,
+        });
+    }
+
+    // crdt_merge: MvRegister.mergeFrom churn. `#lzzigcrdtstack` removed the
+    // `std.heap.page_allocator.alloc` per merge (128-entry stack buffer covers
+    // the realistic entry count). The bench reports iteration count and the
+    // resulting `entries` length; counter-based since the win is in
+    // allocator-syscall avoidance, not graph work.
+    {
+        const iters: u64 = 100_000;
+        var i: u64 = 0;
+        while (i < iters) : (i += 1) {
+            var a = MvRegister(u32).init(allocator);
+            defer a.deinit();
+            var b = MvRegister(u32).init(allocator);
+            defer b.deinit();
+            try a.set(1, 1);
+            try b.set(2, 2);
+            _ = try a.mergeFrom(&b);
+        }
+        std.debug.print(
+            "{s:<40} {d:>12} iters  merges={d}\n",
+            .{ "crdt_mv_register_merge", iters, iters },
+        );
     }
 
     std.debug.print("\n(instrumentation counter deltas; lower = less work per op)\n", .{});

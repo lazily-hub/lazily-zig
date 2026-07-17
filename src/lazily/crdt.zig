@@ -191,10 +191,26 @@ fn freeValues(comptime V: type, allocator: std.mem.Allocator, slice: []V) void {
 }
 
 /// Order-insensitive multiset equality over two value slices.
-fn sameValues(comptime V: type, a: []const V, b: []const V) bool {
+///
+/// `#lzzigcrdtstack` — for the overwhelmingly common case (`b.len ≤ 128`, which
+/// covers every realistic CRDT register entry count) the matched-flags buffer
+/// lives on the call stack, removing a global-lock allocation per merge. Only
+/// pathological wide registers fall back to the caller-supplied allocator. The
+/// previous implementation unconditionally used `std.heap.page_allocator`, which
+/// takes the global allocator mutex on every merge.
+fn sameValues(
+    comptime V: type,
+    a: []const V,
+    b: []const V,
+    allocator: std.mem.Allocator,
+) bool {
     if (a.len != b.len) return false;
-    const matched = std.heap.page_allocator.alloc(bool, b.len) catch return false;
-    defer std.heap.page_allocator.free(matched);
+    var stack_buf: [128]bool = undefined;
+    const matched: []bool = if (b.len <= stack_buf.len) stack_buf[0..b.len] else blk: {
+        const allocated = allocator.alloc(bool, b.len) catch return false;
+        break :blk allocated;
+    };
+    defer if (matched.len > stack_buf.len) allocator.free(matched);
     @memset(matched, false);
     for (a) |av| {
         var found = false;
@@ -288,7 +304,7 @@ pub fn MvRegister(comptime V: type) type {
             try self.normalize();
             const after = try self.values(self.allocator);
             defer self.allocator.free(after);
-            return !sameValues(V, before, after);
+            return !sameValues(V, before, after, self.allocator);
         }
 
         /// Drop entries whose version vector is strictly dominated by another,
