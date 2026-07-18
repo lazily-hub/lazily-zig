@@ -435,184 +435,192 @@ pub fn valueFnCacheKey(valueFn: anytype) usize {
     };
 }
 
-/// Inline-capacity set of `*Slot` (`#lzedgeinline`) — the dependency-edge
-/// container for `Slot.change_subscribers` and `Slot.parents`.
+/// Inline-capacity set of keys (`#lzedgeinline`) — the dependency-edge
+/// container behind `Slot.change_subscribers` / `Slot.parents` (keyed by
+/// `*Slot`) and `Cell` subscriber sets (keyed by `SubscriberKey`).
 ///
 /// Profiling `cold_full_recalc` showed ~21% of wall-clock in growing the
 /// per-slot `AutoHashMap` edge sets: every reactive node allocated one map per
 /// direction and grew it on the first edge insert, so an N-node graph paid
 /// O(N) heap allocations just to record edges. Real reactive graphs are
 /// overwhelmingly low-degree (a spreadsheet formula reads 2–3 cells), so this
-/// set stores the first `inline_cap` edges inline in the slot and only spills
-/// to a heap `AutoHashMap` for genuinely high-fan-out nodes (e.g. one source
-/// feeding thousands of dependents). Low-degree graphs allocate zero edge maps.
+/// set stores the first `inline_cap` keys inline and only spills to a heap
+/// `ArrayList(K)` for genuinely high-fan-out nodes (e.g. one source feeding
+/// thousands of dependents). Low-degree graphs allocate zero edge maps.
 ///
-/// This is a drop-in for the `AutoHashMap(*Slot, void)` surface the graph used
+/// `EdgeSet` is generic over an equatable key type `K`
+/// (`#lzzigcellslotedgeset`) so the same low-footprint container serves both
+/// the `*Slot` graph edges and the `SubscriberKey` callback sets on `Cell`,
+/// replacing the per-`Cell` `AutoHashMap(SubscriberKey, void)` pair with two
+/// inline edge sets.
+///
+/// This is a drop-in for the `AutoHashMap(K, void)` surface the graph used
 /// (`getOrPut` dedup-add, `remove`, `count`, `keyIterator`,
 /// `clearRetainingCapacity`, `deinit`), so the surrounding, concurrency-
 /// sensitive snapshot-then-clear-then-iterate control flow is unchanged. Access
 /// is always serialized by `ctx.mutex`, exactly as the map was.
-pub const SlotEdgeSet = struct {
-    /// Inline edges before spilling. 2 mirrors lazily-rs `EdgeVec = SmallVec<[SlotId; 2]>`
-    /// (`#lzvecedge`): reactive graphs are overwhelmingly degree 2-3 (a
-    /// spreadsheet formula reads 2-3 cells, diamond/multi-subscriber test
-    /// graphs are ≤3), so 2 inline covers the common case with the smallest
-    /// per-slot footprint (2 pointers = 16 bytes/direction). Higher-degree
-    /// nodes (one source feeding many dependents) spill to a heap ArrayList.
-    pub const inline_cap: usize = 2;
+pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
 
-    // NOTE: no stored `allocator` field. It was 16 bytes/direction (a vtable
-    // pair) paid by every edge set even though it is needed only on the rare
-    // inline→spill transition. The spill allocator is passed to `getOrPut`/
-    // `deinit` from the owning Slot's `ctx.allocator`.
-    buf: [inline_cap]*Slot = undefined,
-    len: usize = 0,
-    /// Spill store: a growable `ArrayList(*Slot)` with linear dedup, replacing
-    /// the former `AutoHashMap(*Slot, void)` spill (`#lzvecedge`). Linear
-    /// `contains` on a small set is cache-friendlier and faster than
-    /// hash+probe (no hashing, no bucket chain), matching lazily-rs `EdgeVec` /
-    /// `edge_insert` (`SmallVec<[SlotId;2]>` + linear `contains`). Only the
-    /// rare high-fan-out node spills; while spilled, `len` is held at 0 and
-    /// `buf` is unused.
-    spill: ?std.ArrayList(*Slot) = null,
+        /// Inline edges before spilling. `cap` is chosen per use site: the
+        /// `*Slot` graph edges use 2 (mirrors lazily-rs `EdgeVec =
+        /// SmallVec<[SlotId; 2]>`, `#lzvecedge` — reactive graphs are
+        /// overwhelmingly degree 2-3), while `Cell` subscriber sets use 1
+        /// (`#lzzigcellslotedgeset` — a cell usually has 0-1 callbacks). The
+        /// first `cap` keys live inline (no heap alloc); higher-fan-out nodes
+        /// spill to a heap `ArrayList(K)`.
+        pub const inline_cap: usize = cap;
 
-    pub fn init() SlotEdgeSet {
-        return .{};
-    }
+        // NOTE: no stored `allocator` field. It was 16 bytes/direction (a vtable
+        // pair) paid by every edge set even though it is needed only on the rare
+        // inline→spill transition. The spill allocator is passed to `getOrPut`/
+        // `deinit` from the owning Slot's `ctx.allocator`.
+        buf: [cap]K = undefined,
+        len: usize = 0,
+        /// Spill store: a growable `ArrayList(K)` with linear dedup, replacing
+        /// the former `AutoHashMap(K, void)` spill (`#lzvecedge`). Linear
+        /// `contains` on a small set is cache-friendlier and faster than
+        /// hash+probe (no hashing, no bucket chain), matching lazily-rs `EdgeVec` /
+        /// `edge_insert` (`SmallVec<[SlotId;2]>` + linear `contains`). Only the
+        /// rare high-fan-out node spills; while spilled, `len` is held at 0 and
+        /// `buf` is unused.
+        ///
+        /// Non-optional (`#lzzigslotpack`): the inline-vs-spilled state is
+        /// discriminated by `spill.items.len > 0`, not by a null pointer. An
+        /// empty spilled set is indistinguishable from an empty inline set, so
+        /// `ArrayList(K)` (24B) replaces `?ArrayList(K)` (32B) — 8B fewer per
+        /// edge set with no behavioral change.
+        spill: std.ArrayList(K) = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(K).empty,
 
-    pub fn deinit(self: *SlotEdgeSet, allocator: std.mem.Allocator) void {
-        if (self.spill) |*s| s.deinit(allocator);
-        self.* = undefined;
-    }
+        pub fn init() Self {
+            return .{};
+        }
 
-    pub fn count(self: *const SlotEdgeSet) usize {
-        return if (self.spill) |*s| s.items.len else self.len;
-    }
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
+            self.* = undefined;
+        }
 
-    /// Dedup-add `key`. Mirrors `AutoHashMap.getOrPut` for the graph's use
-    /// (callers only rely on the dedup side effect). Spills inline→ArrayList
-    /// when the inline buffer is full. `allocator` is used only on the (rare)
-    /// spill and its amortized growth.
-    pub fn getOrPut(self: *SlotEdgeSet, key: *Slot, allocator: std.mem.Allocator) !void {
-        if (self.spill) |*s| {
-            for (s.items) |e| {
-                if (e == key) return; // already present
+        pub fn count(self: *const Self) usize {
+            return if (self.spill.items.len > 0) self.spill.items.len else self.len;
+        }
+
+        /// Dedup-add `key`. Mirrors `AutoHashMap.getOrPut` for the graph's use
+        /// (callers only rely on the dedup side effect). Spills inline→ArrayList
+        /// when the inline buffer is full. `allocator` is used only on the (rare)
+        /// spill and its amortized growth.
+        pub fn getOrPut(self: *Self, key: K, allocator: std.mem.Allocator) !void {
+            if (self.spill.items.len > 0) {
+                for (self.spill.items) |e| {
+                    if (std.meta.eql(e, key)) return; // already present
+                }
+                try self.spill.append(allocator, key);
+                return;
             }
-            try s.append(allocator, key);
-            return;
+            for (self.buf[0..self.len]) |e| {
+                if (std.meta.eql(e, key)) return; // already present
+            }
+            if (self.len < inline_cap) {
+                self.buf[self.len] = key;
+                self.len += 1;
+                return;
+            }
+            // Inline buffer full — spill into the (already-empty) ArrayList.
+            // Copy the inline entries in, then add the new key. Capacity may be
+            // retained from a prior spill→clear cycle, so the alloc is skipped.
+            try self.spill.ensureTotalCapacity(allocator, inline_cap + 1);
+            for (self.buf[0..self.len]) |e| self.spill.appendAssumeCapacity(e);
+            self.spill.appendAssumeCapacity(key);
+            self.len = 0;
         }
-        for (self.buf[0..self.len]) |e| {
-            if (e == key) return; // already present
-        }
-        if (self.len < inline_cap) {
-            self.buf[self.len] = key;
-            self.len += 1;
-            return;
-        }
-        // Inline buffer full — spill to a heap ArrayList (allocate ONCE, then
-        // reuse). Copy the inline entries in, then add the new key.
-        var s = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty;
-        errdefer s.deinit(allocator);
-        try s.ensureTotalCapacity(allocator, inline_cap + 1);
-        for (self.buf[0..self.len]) |e| s.appendAssumeCapacity(e);
-        s.appendAssumeCapacity(key);
-        self.spill = s;
-        self.len = 0;
-    }
 
-    /// Membership probe (`#lzzigcontainsfast`). Same linear scan `getOrPut`
-    /// performs before its insert, but without the write side effect — so the
-    /// cached-read subscribe site can short-circuit an already-tracked edge
-    /// without paying for the (cold-path) `getOrPut` bookkeeping on every hit.
-    /// Pointer-identity only (never dereferences `key`).
-    pub fn contains(self: *const SlotEdgeSet, key: *const Slot) bool {
-        if (self.spill) |*s| {
-            for (s.items) |e| {
-                if (e == key) return true;
+        /// Membership probe (`#lzzigcontainsfast`). Same linear scan `getOrPut`
+        /// performs before its insert, but without the write side effect — so the
+        /// cached-read subscribe site can short-circuit an already-tracked edge
+        /// without paying for the (cold-path) `getOrPut` bookkeeping on every hit.
+        /// Key-identity only (never dereferences `key`).
+        pub fn contains(self: *const Self, key: K) bool {
+            if (self.spill.items.len > 0) {
+                for (self.spill.items) |e| {
+                    if (std.meta.eql(e, key)) return true;
+                }
+                return false;
+            }
+            for (self.buf[0..self.len]) |e| {
+                if (std.meta.eql(e, key)) return true;
             }
             return false;
         }
-        for (self.buf[0..self.len]) |e| {
-            if (e == key) return true;
-        }
-        return false;
-    }
 
-    /// Remove `key` if present; returns whether it was. Both paths use
-    /// swap-remove (set is unordered; all iteration sites snapshot first).
-    pub fn remove(self: *SlotEdgeSet, key: *Slot) bool {
-        if (self.spill) |*s| {
-            for (s.items, 0..) |e, i| {
-                if (e == key) {
-                    s.items[i] = s.items[s.items.len - 1];
-                    _ = s.pop();
+        /// Remove `key` if present; returns whether it was. Both paths use
+        /// swap-remove (set is unordered; all iteration sites snapshot first).
+        pub fn remove(self: *Self, key: K) bool {
+            if (self.spill.items.len > 0) {
+                for (self.spill.items, 0..) |e, i| {
+                    if (std.meta.eql(e, key)) {
+                        self.spill.items[i] = self.spill.items[self.spill.items.len - 1];
+                        _ = self.spill.pop();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            var i: usize = 0;
+            while (i < self.len) : (i += 1) {
+                if (std.meta.eql(self.buf[i], key)) {
+                    self.buf[i] = self.buf[self.len - 1];
+                    self.len -= 1;
                     return true;
                 }
             }
             return false;
         }
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            if (self.buf[i] == key) {
-                self.buf[i] = self.buf[self.len - 1];
-                self.len -= 1;
-                return true;
-            }
+
+        pub fn clearRetainingCapacity(self: *Self) void {
+            self.spill.clearRetainingCapacity();
+            self.len = 0;
         }
-        return false;
-    }
 
-    pub fn clearRetainingCapacity(self: *SlotEdgeSet) void {
-        if (self.spill) |*s| s.clearRetainingCapacity();
-        self.len = 0;
-    }
+        /// Iterator matching `AutoHashMap.keyIterator()`: `next()` yields
+        /// `*K` (a pointer to the stored key), so existing call sites'
+        /// `ptr.*` continues to work. The returned pointer is stable for the
+        /// duration of a snapshot-then-clear iterate cycle (the only mutation
+        /// callers perform after iteration is `clearRetainingCapacity`, which
+        /// keeps the backing but resets length).
+        pub const KeyIterator = struct {
+            set: *Self,
+            idx: usize = 0,
 
-    /// Iterator matching `AutoHashMap.keyIterator()`: `next()` yields
-    /// `*(*Slot)` (a pointer to the stored key), so existing call sites'
-    /// `ptr.*` continues to work. The returned pointer is stable for the
-    /// duration of a snapshot-then-clear iterate cycle (the only mutation
-    /// callers perform after iteration is `clearRetainingCapacity`, which
-    /// keeps the backing but resets length).
-    pub const KeyIterator = struct {
-        set: *SlotEdgeSet,
-        idx: usize = 0,
-
-        pub fn next(self: *KeyIterator) ?*(*Slot) {
-            if (self.set.spill) |*s| {
-                if (self.idx < s.items.len) {
-                    const p = &s.items[self.idx];
+            pub fn next(self: *KeyIterator) ?*K {
+                if (self.set.spill.items.len > 0) {
+                    if (self.idx < self.set.spill.items.len) {
+                        const p = &self.set.spill.items[self.idx];
+                        self.idx += 1;
+                        return p;
+                    }
+                    return null;
+                }
+                if (self.idx < self.set.len) {
+                    const p = &self.set.buf[self.idx];
                     self.idx += 1;
                     return p;
                 }
                 return null;
             }
-            if (self.idx < self.set.len) {
-                const p = &self.set.buf[self.idx];
-                self.idx += 1;
-                return p;
-            }
-            return null;
+        };
+
+        pub fn keyIterator(self: *Self) KeyIterator {
+            return .{ .set = self };
         }
     };
+}
 
-    pub fn keyIterator(self: *SlotEdgeSet) KeyIterator {
-        return .{ .set = self };
-    }
-};
+/// `*Slot`-keyed edge set — the dependency-edge container for
+/// `Slot.change_subscribers` and `Slot.parents`.
+pub const SlotEdgeSet = EdgeSet(*Slot, 2);
 
 pub const Slot = struct {
-    ctx: *Context,
-    value_fn_ptr: ?*anyopaque,
-    cache_key: ?usize = null,
-    id: SlotId = .{ .raw = 0 },
-    storage: ?Storage,
-    mode: Modes,
-    /// Pointer classification for the cached value type (std.builtin.Type.Pointer.Size): .one, .many, .slice, .c
-    ptr_size: std.builtin.Type.Pointer.Size,
-    change_subscribers: SlotEdgeSet,
-    parents: SlotEdgeSet,
-    deinitPayload: ?*const fn (*Slot) void,
-    free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
     // Inline small-value storage (`#lzinline`). For `.indirect` values whose
     // size/alignment fit `inline_cap`/`inline_align`, the value lives directly
     // in `inline_buf` instead of a separate heap box: `storage.payload.single_ptr`
@@ -621,13 +629,29 @@ pub const Slot = struct {
     // under invalidate-in-place (`#lzinplace`) because a stale slot is orphaned,
     // not freed, so the interior pointer stays valid for concurrent readers.
     // `storage_inline` gates the per-slot free in `destroySelf`.
-    storage_inline: bool = false,
     inline_buf: [inline_cap]u8 align(inline_align) = undefined,
+    storage: ?Storage,
+    change_subscribers: SlotEdgeSet,
+    parents: SlotEdgeSet,
+    ctx: *Context,
+    value_fn_ptr: ?*anyopaque,
+    cache_key: ?usize = null,
+    id: SlotId = .{ .raw = 0 },
+    deinitPayload: ?*const fn (*Slot) void,
+    free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
     // Eager-Signal hooks (default null = lazy/destroy-on-invalidate semantics).
     // on_invalidate: fired instead of destroyUnlocked when a dependency invalidates this slot.
     // recompute: type-erased re-materialize (re-run valueFn, memo guard, swap, emitChange).
     on_invalidate: ?*const fn (*Slot) void = null,
     recompute: ?*const fn (*Slot) void = null,
+    // Small fields grouped at the tail (`#lzzigslotpack`): the 1-byte enums and
+    // bools are clustered so the struct carries no inter-field padding between
+    // them. `storage`/`inline_buf` keep their types and the `#lzinplace`
+    // page-stable contract is unchanged — this is a declaration-ordering only.
+    mode: Modes,
+    /// Pointer classification for the cached value type (std.builtin.Type.Pointer.Size): .one, .many, .slice, .c
+    ptr_size: std.builtin.Type.Pointer.Size,
+    storage_inline: bool = false,
     stale: bool = false,
 
     /// Inline-storage budget (`#lzinline`). 16 bytes / 16-byte alignment covers
@@ -1479,17 +1503,17 @@ test "lazily/context.SlotEdgeSet: inline fill, spill, dedup, iterate, remove, cl
     var i: usize = 0;
     while (i < SlotEdgeSet.inline_cap) : (i += 1) try set.getOrPut(fakeSlot(i), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
-    try std.testing.expect(set.spill == null);
+    try std.testing.expect(set.spill.items.len == 0);
 
     // Dedup: re-adding an existing key does not grow the set.
     try set.getOrPut(fakeSlot(0), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
-    try std.testing.expect(set.spill == null);
+    try std.testing.expect(set.spill.items.len == 0);
 
     // One more distinct key spills to the heap ArrayList, preserving every entry.
     try set.getOrPut(fakeSlot(SlotEdgeSet.inline_cap), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap + 1, set.count());
-    try std.testing.expect(set.spill != null);
+    try std.testing.expect(set.spill.items.len > 0);
 
     // Iterate: every inserted key appears exactly once.
     var seen: usize = 0;
@@ -1522,7 +1546,7 @@ test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no sp
     // Fill exactly to inline capacity (2) — stays inline.
     try set.getOrPut(fakeSlot(0), a);
     try set.getOrPut(fakeSlot(1), a);
-    try std.testing.expect(set.spill == null);
+    try std.testing.expect(set.spill.items.len == 0);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
 
     // Swap-remove one entry: the survivor stays, still inline.
@@ -1541,5 +1565,6 @@ test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no sp
     // Re-adding fills the freed inline slot without ever spilling.
     try set.getOrPut(fakeSlot(0), a);
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
-    try std.testing.expect(set.spill == null);
+    try std.testing.expect(set.spill.items.len == 0);
 }
+

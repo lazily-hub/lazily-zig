@@ -3,12 +3,11 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Context = @import("context.zig").Context;
 const currentSlotFor = @import("context.zig").currentSlotFor;
+const EdgeSet = @import("context.zig").EdgeSet;
 const Owned = @import("context.zig").Owned;
 const OwnedString = @import("context.zig").OwnedString;
 const Slot = @import("context.zig").Slot;
 const String = @import("context.zig").String;
-const subscriberKey = @import("context.zig").subscriberKey;
-const SubscriberKey = @import("context.zig").SubscriberKey;
 const ValueFn = @import("context.zig").ValueFn;
 const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const deinitSlotValue = @import("slot.zig").deinitSlotValue;
@@ -26,14 +25,25 @@ pub fn ChangeCallback(comptime T: type) type {
     return *const fn (*Cell(T)) void;
 }
 
+/// `EdgeSet(usize, 1)` (`#lzzigcellslotedgeset`): the same inline-capacity
+/// container the `Slot` graph uses for its dependency edges, keyed here by the
+/// callback address alone. A `SubscriberKey` carries both `ctx_ptr` and
+/// `cb_ptr`, but every subscriber of a given `Cell` shares the same `ctx`
+/// (`self.ctx`), so `ctx_ptr` is constant per-cell and the callback address
+/// alone is a unique dedup key. Keying on the `usize` handle (8 bytes, vs the
+/// 16-byte `SubscriberKey`) plus `inline_cap = 1` keeps the common 0-1
+/// subscriber cell allocation-free at near-neutral footprint versus the old
+/// `AutoHashMap(SubscriberKey, void)` pair.
+const SubscriberEdgeSet = EdgeSet(usize, 1);
+
 /// A mutable container to be stored as a slot via the cell function
 pub fn Cell(comptime T: type) type {
     return struct {
         ctx: *Context,
         slot: *Slot,
         value: T,
-        before_change_subscribers: std.AutoHashMap(SubscriberKey, void),
-        change_subscribers: std.AutoHashMap(SubscriberKey, void),
+        before_change_subscribers: SubscriberEdgeSet,
+        change_subscribers: SubscriberEdgeSet,
         deinitCellValue: ?DeinitCellValueFn(T),
 
         pub const MissingCurrentSlotError = error{MissingCurrentSlot};
@@ -52,14 +62,8 @@ pub fn Cell(comptime T: type) type {
                             .ctx = _ctx,
                             .slot = cell_slot,
                             .value = initial_value,
-                            .before_change_subscribers = std.AutoHashMap(
-                                SubscriberKey,
-                                void,
-                            ).init(_ctx.allocator),
-                            .change_subscribers = std.AutoHashMap(
-                                SubscriberKey,
-                                void,
-                            ).init(_ctx.allocator),
+                            .before_change_subscribers = SubscriberEdgeSet.init(),
+                            .change_subscribers = SubscriberEdgeSet.init(),
                             .deinitCellValue = deinitCellValue,
                         };
                     } else return error.MissingCurrentSlot;
@@ -90,8 +94,8 @@ pub fn Cell(comptime T: type) type {
             if (self.deinitCellValue) |deinit_fn| {
                 deinit_fn(self);
             }
-            self.before_change_subscribers.deinit();
-            self.change_subscribers.deinit();
+            self.before_change_subscribers.deinit(self.ctx.allocator);
+            self.change_subscribers.deinit(self.ctx.allocator);
         }
 
         pub fn get(self: *const @This()) T {
@@ -113,10 +117,9 @@ pub fn Cell(comptime T: type) type {
             // re-enter Context/Cell methods that acquire `ctx.mutex` —
             // `Cell.get` is lock-free and safe for reading the old value.
             {
-                var before_iter = self.before_change_subscribers.iterator();
-                while (before_iter.next()) |entry| {
-                    const before_key = entry.key_ptr.*;
-                    const before_cb: ChangeCallback(T) = @ptrFromInt(before_key.cb_ptr);
+                var before_iter = self.before_change_subscribers.keyIterator();
+                while (before_iter.next()) |key_ptr| {
+                    const before_cb: ChangeCallback(T) = @ptrFromInt(key_ptr.*);
                     before_cb(self);
                 }
             }
@@ -127,10 +130,9 @@ pub fn Cell(comptime T: type) type {
             // Callbacks may call into the context so unlock here.
             self.ctx.mutex.unlock();
 
-            var iter = self.change_subscribers.iterator();
-            while (iter.next()) |entry| {
-                const subscriber_key = entry.key_ptr.*;
-                const cb: ChangeCallback(T) = @ptrFromInt(subscriber_key.cb_ptr);
+            var iter = self.change_subscribers.keyIterator();
+            while (iter.next()) |key_ptr| {
+                const cb: ChangeCallback(T) = @ptrFromInt(key_ptr.*);
                 cb(self);
             }
 
@@ -154,12 +156,10 @@ pub fn Cell(comptime T: type) type {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
-            const subscriber_key = subscriberKey(self.ctx, cb);
+            const cb_key = @intFromPtr(cb);
 
-            const gop = try self.change_subscribers.getOrPut(subscriber_key);
-            if (gop.found_existing) return false; // duplicate, not added
-
-            // Value type is void, nothing to store.
+            if (self.change_subscribers.contains(cb_key)) return false; // duplicate, not added
+            try self.change_subscribers.getOrPut(cb_key, self.ctx.allocator);
             return true; // newly added
         }
 
@@ -168,8 +168,8 @@ pub fn Cell(comptime T: type) type {
             defer self.ctx.mutex.unlock();
 
             // Remove by swap-remove for O(1) erase (order not preserved).
-            const subscriber_key = subscriberKey(self.ctx, cb);
-            return self.change_subscribers.remove(subscriber_key);
+            const cb_key = @intFromPtr(cb);
+            return self.change_subscribers.remove(cb_key);
         }
 
         /// Subscribe a callback that fires BEFORE a `set` commits its new
@@ -178,11 +178,10 @@ pub fn Cell(comptime T: type) type {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
-            const subscriber_key = subscriberKey(self.ctx, cb);
+            const cb_key = @intFromPtr(cb);
 
-            const gop = try self.before_change_subscribers.getOrPut(subscriber_key);
-            if (gop.found_existing) return false; // duplicate, not added
-
+            if (self.before_change_subscribers.contains(cb_key)) return false; // duplicate, not added
+            try self.before_change_subscribers.getOrPut(cb_key, self.ctx.allocator);
             return true; // newly added
         }
 
@@ -190,8 +189,8 @@ pub fn Cell(comptime T: type) type {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
-            const subscriber_key = subscriberKey(self.ctx, cb);
-            return self.before_change_subscribers.remove(subscriber_key);
+            const cb_key = @intFromPtr(cb);
+            return self.before_change_subscribers.remove(cb_key);
         }
     };
 }
@@ -632,3 +631,4 @@ test "lazily/cell.thread_safe Cell updates" {
     // didn't deadlock or crash during high-frequency contention.
     _ = counter.get();
 }
+
