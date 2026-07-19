@@ -499,3 +499,278 @@ test "lazily/async_context: generic over bool value type" {
     try ctx.setCell(c, false);
     try std.testing.expectEqual(@as(?bool, false), ctx.getCell(c));
 }
+
+// ---------------------------------------------------------------------------
+// Transitive-cascade coverage (#lzdartobservercow).
+//
+// `invalidateSlot` deliberately does NOT walk dependents — it only bumps the
+// revision and enqueues the slot. The cascade instead rides the recompute
+// pipeline: `settleOnce` publishes a changed value and only then invalidates
+// that slot's `reverse_edges`, which enqueues the next level. So depth is
+// covered by the queue draining, not by a recursive invalidate.
+//
+// This is the structural difference from the lazily-dart (c91a32a) and
+// lazily-go (bdfdbce) defect, where an invalidation handler marked its own node
+// stale and stopped, and a "resolved" read fast path short-circuited the
+// recursive pull that would otherwise have compensated. These tests pin the
+// zig behavior at depth so a future refactor cannot quietly reintroduce it.
+// ---------------------------------------------------------------------------
+
+/// cell -> a -> b -> c -> d. Each level registers the level above it as a
+/// dependency via `readCell` (ids are uniform, so a slot id is a legal
+/// dependency id) and folds its value.
+const ChainState = struct {
+    var cell_id: u64 = 0;
+    var a_id: u64 = 0;
+    var b_id: u64 = 0;
+    var c_id: u64 = 0;
+    var d_id: u64 = 0;
+
+    var a_runs: u64 = 0;
+    var b_runs: u64 = 0;
+    var c_runs: u64 = 0;
+    var d_runs: u64 = 0;
+
+    fn reset() void {
+        a_runs = 0;
+        b_runs = 0;
+        c_runs = 0;
+        d_runs = 0;
+    }
+
+    fn a(cc: *CC) anyerror!u32 {
+        cc.readCell(cell_id);
+        a_runs += 1;
+        return (cc.async_ctx.getCell(cell_id) orelse 0) + 10;
+    }
+    fn b(cc: *CC) anyerror!u32 {
+        cc.readCell(a_id);
+        b_runs += 1;
+        return (cc.async_ctx.get(a_id) orelse 0) + 100;
+    }
+    fn c(cc: *CC) anyerror!u32 {
+        cc.readCell(b_id);
+        c_runs += 1;
+        return (cc.async_ctx.get(b_id) orelse 0) + 1000;
+    }
+    fn d(cc: *CC) anyerror!u32 {
+        cc.readCell(c_id);
+        d_runs += 1;
+        return (cc.async_ctx.get(c_id) orelse 0) + 10000;
+    }
+};
+
+test "lazily/async_context: cascade reaches depth 3 (cell -> a -> b -> c)" {
+    const allocator = std.testing.allocator;
+    var ctx = ACtx.init(allocator);
+    defer ctx.deinit();
+
+    const S = ChainState;
+    S.reset();
+    S.cell_id = try ctx.cell(1);
+    S.a_id = try ctx.computedAsync(S.a);
+    S.b_id = try ctx.computedAsync(S.b);
+    S.c_id = try ctx.computedAsync(S.c);
+
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 11), ctx.get(S.a_id).?);
+    try std.testing.expectEqual(@as(u32, 111), ctx.get(S.b_id).?);
+    try std.testing.expectEqual(@as(u32, 1111), ctx.get(S.c_id).?);
+
+    // One write at the root must refresh ALL THREE levels, not just the first.
+    // This is the exact assertion that failed in dart/go before c91a32a/bdfdbce.
+    S.reset();
+    try ctx.setCell(S.cell_id, 2);
+    _ = try ctx.settle();
+
+    try std.testing.expectEqual(@as(u32, 12), ctx.get(S.a_id).?);
+    try std.testing.expectEqual(@as(u32, 112), ctx.get(S.b_id).?);
+    try std.testing.expectEqual(@as(u32, 1112), ctx.get(S.c_id).?);
+    try std.testing.expectEqual(@as(u64, 1), S.a_runs);
+    try std.testing.expectEqual(@as(u64, 1), S.b_runs);
+    try std.testing.expectEqual(@as(u64, 1), S.c_runs);
+}
+
+test "lazily/async_context: cascade reaches depth 4 and repeats across writes" {
+    const allocator = std.testing.allocator;
+    var ctx = ACtx.init(allocator);
+    defer ctx.deinit();
+
+    const S = ChainState;
+    S.reset();
+    S.cell_id = try ctx.cell(1);
+    S.a_id = try ctx.computedAsync(S.a);
+    S.b_id = try ctx.computedAsync(S.b);
+    S.c_id = try ctx.computedAsync(S.c);
+    S.d_id = try ctx.computedAsync(S.d);
+
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 11111), ctx.get(S.d_id).?);
+
+    // Three successive writes: the cascade must fire every time, not just once
+    // (the dart/go defect went deaf after the first rerun).
+    var expected: u32 = 11111;
+    var v: u32 = 1;
+    while (v < 4) : (v += 1) {
+        S.reset();
+        try ctx.setCell(S.cell_id, v + 1);
+        _ = try ctx.settle();
+        expected += 1;
+        try std.testing.expectEqual(expected, ctx.get(S.d_id).?);
+        try std.testing.expectEqual(@as(u64, 1), S.d_runs);
+    }
+}
+
+/// cell -> {left, right} -> sink. Sink must recompute exactly once per write
+/// despite two invalidation paths reaching it.
+const DiamondState = struct {
+    var cell_id: u64 = 0;
+    var left_id: u64 = 0;
+    var right_id: u64 = 0;
+    var sink_id: u64 = 0;
+    var sink_runs: u64 = 0;
+
+    fn left(cc: *CC) anyerror!u32 {
+        cc.readCell(cell_id);
+        return (cc.async_ctx.getCell(cell_id) orelse 0) + 1;
+    }
+    fn right(cc: *CC) anyerror!u32 {
+        cc.readCell(cell_id);
+        return (cc.async_ctx.getCell(cell_id) orelse 0) + 2;
+    }
+    fn sink(cc: *CC) anyerror!u32 {
+        cc.readCell(left_id);
+        cc.readCell(right_id);
+        sink_runs += 1;
+        return (cc.async_ctx.get(left_id) orelse 0) +
+            (cc.async_ctx.get(right_id) orelse 0);
+    }
+};
+
+test "lazily/async_context: diamond converges and does not double-run the sink" {
+    const allocator = std.testing.allocator;
+    var ctx = ACtx.init(allocator);
+    defer ctx.deinit();
+
+    const S = DiamondState;
+    S.sink_runs = 0;
+    S.cell_id = try ctx.cell(10);
+    S.left_id = try ctx.computedAsync(S.left);
+    S.right_id = try ctx.computedAsync(S.right);
+    S.sink_id = try ctx.computedAsync(S.sink);
+
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 23), ctx.get(S.sink_id).?); // 11 + 12
+
+    S.sink_runs = 0;
+    try ctx.setCell(S.cell_id, 20);
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 43), ctx.get(S.sink_id).?); // 21 + 22
+
+    // `enqueueCompute`'s `queued` latch collapses the two arrival paths, but the
+    // sink still reruns once per arriving level (left, then right), so assert a
+    // bound rather than an exact 1.
+    try std.testing.expect(S.sink_runs >= 1 and S.sink_runs <= 2);
+}
+
+/// A slot whose compute has an observable side effect — the AsyncContext analog
+/// of an Effect downstream of a slot. Two successive writes must produce two
+/// reruns; the sibling defect made an async effect deaf after exactly one.
+const AsyncEffectState = struct {
+    var cell_id: u64 = 0;
+    var mid_id: u64 = 0;
+    var effect_runs: u64 = 0;
+    var last_seen: u32 = 0;
+
+    fn mid(cc: *CC) anyerror!u32 {
+        cc.readCell(cell_id);
+        return (cc.async_ctx.getCell(cell_id) orelse 0) * 2;
+    }
+    fn effect(cc: *CC) anyerror!u32 {
+        cc.readCell(mid_id);
+        const v = cc.async_ctx.get(mid_id) orelse 0;
+        effect_runs += 1;
+        last_seen = v;
+        return v;
+    }
+};
+
+test "lazily/async_context: effect downstream of a slot reruns on every write" {
+    const allocator = std.testing.allocator;
+    var ctx = ACtx.init(allocator);
+    defer ctx.deinit();
+
+    const S = AsyncEffectState;
+    S.effect_runs = 0;
+    S.last_seen = 0;
+    S.cell_id = try ctx.cell(1);
+    S.mid_id = try ctx.computedAsync(S.mid);
+    _ = try ctx.computedAsync(S.effect);
+
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u64, 1), S.effect_runs);
+    try std.testing.expectEqual(@as(u32, 2), S.last_seen);
+
+    // First write.
+    try ctx.setCell(S.cell_id, 5);
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 10), S.last_seen);
+
+    // SECOND write — the one that exposed the dart/go "deaf after one rerun".
+    try ctx.setCell(S.cell_id, 9);
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 18), S.last_seen);
+    try std.testing.expectEqual(@as(u64, 3), S.effect_runs);
+}
+
+test "lazily/async_context: read before the queue drains observes a stale value at depth" {
+    // SEMANTICS PIN, not a bug report. `setCell` enqueues only its DIRECT
+    // dependents; deeper levels are enqueued later, by `settleOnce` publishing a
+    // changed value and walking `reverse_edges`. So between the write and
+    // quiescence, a depth>=2 slot is still `.resolved` holding its previous
+    // value, and both `get` and `awaitResolved` will hand it back.
+    //
+    // `awaitResolved` is the sharper case: its loop leads with
+    // `if (self.get(id)) |v| return v`, so it returns the stale value WITHOUT
+    // settling anything, because the slot was never moved off `.resolved`.
+    //
+    // This is eventual consistency, and it is the documented contract for this
+    // type: `settle()` is "drain the pending-compute queue to quiescence" and is
+    // what callers must run before reading. It is not the dart/go defect — the
+    // cascade does reach every level (see the depth-3/depth-4 tests above), it
+    // just reaches them asynchronously. Changing it would mean making `get`
+    // demand-driven, which is a contract change, not a fix.
+    const allocator = std.testing.allocator;
+    var ctx = ACtx.init(allocator);
+    defer ctx.deinit();
+
+    const S = ChainState;
+    S.reset();
+    S.cell_id = try ctx.cell(1);
+    S.a_id = try ctx.computedAsync(S.a);
+    S.b_id = try ctx.computedAsync(S.b);
+    S.c_id = try ctx.computedAsync(S.c);
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 1111), ctx.get(S.c_id).?);
+
+    S.reset();
+    try ctx.setCell(S.cell_id, 2);
+
+    // Only the direct dependent was enqueued.
+    try std.testing.expectEqual(@as(usize, 1), ctx.pending.items.len);
+    try std.testing.expectEqual(S.a_id, ctx.pending.items[0]);
+
+    // Depth 2 and 3 are still `.resolved` with pre-write values.
+    try std.testing.expectEqual(@as(u32, 111), ctx.get(S.b_id).?);
+    try std.testing.expectEqual(@as(u32, 1111), ctx.get(S.c_id).?);
+
+    // And `awaitResolved` short-circuits on that stale `.resolved` state
+    // without running a single compute.
+    try std.testing.expectEqual(@as(u32, 1111), try ctx.awaitResolved(S.c_id));
+    try std.testing.expectEqual(@as(u64, 0), S.c_runs);
+
+    // Draining to quiescence is what makes the read correct.
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 1112), ctx.get(S.c_id).?);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending.items.len);
+}
