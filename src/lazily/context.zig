@@ -175,6 +175,14 @@ pub const Context = struct {
     // Always empty on entry (each cascade drains it to completion under
     // `mutex`); the trailing `defer clearRetainingCapacity()` is a safety net.
     cascade_scratch: std.ArrayList(*Slot),
+    // Count of invalidation cascades that could not grow `cascade_scratch` and
+    // fell back to `cascadeFallbackMarkAllStaleUnlocked` (see there). Non-zero
+    // means the graph was conservatively over-invalidated at least once: still
+    // correct, but every cached slot was forced to recompute. Exposed so an
+    // OOM-degraded cascade is observable instead of silent. Deliberately NOT a
+    // field of `Instrumentation`, which mirrors lazily-rs `InstrumentationCounters`
+    // one-for-one and must not drift.
+    cascade_oom_fallbacks: u64 = 0,
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
@@ -1264,6 +1272,7 @@ pub const Slot = struct {
         std.debug.assert(wl.items.len == 0); // always empty on entry
         defer wl.clearRetainingCapacity();
 
+        var oom = false;
         {
             var iter = self.change_subscribers.keyIterator();
             while (iter.next()) |ptr| {
@@ -1272,10 +1281,22 @@ pub const Slot = struct {
                 if (dependent_slot.on_invalidate) |hook| {
                     hook(dependent_slot);
                 } else {
-                    wl.append(ctx.allocator, dependent_slot) catch {};
+                    // A dropped push would strand this dependent's whole
+                    // subgraph as permanently-fresh-but-wrong; degrade to the
+                    // conservative sweep instead. See
+                    // `cascadeFallbackMarkAllStaleUnlocked`.
+                    wl.append(ctx.allocator, dependent_slot) catch {
+                        oom = true;
+                    };
                 }
             }
             self.change_subscribers.clearRetainingCapacity();
+        }
+
+        if (oom) {
+            wl.clearRetainingCapacity();
+            cascadeFallbackMarkAllStaleUnlocked(ctx);
+            return;
         }
 
         drainCascadeWorklist(ctx);
@@ -1287,6 +1308,55 @@ pub const Slot = struct {
     /// A node's `change_subscribers` is cleared after its children are pushed,
     /// so children processing (deferred to future pops) never observes a
     /// half-iterated set — the snapshot-before-iterate invariant from #lzuafix.
+    /// Conservative, allocation-free recovery for a cascade that ran out of
+    /// memory growing `ctx.cascade_scratch`.
+    ///
+    /// The cascade's whole reason to exist is the invariant *a stale node
+    /// implies all of its transitive dependents are stale*. `drainCascadeWorklist`
+    /// relies on it for the `if (node.stale) continue` early-out, and
+    /// `slotKeyed` relies on it to know a non-stale cache hit is trustworthy.
+    /// Dropping a single worklist push breaks that invariant permanently: the
+    /// dropped node's entire subgraph keeps serving values computed from a
+    /// dependency that has since changed, and nothing ever revisits it.
+    ///
+    /// So on OOM we do the only thing that restores the invariant without
+    /// allocating: mark *every* slot the Context knows about stale. The
+    /// implication holds vacuously once nothing is fresh. Slots carrying an
+    /// `on_invalidate` hook (Signal/Effect-backed) get the hook instead, so
+    /// eager nodes still reach `pending_recompute` when that queue can grow.
+    ///
+    /// Edges are intentionally left intact here. The normal cascade unsubscribes
+    /// as it walks, but skipping that only over-notifies on the next write, and
+    /// `slotKeyed` orphans each stale slot and rebuilds its edges on first read
+    /// anyway. Over-notification is the safe direction; dropping edges is not.
+    fn cascadeFallbackMarkAllStaleUnlocked(ctx: *Context) void {
+        ctx.cascade_oom_fallbacks += 1;
+
+        var iter = ctx.cache.valueIterator();
+        while (iter.next()) |ptr| markStaleConservatively(ptr.*);
+        for (ctx.orphaned_slots.items) |slot| markStaleConservatively(slot);
+    }
+
+    /// Symmetrically drop every remaining `node -> child` edge. Idempotent for
+    /// children whose `parents` entry the caller already removed.
+    fn dropRemainingSubscriberEdges(node: *Slot) void {
+        var iter = node.change_subscribers.keyIterator();
+        while (iter.next()) |ptr| {
+            _ = ptr.*.parents.remove(node);
+        }
+        node.change_subscribers.clearRetainingCapacity();
+    }
+
+    fn markStaleConservatively(slot: *Slot) void {
+        if (slot.destroying) return;
+        if (slot.on_invalidate) |hook| {
+            // The hook is itself `if (!s.stale)`-guarded and idempotent.
+            hook(slot);
+        } else {
+            slot.stale = true;
+        }
+    }
+
     fn drainCascadeWorklist(ctx: *Context) void {
         const wl = &ctx.cascade_scratch;
         while (wl.pop()) |node| {
@@ -1301,7 +1371,23 @@ pub const Slot = struct {
                 if (child.on_invalidate) |hook| {
                     hook(child);
                 } else {
-                    wl.append(ctx.allocator, child) catch {};
+                    wl.append(ctx.allocator, child) catch {
+                        // Same hole as the seeding loop in
+                        // `emitChangeUnlocked`: abandon the partial walk and
+                        // restore the invariant conservatively.
+                        //
+                        // Finish dropping BOTH halves of every remaining edge
+                        // first. Clearing `change_subscribers` while some
+                        // child still lists `node` in `parents` would leave a
+                        // one-sided edge, and `destroySelf` walks
+                        // `change_subscribers` to clean up `parents` — a
+                        // one-sided edge there is a dangling pointer, not just
+                        // a stale one.
+                        dropRemainingSubscriberEdges(node);
+                        wl.clearRetainingCapacity();
+                        cascadeFallbackMarkAllStaleUnlocked(ctx);
+                        return;
+                    };
                 }
             }
             node.change_subscribers.clearRetainingCapacity();

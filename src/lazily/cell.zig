@@ -464,3 +464,71 @@ test "lazily/cell.thread_safe Cell updates" {
     // didn't deadlock or crash during high-frequency contention.
     _ = counter.get();
 }
+
+// Depth-3 chain used by the OOM-cascade regression test below. Declared at
+// file scope so each level is a distinct, stable cache key.
+const CascadeOomChain = struct {
+    var source: u32 = 1;
+
+    fn getSource(_ctx: *Context) !u32 {
+        _ = _ctx;
+        return source;
+    }
+    const srcCell = initCellFn(u32, getSource, null);
+
+    fn getA(_ctx: *Context) !u32 {
+        return (try srcCell(_ctx)).get() + 10;
+    }
+    const a = initSlotFn(u32, getA, null);
+
+    fn getB(_ctx: *Context) !u32 {
+        return (try a(_ctx)).* + 100;
+    }
+    const b = initSlotFn(u32, getB, null);
+
+    fn getC(_ctx: *Context) !u32 {
+        return (try b(_ctx)).* + 1000;
+    }
+    const c = initSlotFn(u32, getC, null);
+};
+
+test "lazily/cell: OOM growing the cascade worklist must not strand a dependent subgraph" {
+    // Regression guard for the `wl.append(...) catch {}` that used to sit in
+    // `emitChangeUnlocked`/`drainCascadeWorklist`. Swallowing that failure
+    // dropped a dependent from the invalidation cascade, and because
+    // `drainCascadeWorklist` short-circuits on `node.stale` the whole subgraph
+    // below it stayed fresh-but-wrong forever. The fix degrades to
+    // `cascadeFallbackMarkAllStaleUnlocked` instead.
+    const S = CascadeOomChain;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.source = 1;
+    try std.testing.expectEqual(@as(u32, 1111), (try S.c(ctx)).*);
+
+    // Force the very next allocation — the cascade worklist growth — to fail.
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    ctx.allocator = failing.allocator();
+
+    S.source = 2;
+    (try S.srcCell(ctx)).set(2);
+
+    ctx.allocator = backing;
+
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The invariant holds: every level below the cell is stale, including the
+    // deepest one the dropped push would have stranded. This is the assertion
+    // that actually fails against the old `catch {}`.
+    try std.testing.expect(ctx.getSlot(S.getA).?.stale);
+    try std.testing.expect(ctx.getSlot(S.getB).?.stale);
+    try std.testing.expect(ctx.getSlot(S.getC).?.stale);
+
+    // The cascade degraded observably rather than silently.
+    try std.testing.expectEqual(@as(u64, 1), ctx.cascade_oom_fallbacks);
+
+    // And the observable value is correct on the next read.
+    try std.testing.expectEqual(@as(u32, 1112), (try S.c(ctx)).*);
+    try std.testing.expectEqual(@as(usize, 0), ctx.cascade_scratch.items.len);
+}
