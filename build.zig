@@ -234,6 +234,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_lossless_tree_mod_tests = b.addRunArtifact(lossless_tree_mod_tests);
 
+    // Canonical cross-language observer-semantics fixtures (`#lzdartobservercow`,
+    // `#lzspecconf`). Reads `../lazily-spec/conformance/reactive-graph/` at
+    // runtime and skips (loudly) when the sibling is absent — CI clones it and
+    // then asserts the directory exists so the skip can never pass silently.
+    const observer_conformance_mod = b.createModule(.{
+        .root_source_file = b.path("src/lazily/observer_conformance_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    observer_conformance_mod.addOptions("build_options", build_options);
+    const observer_conformance_tests = b.addTest(.{
+        .root_module = observer_conformance_mod,
+        .filters = filters,
+    });
+    const run_observer_conformance_tests = b.addRunArtifact(observer_conformance_tests);
+
     const command_plane_mod_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lazily/command_plane_test.zig"),
@@ -312,6 +328,7 @@ pub fn build(b: *std.Build) void {
     run_test.dependOn(&run_ipc_mod_tests.step);
     run_test.dependOn(&run_lossless_tree_mod_tests.step);
     run_test.dependOn(&run_command_plane_mod_tests.step);
+    run_test.dependOn(&run_observer_conformance_tests.step);
     run_test.dependOn(&run_reliable_sync_mod_tests.step);
     run_test.dependOn(&run_example_auth_mod_tests.step);
     run_test.dependOn(&run_example_cells_mod_tests.step);

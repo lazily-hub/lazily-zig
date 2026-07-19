@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Zig build + test, across the toolchains this repo claims to support.
+  #
+  # `master` is deliberately NOT a gate. zig master has already gutted
+  # `std.posix`/`std.fs` under this repo once (which is why parts of the code
+  # reach for `std.os.linux` raw syscalls), and a main branch that is red
+  # because of an upstream commit nobody here made is a branch people learn to
+  # ignore. It runs as an early-warning signal instead.
+  #
+  # 0.15.2 is also non-gating, but for a different reason: the tree does not
+  # currently compile there (`std.testing.io` in reliable_sync.zig and the `O`
+  # flags struct in transport.zig both postdate it). That is pre-existing and
+  # is tracked separately from the observer-semantics migration; the job is
+  # kept so the gap stays visible rather than being silently dropped.
+  #
+  # 0.16.0 is the real gate.
+  test:
+    name: Zig ${{ matrix.zig }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.zig != '0.16.0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        zig: ['0.15.2', '0.16.0', 'master']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ matrix.zig }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig }}
+
+      # lazily-spec is the canonical cross-language source for the conformance
+      # fixtures. Clone it as a sibling BEFORE the test step so
+      # `observer_conformance_test.zig` replays the canonical files rather than
+      # skipping (#lzspecconf).
+      - name: Fetch canonical lazily-spec conformance fixtures (#lzspecconf)
+        run: git clone --depth 1 https://github.com/lazily-hub/lazily-spec.git ../lazily-spec
+
+      # The runner skips loudly when the sibling is absent, which is right for a
+      # local checkout and wrong for CI: a skip that nobody asserts against
+      # reports green while testing nothing. Assert it here.
+      - name: Assert conformance fixtures are present
+        run: |
+          test -d ../lazily-spec/conformance/reactive-graph || {
+            echo "::error::../lazily-spec/conformance/reactive-graph missing — observer_conformance_test.zig would skip and CI would report green having tested nothing"
+            exit 1
+          }
+          ls ../lazily-spec/conformance/reactive-graph/observer_*.json >/dev/null || {
+            echo "::error::no observer_*.json fixtures under ../lazily-spec/conformance/reactive-graph"
+            exit 1
+          }
+
+      - name: Test
+        run: zig build test --summary all
+
+  # ---------------------------------------------------------------------------
+  # `make check` also runs the Lean model in lazily-formal. It is split out
+  # rather than folded into the matrix above: a Lean toolchain download and
+  # `lake build` are slow and are their own failure surface, and gating fast
+  # zig feedback behind them buys nothing.
+  lean-formal:
+    name: Lean formal model
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch lazily-formal sibling
+        run: git clone --depth 1 https://github.com/lazily-hub/lazily-formal.git ../lazily-formal
+
+      - name: Assert lazily-formal is present
+        run: |
+          test -f ../lazily-formal/lakefile.lean || {
+            echo "::error::../lazily-formal/lakefile.lean missing — the formal-model gate would silently do nothing"
+            exit 1
+          }
+
+      - name: Install Lean toolchain
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: ../lazily-formal
+          build: true
+          test: false
+          lint: false

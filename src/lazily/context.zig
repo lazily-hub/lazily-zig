@@ -548,8 +548,14 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
 
         /// Whether `K` can be hashed cheaply (pointer or integer). Non-indexable
         /// key types keep the pure-scan behaviour.
+        /// Struct keys opt in by declaring `edgeHashKey`, which projects the
+        /// key onto the unique field the index should hash (`Cell`'s
+        /// `Subscription` hashes its registration id, not the callback
+        /// address). Without the hook a struct key keeps the pure-scan
+        /// behaviour, since `mixKey` has nothing safe to hash.
         const indexable = switch (@typeInfo(K)) {
             .pointer, .int => true,
+            .@"struct" => @hasDecl(K, "edgeHashKey"),
             else => false,
         };
 
@@ -572,6 +578,7 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
             var x: u64 = switch (@typeInfo(K)) {
                 .pointer => @intFromPtr(key),
                 .int => @intCast(key),
+                .@"struct" => key.edgeHashKey(),
                 else => unreachable,
             };
             // Multiply-shift finalizer (fmix64). Slot pointers stride by a fixed

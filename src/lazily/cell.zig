@@ -25,21 +25,50 @@ pub fn ChangeCallback(comptime T: type) type {
     return *const fn (*Cell(T)) void;
 }
 
-/// `EdgeSet(usize, 1)` (`#lzzigcellslotedgeset`): the same inline-capacity
-/// container the `Slot` graph uses for its dependency edges, keyed here by the
-/// callback address alone. A `SubscriberKey` carries both `ctx_ptr` and
-/// `cb_ptr`, but every subscriber of a given `Cell` shares the same `ctx`
-/// (`self.ctx`), so `ctx_ptr` is constant per-cell and the callback address
-/// alone is a unique dedup key. Keying on the `usize` handle (8 bytes, vs the
-/// 16-byte `SubscriberKey`) plus `inline_cap = 1` keeps the common 0-1
-/// subscriber cell allocation-free at near-neutral footprint versus the old
-/// `AutoHashMap(SubscriberKey, void)` pair.
-const SubscriberEdgeSet = EdgeSet(usize, 1);
+/// A single observer registration (`#lzdartobservercow`).
+///
+/// The observer collection is keyed by REGISTRATION, never by callback: the
+/// spec's no-deduplication clause makes "subscribe the same callback twice"
+/// two independent observers, both invoked per notification, each removed by
+/// exactly its own token. Keying by callback address — what this file did
+/// before, returning "not added" for a callback already present — silently
+/// couples unrelated callers: two components that happen to subscribe the same
+/// function share one registration, so the first to unsubscribe cancels the
+/// second's subscription.
+///
+/// `id` is a per-cell monotonic counter starting at 1, so it is also what
+/// makes disposal latch: a spent token names an id that is no longer in the
+/// set, and every call after the first is a no-op that cannot reach a later
+/// registration of an equal callable.
+pub const Subscription = struct {
+    /// Unique per `Cell`, monotonic, never reused. `0` is the tombstone.
+    id: u64,
+    /// Erased `ChangeCallback(T)`; `Subscription` is not generic so a caller
+    /// can store tokens for cells of different value types together.
+    cb: usize,
+
+    /// `EdgeSet` index hook: hash the registration id, which is unique, rather
+    /// than the whole key.
+    pub inline fn edgeHashKey(self: Subscription) u64 {
+        return self.id;
+    }
+};
+
+/// `EdgeSet(Subscription, 1)` (`#lzzigcellslotedgeset`): the same
+/// inline-capacity container the `Slot` graph uses for its dependency edges.
+/// `inline_cap = 1` keeps the common 0-1 subscriber cell allocation-free.
+///
+/// The set's dedup scan never fires here — registration ids are unique by
+/// construction — but the container is still the right one: it preserves
+/// insertion order (which IS firing order), it supports the in-place
+/// tombstone the mid-notification `unsubscribe` path needs, and its wide-fanout
+/// hash index still applies via `Subscription.edgeHashKey`.
+const SubscriberEdgeSet = EdgeSet(Subscription, 1);
 
 /// Sentinel written over an entry unsubscribed while a notification is in
-/// flight (`#lzdartobservercow`). Subscriber keys are callback addresses, so
-/// the null address is never a real member.
-const subscriber_tomb: usize = 0;
+/// flight (`#lzdartobservercow`). Registration ids start at 1, so id `0` is
+/// never a real member.
+const subscriber_tomb: Subscription = .{ .id = 0, .cb = 0 };
 
 /// A mutable container to be stored as a slot via the cell function
 pub fn Cell(comptime T: type) type {
@@ -103,6 +132,18 @@ pub fn Cell(comptime T: type) type {
         change_tombstoned: bool = false,
         before_notify_depth: u32 = 0,
         before_tombstoned: bool = false,
+
+        /// Registration counter shared by both observer lists. Starts at 1 so
+        /// `subscriber_tomb.id == 0` is never issued; never reset, so a token
+        /// for a disposed registration can never collide with a later one.
+        next_subscription_id: u64 = 1,
+
+        /// Allocate the next registration id. Caller must hold `ctx.mutex`.
+        fn nextSubscriptionId(self: *@This()) u64 {
+            const id = self.next_subscription_id;
+            self.next_subscription_id += 1;
+            return id;
+        }
 
         /// Close the holes left by a mid-notification `unsubscribe`. Callers
         /// must hold `ctx.mutex`.
@@ -193,9 +234,9 @@ pub fn Cell(comptime T: type) type {
                     self.before_notify_depth += 1;
                     var i: usize = 0;
                     while (i < before_n) : (i += 1) {
-                        const key = self.before_change_subscribers.at(i);
-                        if (key == subscriber_tomb) continue;
-                        const before_cb: ChangeCallback(T) = @ptrFromInt(key);
+                        const reg = self.before_change_subscribers.at(i);
+                        if (reg.id == subscriber_tomb.id) continue;
+                        const before_cb: ChangeCallback(T) = @ptrFromInt(reg.cb);
                         before_cb(self);
                     }
                     self.before_notify_depth -= 1;
@@ -219,9 +260,9 @@ pub fn Cell(comptime T: type) type {
             if (change_n > 0) {
                 var i: usize = 0;
                 while (i < change_n) : (i += 1) {
-                    const key = self.change_subscribers.at(i);
-                    if (key == subscriber_tomb) continue;
-                    const cb: ChangeCallback(T) = @ptrFromInt(key);
+                    const reg = self.change_subscribers.at(i);
+                    if (reg.id == subscriber_tomb.id) continue;
+                    const cb: ChangeCallback(T) = @ptrFromInt(reg.cb);
                     cb(self);
                 }
                 self.notify_depth -= 1;
@@ -243,7 +284,13 @@ pub fn Cell(comptime T: type) type {
             }
         }
 
-        pub fn subscribe(self: *@This(), cb: ChangeCallback(T)) !bool {
+        /// Register `cb` as a change observer and return the token that
+        /// disposes it (`#lzdartobservercow`).
+        ///
+        /// Every call produces an independent registration, including repeat
+        /// calls with the same `cb`: both are invoked on each notification, in
+        /// registration order, and each token removes exactly one of them.
+        pub fn subscribe(self: *@This(), cb: ChangeCallback(T)) !Subscription {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
@@ -251,63 +298,91 @@ pub fn Cell(comptime T: type) type {
             // can rebuild the index, and the sentinel must not be indexed.
             self.compactChangeSubscribers();
 
-            const cb_key = @intFromPtr(cb);
-
-            if (self.change_subscribers.contains(cb_key)) return false; // duplicate, not added
-            try self.change_subscribers.getOrPut(cb_key, self.ctx.allocator);
-            return true; // newly added
+            const sub = Subscription{
+                .id = self.nextSubscriptionId(),
+                .cb = @intFromPtr(cb),
+            };
+            // Appends: the id is fresh, so the dedup scan never matches and
+            // the entry lands at the back — registration order is firing order.
+            try self.change_subscribers.getOrPut(sub, self.ctx.allocator);
+            return sub;
         }
 
-        pub fn unsubscribe(self: *@This(), cb: ChangeCallback(T)) bool {
+        /// Dispose the registration named by `sub`. Latching and single-shot:
+        /// the first call removes it, every later call is a no-op returning
+        /// `false`, and it can never reach a later registration of an equal
+        /// callback because ids are never reused.
+        pub fn unsubscribe(self: *@This(), sub: Subscription) bool {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
-            const cb_key = @intFromPtr(cb);
+            // Removal is always tombstone-then-compact, never `remove`'s
+            // swap. Two reasons, and both are normative:
+            //
+            //   * Mid-notification, a swap-remove would relocate the tail
+            //     entry behind the notify cursor and that observer would
+            //     silently never be called (`#lzdartobservercow`) — the defect
+            //     the spec section was written from.
+            //   * In steady state, a swap-remove leaves the survivors in an
+            //     order that is not registration order. The spec explicitly
+            //     licenses paying the O(n) erase the notify path already
+            //     tolerates rather than keeping the O(1) swap.
+            if (!self.change_subscribers.tombstone(sub, subscriber_tomb)) return false;
             if (self.notify_depth > 0) {
-                // Mid-notification: tombstone in place. Swap-remove would
-                // relocate the tail entry behind the notify cursor and that
-                // observer would silently never be called
-                // (`#lzdartobservercow`).
-                if (!self.change_subscribers.tombstone(cb_key, subscriber_tomb)) return false;
+                // Compaction is deferred to the outermost notification's exit
+                // (or the next `subscribe`/`set`), so no live entry moves
+                // while the position-indexed loop is walking the list.
                 self.change_tombstoned = true;
                 return true;
             }
-            // `remove` swap-repairs the index and cannot cope with a sentinel,
-            // so any deferred tombstone is settled first.
-            self.compactChangeSubscribers();
-            // Remove by swap-remove for O(1) erase (order not preserved).
-            return self.change_subscribers.remove(cb_key);
+            self.change_subscribers.compactTombstones(subscriber_tomb);
+            self.change_tombstoned = false;
+            return true;
         }
 
         /// Subscribe a callback that fires BEFORE a `set` commits its new
-        /// value (see `set` for the under-lock invocation contract).
-        pub fn subscribeBeforeChange(self: *@This(), cb: ChangeCallback(T)) !bool {
+        /// value (see `set` for the under-lock invocation contract). Same
+        /// registration keying as `subscribe`.
+        pub fn subscribeBeforeChange(self: *@This(), cb: ChangeCallback(T)) !Subscription {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
-            const cb_key = @intFromPtr(cb);
+            if (self.before_tombstoned and self.before_notify_depth == 0) {
+                self.before_change_subscribers.compactTombstones(subscriber_tomb);
+                self.before_tombstoned = false;
+            }
 
-            if (self.before_change_subscribers.contains(cb_key)) return false; // duplicate, not added
-            try self.before_change_subscribers.getOrPut(cb_key, self.ctx.allocator);
-            return true; // newly added
+            const sub = Subscription{
+                .id = self.nextSubscriptionId(),
+                .cb = @intFromPtr(cb),
+            };
+            try self.before_change_subscribers.getOrPut(sub, self.ctx.allocator);
+            return sub;
         }
 
-        pub fn unsubscribeBeforeChange(self: *@This(), cb: ChangeCallback(T)) bool {
+        pub fn unsubscribeBeforeChange(self: *@This(), sub: Subscription) bool {
             self.ctx.mutex.lock();
             defer self.ctx.mutex.unlock();
 
-            const cb_key = @intFromPtr(cb);
+            if (!self.before_change_subscribers.tombstone(sub, subscriber_tomb)) return false;
             if (self.before_notify_depth > 0) {
-                if (!self.before_change_subscribers.tombstone(cb_key, subscriber_tomb)) return false;
                 self.before_tombstoned = true;
                 return true;
             }
-            return self.before_change_subscribers.remove(cb_key);
+            self.before_change_subscribers.compactTombstones(subscriber_tomb);
+            self.before_tombstoned = false;
+            return true;
         }
     };
 }
 
-test "lazily/cell.Cell: subscribe dedup" {
+// Replaces the former `test "lazily/cell.Cell: subscribe dedup"`, which
+// asserted the pre-migration behavior (`subscribe` returning `false` for a
+// callback already present). Deduplication by callback address is now a
+// `MUST NOT` — see `reactive-graph.md` § observer semantics — so the test
+// asserts its inverse. The cross-language fixtures for the same clause run in
+// `observer_conformance_test.zig`.
+test "lazily/cell.Cell: subscribe returns an independent registration per call" {
     const allocator = std.testing.allocator;
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
@@ -333,21 +408,35 @@ test "lazily/cell.Cell: subscribe dedup" {
 
     TestState.called.store(0, .seq_cst);
 
-    // First subscription adds, second is rejected as duplicate (same ctx+cb).
-    try std.testing.expect(try test_cell.subscribe(TestState.onChange));
-    try std.testing.expect(!(try test_cell.subscribe(TestState.onChange)));
+    // Two subscribes of the SAME callback are two registrations, with
+    // distinct tokens.
+    const first = try test_cell.subscribe(TestState.onChange);
+    const second = try test_cell.subscribe(TestState.onChange);
+    try std.testing.expect(first.id != second.id);
     try std.testing.expectEqual(@as(i32, -1), TestState.value.load(.seq_cst));
 
+    // ...so the callback runs twice per notification, once per registration.
     test_cell.set(2);
     try std.testing.expectEqual(@as(i32, 2), test_cell.get());
-    try std.testing.expectEqual(@as(usize, 1), TestState.called.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), TestState.called.load(.seq_cst));
     try std.testing.expectEqual(@as(i32, 2), TestState.value.load(.seq_cst));
 
-    // Unsubscribe and ensure no further notifications.
-    try std.testing.expect(test_cell.unsubscribe(TestState.onChange));
+    // Each token removes exactly one; the other keeps firing.
+    try std.testing.expect(test_cell.unsubscribe(first));
     test_cell.set(3);
-    try std.testing.expectEqual(@as(usize, 1), TestState.called.load(.seq_cst));
-    try std.testing.expectEqual(@as(i32, 2), TestState.value.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 3), TestState.called.load(.seq_cst));
+
+    // A spent token latches: repeat disposal is a silent no-op and must not
+    // reach the surviving registration.
+    try std.testing.expect(!test_cell.unsubscribe(first));
+    try std.testing.expect(!test_cell.unsubscribe(first));
+    test_cell.set(4);
+    try std.testing.expectEqual(@as(usize, 4), TestState.called.load(.seq_cst));
+
+    try std.testing.expect(test_cell.unsubscribe(second));
+    test_cell.set(5);
+    try std.testing.expectEqual(@as(usize, 4), TestState.called.load(.seq_cst));
+    try std.testing.expectEqual(@as(i32, 4), TestState.value.load(.seq_cst));
 }
 
 test "lazily/cell.Cell: before_change fires before commit" {
@@ -376,9 +465,7 @@ test "lazily/cell.Cell: before_change fires before commit" {
 
     TestState.called.store(0, .seq_cst);
 
-    // subscribe dedup: first adds, second is rejected as duplicate.
-    try std.testing.expect(try test_cell.subscribeBeforeChange(TestState.onBeforeChange));
-    try std.testing.expect(!(try test_cell.subscribeBeforeChange(TestState.onBeforeChange)));
+    const before_token = try test_cell.subscribeBeforeChange(TestState.onBeforeChange);
 
     // Unchanged value: before_change must NOT fire.
     test_cell.set(1);
@@ -391,7 +478,7 @@ test "lazily/cell.Cell: before_change fires before commit" {
     try std.testing.expectEqual(@as(i32, 2), test_cell.get());
 
     // Unsubscribe stops before-change notifications.
-    try std.testing.expect(test_cell.unsubscribeBeforeChange(TestState.onBeforeChange));
+    try std.testing.expect(test_cell.unsubscribeBeforeChange(before_token));
     test_cell.set(3);
     try std.testing.expectEqual(@as(usize, 1), TestState.called.load(.seq_cst));
 }
@@ -756,6 +843,13 @@ const ReentrancyProbe = struct {
     var log_len: usize = 0;
     var action: u8 = 0;
 
+    // Registration tokens (`#lzdartobservercow`): removal is keyed by
+    // registration, so a reentrant `unsubscribe` needs the token the matching
+    // `subscribe` returned, not the callback.
+    var tok_a: Subscription = undefined;
+    var tok_c: Subscription = undefined;
+    var tok_before_a: Subscription = undefined;
+
     fn reset(new_action: u8) void {
         log_len = 0;
         action = new_action;
@@ -773,15 +867,15 @@ const ReentrancyProbe = struct {
     fn onA(c: *Cell(i32)) void {
         record('a');
         switch (action) {
-            1 => _ = c.unsubscribe(onA),
-            3 => _ = c.unsubscribe(onC),
+            1 => _ = c.unsubscribe(tok_a),
+            3 => _ = c.unsubscribe(tok_c),
             4 => _ = c.subscribe(onD) catch unreachable,
             else => {},
         }
     }
     fn onB(c: *Cell(i32)) void {
         record('b');
-        if (action == 2) _ = c.unsubscribe(onA);
+        if (action == 2) _ = c.unsubscribe(tok_a);
     }
     fn onC(c: *Cell(i32)) void {
         _ = c;
@@ -794,7 +888,7 @@ const ReentrancyProbe = struct {
 
     fn onBeforeA(c: *Cell(i32)) void {
         record('A');
-        if (action == 5) _ = c.unsubscribeBeforeChange(onBeforeA);
+        if (action == 5) _ = c.unsubscribeBeforeChange(tok_before_a);
     }
     fn onBeforeB(c: *Cell(i32)) void {
         _ = c;
@@ -822,9 +916,9 @@ test "lazily/cell.Cell: self-unsubscribe during notify still visits every live o
     var test_cell = try reentrancyCell(ctx);
 
     ReentrancyProbe.reset(1);
-    _ = try test_cell.subscribe(ReentrancyProbe.onA);
+    ReentrancyProbe.tok_a = try test_cell.subscribe(ReentrancyProbe.onA);
     _ = try test_cell.subscribe(ReentrancyProbe.onB);
-    _ = try test_cell.subscribe(ReentrancyProbe.onC);
+    ReentrancyProbe.tok_c = try test_cell.subscribe(ReentrancyProbe.onC);
 
     test_cell.set(2);
     // `onA` removes itself while the loop is mid-iteration. `onB` and `onC`
@@ -839,9 +933,9 @@ test "lazily/cell.Cell: unsubscribing an already-visited observer during notify 
     var test_cell = try reentrancyCell(ctx);
 
     ReentrancyProbe.reset(2);
-    _ = try test_cell.subscribe(ReentrancyProbe.onA);
+    ReentrancyProbe.tok_a = try test_cell.subscribe(ReentrancyProbe.onA);
     _ = try test_cell.subscribe(ReentrancyProbe.onB);
-    _ = try test_cell.subscribe(ReentrancyProbe.onC);
+    ReentrancyProbe.tok_c = try test_cell.subscribe(ReentrancyProbe.onC);
     _ = try test_cell.subscribe(ReentrancyProbe.onD);
 
     test_cell.set(2);
@@ -857,9 +951,9 @@ test "lazily/cell.Cell: unsubscribing a not-yet-visited observer during notify s
     var test_cell = try reentrancyCell(ctx);
 
     ReentrancyProbe.reset(3);
-    _ = try test_cell.subscribe(ReentrancyProbe.onA);
+    ReentrancyProbe.tok_a = try test_cell.subscribe(ReentrancyProbe.onA);
     _ = try test_cell.subscribe(ReentrancyProbe.onB);
-    _ = try test_cell.subscribe(ReentrancyProbe.onC);
+    ReentrancyProbe.tok_c = try test_cell.subscribe(ReentrancyProbe.onC);
 
     test_cell.set(2);
     // Pinned semantics: `unsubscribe` takes effect immediately, so an observer
@@ -879,7 +973,7 @@ test "lazily/cell.Cell: subscribing during notify defers to the next notificatio
     var test_cell = try reentrancyCell(ctx);
 
     ReentrancyProbe.reset(4);
-    _ = try test_cell.subscribe(ReentrancyProbe.onA);
+    ReentrancyProbe.tok_a = try test_cell.subscribe(ReentrancyProbe.onA);
 
     test_cell.set(2);
     // Pinned semantics: the observer added mid-notification does not run in
@@ -898,7 +992,7 @@ test "lazily/cell.Cell: self-unsubscribe during before_change notify still visit
     var test_cell = try reentrancyCell(ctx);
 
     ReentrancyProbe.reset(5);
-    _ = try test_cell.subscribeBeforeChange(ReentrancyProbe.onBeforeA);
+    ReentrancyProbe.tok_before_a = try test_cell.subscribeBeforeChange(ReentrancyProbe.onBeforeA);
     _ = try test_cell.subscribeBeforeChange(ReentrancyProbe.onBeforeB);
     _ = try test_cell.subscribeBeforeChange(ReentrancyProbe.onBeforeC);
 
@@ -914,6 +1008,7 @@ const WideProbe = struct {
     const width: usize = 96;
 
     var visits: [width]u8 = undefined;
+    var tokens: [width]Subscription = undefined;
     var unsubscribed = false;
 
     fn reset() void {
@@ -928,7 +1023,7 @@ const WideProbe = struct {
                 // The first observer drops itself mid-flight.
                 if (i == 0 and !unsubscribed) {
                     unsubscribed = true;
-                    _ = c.unsubscribe(cb);
+                    _ = c.unsubscribe(tokens[0]);
                 }
             }
         };
@@ -943,7 +1038,7 @@ test "lazily/cell.Cell: unsubscribe during notify on the wide/indexed path visit
 
     WideProbe.reset();
     inline for (0..WideProbe.width) |i| {
-        _ = try test_cell.subscribe(WideProbe.Observer(i).cb);
+        WideProbe.tokens[i] = try test_cell.subscribe(WideProbe.Observer(i).cb);
     }
 
     test_cell.set(2);
@@ -963,11 +1058,11 @@ test "lazily/cell.Cell: unsubscribe during notify on the wide/indexed path visit
     expected[0] = 0; // unsubscribed itself above
     inline for (0..WideProbe.width) |i| {
         if (i % 2 == 1) {
-            try std.testing.expect(test_cell.unsubscribe(WideProbe.Observer(i).cb));
+            try std.testing.expect(test_cell.unsubscribe(WideProbe.tokens[i]));
             expected[i] = 0;
         }
     }
-    try std.testing.expect(try test_cell.subscribe(WideProbe.Observer(0).cb));
+    WideProbe.tokens[0] = try test_cell.subscribe(WideProbe.Observer(0).cb);
     expected[0] = 1;
 
     @memset(&WideProbe.visits, 0);
