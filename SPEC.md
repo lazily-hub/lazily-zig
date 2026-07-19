@@ -64,10 +64,12 @@ Mutable value container stored in a Slot. Changing a Cell invalidates all depend
 |--------|---------|
 | `Cell.get()` | Read current value |
 | `Cell.set(new_value)` | Update value, invalidate dependents |
-| `Cell.subscribe(callback)` | Register change callback (deduplicated) |
-| `Cell.unsubscribe(callback)` | Remove change callback |
-| `Cell.subscribeBeforeChange(callback)` | Register pre-commit callback (deduplicated); fires under the context lock before `set` commits, so `get()` still returns the outgoing value. Must not re-enter `Context`/`Cell` methods that take `ctx.mutex` |
-| `Cell.unsubscribeBeforeChange(callback)` | Remove pre-commit callback |
+
+`Cell` has no observer API. Observation is a declared dependency edge, not a
+registered callback: read the cell from a `Signal` or `Effect` and the graph
+tracks the edge for you. A callback registry on `Cell` would bypass the graph,
+ignore `batch`, break glitch-freedom, and cost memory on every cell whether or
+not anything subscribed. To react to a change, use an `Effect`.
 
 ### Owned
 
@@ -90,7 +92,6 @@ Uses a thread-local tracking stack (`TrackingFrame` linked list).
 ## Invalidation Semantics
 
 - `Cell.set()` → `Slot.emitChange()` → destroys all dependent slots (not the cell slot itself)
-- `before_change_subscribers` fire under the context lock before `set` commits the new value (outgoing value still readable via `get()`); `change_subscribers` fire after the commit (unlocked)
 - `Slot.touch()` → destroys the slot AND all dependents recursively
 - Destroyed slots are removed from the context cache; they recompute on next access
 

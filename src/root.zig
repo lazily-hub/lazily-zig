@@ -4,9 +4,6 @@ pub const cell = @import("./lazily/cell.zig").cell;
 pub const CellFn = @import("./lazily/cell.zig").CellFn;
 pub const Cell = @import("./lazily/cell.zig").Cell;
 pub const initCellFn = @import("./lazily/cell.zig").initCellFn;
-/// Observer registration token returned by `Cell.subscribe` /
-/// `Cell.subscribeBeforeChange` (`#lzdartobservercow`).
-pub const Subscription = @import("./lazily/cell.zig").Subscription;
 pub const Context = @import("./lazily/context.zig").Context;
 pub const ParkingMutex = @import("./lazily/parking_mutex.zig").ParkingMutex;
 pub const ReentrantMutex = @import("./lazily/parking_mutex.zig").ReentrantMutex;

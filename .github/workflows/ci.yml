@@ -43,25 +43,36 @@ jobs:
           version: ${{ matrix.zig }}
 
       # lazily-spec is the canonical cross-language source for the conformance
-      # fixtures. Clone it as a sibling BEFORE the test step so
-      # `observer_conformance_test.zig` replays the canonical files rather than
-      # skipping (#lzspecconf).
+      # fixtures. Clone it as a sibling BEFORE the test step so the replay
+      # tests read the canonical files rather than skipping (#lzspecconf).
       - name: Fetch canonical lazily-spec conformance fixtures (#lzspecconf)
         run: git clone --depth 1 https://github.com/lazily-hub/lazily-spec.git ../lazily-spec
 
-      # The runner skips loudly when the sibling is absent, which is right for a
-      # local checkout and wrong for CI: a skip that nobody asserts against
-      # reports green while testing nothing. Assert it here.
+      # Each replay test skips loudly when its fixture directory is absent,
+      # which is right for a local checkout and wrong for CI: a skip that
+      # nobody asserts against reports green while testing nothing. Assert
+      # every directory that currently has a consumer in src/.
+      #
+      # This list must track the `SPEC_DIR` constants in src/lazily/*.zig. It
+      # deliberately no longer includes `reactive-graph`: the Cell observer API
+      # and its conformance replay were removed, so nothing here reads those
+      # fixtures. Observation is a declared dependency edge on the Slot graph,
+      # not a callback registry, and the graph is covered by `zig build test`.
       - name: Assert conformance fixtures are present
         run: |
-          test -d ../lazily-spec/conformance/reactive-graph || {
-            echo "::error::../lazily-spec/conformance/reactive-graph missing — observer_conformance_test.zig would skip and CI would report green having tested nothing"
-            exit 1
-          }
-          ls ../lazily-spec/conformance/reactive-graph/observer_*.json >/dev/null || {
-            echo "::error::no observer_*.json fixtures under ../lazily-spec/conformance/reactive-graph"
-            exit 1
-          }
+          set -euo pipefail
+          for d in coordination materialization membership presence rateshape \
+                   resilience service temporal windowing; do
+            dir="../lazily-spec/conformance/$d"
+            test -d "$dir" || {
+              echo "::error::$dir missing — its replay test would skip and CI would report green having tested nothing"
+              exit 1
+            }
+            ls "$dir"/*.json >/dev/null 2>&1 || {
+              echo "::error::no *.json fixtures under $dir"
+              exit 1
+            }
+          done
 
       - name: Test
         run: zig build test --summary all

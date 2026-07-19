@@ -547,15 +547,11 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         pub const promote_threshold: usize = 64;
 
         /// Whether `K` can be hashed cheaply (pointer or integer). Non-indexable
-        /// key types keep the pure-scan behaviour.
-        /// Struct keys opt in by declaring `edgeHashKey`, which projects the
-        /// key onto the unique field the index should hash (`Cell`'s
-        /// `Subscription` hashes its registration id, not the callback
-        /// address). Without the hook a struct key keeps the pure-scan
-        /// behaviour, since `mixKey` has nothing safe to hash.
+        /// key types keep the pure-scan behaviour, since `mixKey` has nothing
+        /// safe to hash. Every edge set in the graph is keyed by `*Slot`, so
+        /// the pointer arm is the one that carries the wide-fanout index.
         const indexable = switch (@typeInfo(K)) {
             .pointer, .int => true,
-            .@"struct" => @hasDecl(K, "edgeHashKey"),
             else => false,
         };
 
@@ -578,7 +574,6 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
             var x: u64 = switch (@typeInfo(K)) {
                 .pointer => @intFromPtr(key),
                 .int => @intCast(key),
-                .@"struct" => key.edgeHashKey(),
                 else => unreachable,
             };
             // Multiply-shift finalizer (fmix64). Slot pointers stride by a fixed
@@ -1978,7 +1973,6 @@ test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no sp
     try std.testing.expectEqual(SlotEdgeSet.inline_cap, set.count());
     try std.testing.expect(set.spill.items.len == 0);
 }
-
 
 // ---------------------------------------------------------------------------
 // Wide-fanout hash index (`#lzspecedgeindex`).
