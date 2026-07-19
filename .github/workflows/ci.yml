@@ -53,16 +53,20 @@ jobs:
       # nobody asserts against reports green while testing nothing. Assert
       # every directory that currently has a consumer in src/.
       #
-      # This list must track the `SPEC_DIR` constants in src/lazily/*.zig. It
-      # deliberately no longer includes `reactive-graph`: the Cell observer API
-      # and its conformance replay were removed, so nothing here reads those
-      # fixtures. Observation is a declared dependency edge on the Slot graph,
-      # not a callback registry, and the graph is covered by `zig build test`.
+      # This list must track the `SPEC_DIR` constants in src/lazily/*.zig.
+      #
+      # `reactive-graph` is back on the list: src/lazily/reactive_graph_conformance.zig
+      # replays that corpus against every context this binding ships (Context /
+      # ThreadSafeContext / AsyncContext). Its skip-when-absent branch is right
+      # for a local checkout and wrong here, so the directory is asserted
+      # present — and the runner itself asserts a non-zero count of fixtures,
+      # ops and assertions actually replayed, so a green run cannot mean
+      # "executed nothing" (#lzspecconf).
       - name: Assert conformance fixtures are present
         run: |
           set -euo pipefail
           for d in coordination materialization membership presence rateshape \
-                   resilience service temporal windowing; do
+                   reactive-graph resilience service temporal windowing; do
             dir="../lazily-spec/conformance/$d"
             test -d "$dir" || {
               echo "::error::$dir missing — its replay test would skip and CI would report green having tested nothing"

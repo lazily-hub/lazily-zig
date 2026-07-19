@@ -365,6 +365,26 @@ pub fn build(b: *std.Build) void {
         run_test.dependOn(&run_cell_0_15_tests.step);
     }
 
+    // --- reactive-graph conformance replay (`#lzspecconf`) ---
+    // Replays `../lazily-spec/conformance/reactive-graph/*.json` against every
+    // context this binding ships (Context / ThreadSafeContext / AsyncContext).
+    // Its own module rather than a `root.zig` test so the corpus is visible as
+    // a distinct build step, matching lazily-rs `tests/reactive_graph_conformance.rs`.
+    const reactive_graph_conformance_mod = b.createModule(.{
+        .root_source_file = b.path("src/lazily/reactive_graph_conformance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    reactive_graph_conformance_mod.addOptions("build_options", build_options);
+    const reactive_graph_conformance_tests = b.addTest(.{
+        .root_module = reactive_graph_conformance_mod,
+        .filters = filters,
+    });
+    const run_reactive_graph_conformance_tests =
+        b.addRunArtifact(reactive_graph_conformance_tests);
+    run_test.dependOn(&run_reactive_graph_conformance_tests.step);
+
     const install_test = b.step(
         "install_test",
         "Create test binaries for debugging",
