@@ -99,6 +99,13 @@ pub fn effect(
     // Get the slot pointer from cache
     const slot_ptr = ctx.getSlot(bodyFn) orelse return error.SlotNotFound;
 
+    // Reserve this Effect's `pending_recompute` entry up front so
+    // `on_invalidate_hook` never has to allocate. See
+    // `Context.reserveEagerRecomputeSlot` — a dropped enqueue detaches the
+    // Effect from the graph permanently, so the OOM is surfaced here (where
+    // the caller can see it) rather than swallowed in the cascade.
+    try ctx.reserveEagerRecomputeSlot();
+
     // Install eager-recompute hooks (same machinery as Signal)
     slot_ptr.on_invalidate = &on_invalidate_hook;
     slot_ptr.recompute = makeEffectRecomputeFn(Cleanup, bodyFn);
@@ -130,8 +137,39 @@ fn on_invalidate_hook(s: *Slot) void {
     // AUDIT ONLY (#lzspecedgeindex): rs/cpp `run_effect` scanned here.
     SignalMod.naiveEnqueueScan(s);
     if (!s.stale) {
+        // This append cannot fail in practice: `effect()` reserved a
+        // `pending_recompute` entry for this node at construction
+        // (`Context.reserveEagerRecomputeSlot`), so there is spare capacity and
+        // `append` never reaches the allocator. That reservation is the actual
+        // fix, and it lives at construction because this site cannot recover:
+        // `emitChangeUnlocked` removes the dependent from `parents` and clears
+        // `change_subscribers` BEFORE calling this hook, so once the enqueue is
+        // dropped the edge that would deliver the next invalidation is gone and
+        // only the cancelled recompute would have rebuilt it. The Effect
+        // detaches from the graph for the life of the Context — a side effect
+        // that silently never happens again, with no reader to pull it back the
+        // way a Signal's value can be pulled.
+        //
+        // Two degradations were rejected. The whole-context
+        // `cascadeFallbackMarkAllStaleUnlocked` used for the cascade worklist
+        // is no help: over-invalidating the graph puts nothing into
+        // `pending_recompute`, which is the resource that ran out. Running the
+        // body inline is worse than the bug — this hook fires while
+        // `emitChangeUnlocked` iterates `change_subscribers`, and the body
+        // re-enters the graph and mutates those very edge sets.
+        //
+        // The `catch` below therefore covers only the residual case (a caller
+        // that discarded the reservation). It enqueues BEFORE latching `stale`
+        // and does not latch on failure: `stale` is this queue's O(1) dedupe key
+        // (`#lzspecedgeindex`), and leaving it set with no queue entry marks the
+        // node "already queued" forever, so nothing could revive it even if the
+        // edge were restored by other means. That does not make the drop
+        // recoverable — it makes it observable and flag-clean.
+        s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {
+            s.ctx.eager_enqueue_drops += 1;
+            return;
+        };
         s.stale = true;
-        s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {};
         s.ctx.instrumentation.effect_queue_pushes += 1;
     }
 }
@@ -232,4 +270,120 @@ test "lazily/effect: dispose stops reruns" {
 
     source.set(99);
     try std.testing.expectEqual(@as(u32, 1), EffectTestState.counter);
+}
+
+// ---------------------------------------------------------------------------
+// OOM regression (`#lzspecedgeindex`): a dropped eager-enqueue detaches the
+// Effect from the graph permanently, so the enqueue must not be able to fail.
+// ---------------------------------------------------------------------------
+
+const OomEffectState = struct {
+    var runs: u32 = 0;
+
+    fn getSource(_: *Context) anyerror!u32 {
+        return 0;
+    }
+
+    fn body(c: *Context) anyerror!void {
+        _ = try CellMod.cell(u32, c, getSource, null);
+        runs += 1;
+    }
+};
+
+test "lazily/effect: an eager rerun must survive an exhausted allocator" {
+    // Regression guard for the `pending_recompute.append(...) catch {}` that
+    // used to sit in `on_invalidate_hook`.
+    //
+    // The hook is called from `emitChangeUnlocked`, which removes the
+    // dependent from `parents` and then clears `change_subscribers` — so by the
+    // time the hook runs, the `cell -> effect` edge is ALREADY gone, and the
+    // only thing that rebuilds it is the recompute the hook is trying to
+    // schedule. Dropping that enqueue therefore does not cost one rerun; it
+    // detaches the Effect from the graph for the life of the Context, and no
+    // reader exists to pull the side effect back the way one would pull a
+    // Signal's value.
+    //
+    // The fix is `Context.reserveEagerRecomputeSlot`, called by `effect()`:
+    // the queue entry is paid for at construction, where OOM is reportable, so
+    // the hook's `append` runs into spare capacity and cannot fail.
+    const S = OomEffectState;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.runs = 0;
+    const source = try CellMod.cell(u32, ctx, S.getSource, null);
+
+    const eff = try effectNoCleanup(ctx, S.body);
+    defer ctx.allocator.destroy(eff);
+    defer eff.dispose();
+
+    try std.testing.expectEqual(@as(u32, 1), S.runs);
+    // The reservation exists before any invalidation has occurred.
+    try std.testing.expect(ctx.pending_recompute.capacity >= 1);
+
+    // Warm the edge-set capacity so the recompute's re-subscribe is also
+    // allocation-free, then starve the allocator completely.
+    source.set(1);
+    try std.testing.expectEqual(@as(u32, 2), S.runs);
+
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    ctx.allocator = failing.allocator();
+    defer ctx.allocator = backing;
+
+    // The assertion that fails against the old `catch {}`: with no memory
+    // available at all, the Effect still reruns.
+    source.set(2);
+    try std.testing.expectEqual(@as(u32, 3), S.runs);
+    try std.testing.expectEqual(@as(u64, 0), ctx.eager_enqueue_drops);
+
+    // And it is still attached — a second write under the same starvation
+    // reaches it, which a detached Effect could never do.
+    source.set(3);
+    try std.testing.expectEqual(@as(u32, 4), S.runs);
+}
+
+test "lazily/effect: a genuinely undeliverable enqueue is counted, not latched" {
+    // The residual path. `reserveEagerRecomputeSlot` makes the hook's append
+    // allocation-free, so reaching the `catch` requires deliberately throwing
+    // the reservation away. What is pinned here is that the hook does not
+    // latch `stale` on the way out: `stale` is the queue's O(1) dedupe key, and
+    // leaving it set with no queue entry would mark the node "already queued"
+    // forever, so even restoring the edge by other means could not revive it.
+    //
+    // This does NOT claim the Effect recovers — the cascade dropped its edge
+    // before the hook ran. It claims the failure is observable and leaves no
+    // corrupt flag behind.
+    const S = OomEffectState;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.runs = 0;
+    const source = try CellMod.cell(u32, ctx, S.getSource, null);
+
+    const eff = try effectNoCleanup(ctx, S.body);
+    defer ctx.allocator.destroy(eff);
+    defer eff.dispose();
+
+    try std.testing.expectEqual(@as(u32, 1), S.runs);
+
+    // Throw away the reservation, then starve the allocator.
+    ctx.pending_recompute.clearAndFree(ctx.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.capacity);
+
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    ctx.allocator = failing.allocator();
+
+    source.set(1);
+
+    ctx.allocator = backing;
+    try std.testing.expect(failing.has_induced_failure);
+
+    try std.testing.expectEqual(@as(u32, 1), S.runs);
+    try std.testing.expectEqual(@as(u64, 1), ctx.eager_enqueue_drops);
+
+    // Not queued implies not stale.
+    try std.testing.expect(!eff.slot.stale);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
 }

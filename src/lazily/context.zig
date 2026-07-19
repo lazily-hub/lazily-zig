@@ -183,6 +183,19 @@ pub const Context = struct {
     // field of `Instrumentation`, which mirrors lazily-rs `InstrumentationCounters`
     // one-for-one and must not drift.
     cascade_oom_fallbacks: u64 = 0,
+    // Count of eager-recompute enqueues (`Signal`/`Effect` `on_invalidate`
+    // hooks) that could not grow `pending_recompute` and were dropped. The
+    // hooks roll `stale` back rather than latching it, so a drop costs the
+    // node one eager rerun and the next invalidation re-enqueues it — but the
+    // node did serve a stale value in between, so the event is counted rather
+    // than swallowed. Deliberately NOT a field of `Instrumentation`, which
+    // mirrors lazily-rs `InstrumentationCounters` one-for-one and must not
+    // drift (same rationale as `cascade_oom_fallbacks` above).
+    eager_enqueue_drops: u64 = 0,
+    // Number of eager nodes (`Signal`/`Effect`) ever constructed against this
+    // Context. Backs the `pending_recompute` capacity reservation — see
+    // `reserveEagerRecomputeSlot`.
+    eager_nodes: u64 = 0,
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
@@ -337,6 +350,36 @@ pub const Context = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.cacheLookup(cache_key);
+    }
+
+    /// Reserve this Context's `pending_recompute` room for one more eager node,
+    /// so that node's `on_invalidate` hook can enqueue without allocating.
+    ///
+    /// The hook runs from inside the invalidation cascade, which has already
+    /// unsubscribed the dependent (`dependent_slot.parents.remove(self)` and
+    /// the trailing `change_subscribers.clearRetainingCapacity()`) by the time
+    /// it fires. A dropped enqueue therefore does not merely lose one rerun —
+    /// the edge that would have delivered the *next* invalidation is gone too,
+    /// and only the recompute the drop just cancelled would have rebuilt it. An
+    /// Effect silently detaches from the graph forever; a Signal keeps serving
+    /// its pre-invalidation value from `Signal.get`, which reads storage
+    /// directly and never consults `stale`.
+    ///
+    /// Nothing at the hook site can recover from that without allocating, and
+    /// the allocator is what just failed. So the allocation is moved to
+    /// construction instead, where `signal()`/`effect()` already return an
+    /// error union and OOM is reportable rather than silent.
+    ///
+    /// One reserved entry per eager node is sufficient: `stale` dedupes the
+    /// queue to at most one live entry per slot, and a torn-down slot's
+    /// tombstone entry is covered by that slot's own never-reclaimed
+    /// reservation.
+    pub fn reserveEagerRecomputeSlot(self: *Context) !void {
+        self.eager_nodes += 1;
+        try self.pending_recompute.ensureTotalCapacity(
+            self.allocator,
+            @intCast(self.eager_nodes),
+        );
     }
 
     /// Drain the pending-recompute queue. Called outside the graph mutex so that

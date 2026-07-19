@@ -98,8 +98,38 @@ pub inline fn naiveDisposeScan(s: *Slot) void {
 fn on_invalidate_hook(s: *Slot) void {
     naiveEnqueueScan(s);
     if (!s.stale) {
+        // Same ordering fix as `effect.zig`'s hook, and for a stronger reason
+        // than "laziness covers it".
+        //
+        // Laziness does cover a *graph* reader: another slot pulling this
+        // Signal's value goes through `slotKeyed`, which sees `stale`, orphans
+        // the slot and recomputes. But `Signal.get` does not take that path —
+        // it calls `self.slot.get(T)` directly, and `Slot.get` reads `storage`
+        // without consulting `stale`. The handle read is served entirely by the
+        // eager recompute, so a dropped enqueue that also latched `stale`
+        // wedged the node (the `!s.stale` guard never fires again) and
+        // `Signal.get` returned the pre-invalidation value for the life of the
+        // Context. Worse, the first graph read orphans the wedged slot and
+        // installs a fresh one, while the `Signal` handle keeps pointing at the
+        // orphan — so the handle and the graph then disagree forever.
+        //
+        // `signal()` therefore reserves this queue entry at construction
+        // (`Context.reserveEagerRecomputeSlot`), so the append below runs into
+        // spare capacity and cannot fail. The reservation — not the `catch` —
+        // is the fix, because this site has no recovery available: by the time
+        // the hook runs, `emitChangeUnlocked` has already dropped the edge that
+        // would deliver the next invalidation, and only the recompute being
+        // cancelled would have rebuilt it.
+        //
+        // The `catch` covers only the residual case (a caller that discarded
+        // the reservation). It enqueues before latching `stale` and does not
+        // latch on failure, so no "already queued" flag is left behind with no
+        // queue entry to clear it.
+        s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {
+            s.ctx.eager_enqueue_drops += 1;
+            return;
+        };
         s.stale = true;
-        s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {};
         s.ctx.instrumentation.effect_queue_pushes += 1;
     }
 }
@@ -225,6 +255,13 @@ pub fn signal(
 
     // Get the slot pointer from cache
     const slot_ptr = ctx.getSlot(valueFn) orelse return error.SlotNotFound;
+
+    // Reserve this Signal's `pending_recompute` entry up front so
+    // `on_invalidate_hook` never has to allocate. See
+    // `Context.reserveEagerRecomputeSlot` — a dropped enqueue leaves
+    // `Signal.get` serving the pre-invalidation value permanently, because the
+    // cascade has already dropped the edge that would deliver the next one.
+    try ctx.reserveEagerRecomputeSlot();
 
     // Install eager-Signal hooks
     slot_ptr.on_invalidate = &on_invalidate_hook;
@@ -699,4 +736,76 @@ test "lazily/signal: destroying a slot from its payload destructor during recomp
     // Queue fully drained, scratch worklist balanced.
     try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.cascade_scratch.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// OOM regression: a dropped eager-enqueue makes `Signal.get` serve a stale
+// value permanently. Laziness does NOT cover this site.
+// ---------------------------------------------------------------------------
+
+const OomSignalState = struct {
+    var source_value: u32 = 0;
+
+    fn getSource(_: *Context) anyerror!u32 {
+        return source_value;
+    }
+
+    fn getDerived(c: *Context) anyerror!u32 {
+        const src = try CellMod.cell(u32, c, getSource, null);
+        return src.get() * 10;
+    }
+};
+
+test "lazily/signal: Signal.get must not serve a stale value after an OOM enqueue" {
+    // The prior judgement on this hook was that laziness covers a dropped
+    // enqueue, because `stale` is set first and a later read recomputes. That
+    // holds for a *graph* reader — another slot pulling this value goes through
+    // `slotKeyed`, which sees `stale`, orphans the slot and recomputes.
+    //
+    // It does not hold for the handle. `Signal.get` calls `self.slot.get(T)`
+    // directly, and `Slot.get` reads `storage` without ever consulting `stale`.
+    // So the handle read is served entirely by the eager recompute, and a
+    // dropped enqueue that also latched `stale` wedged the node: the `!s.stale`
+    // guard never fired again, and `Signal.get` returned the pre-invalidation
+    // value for the life of the Context. Worse, the first graph read then
+    // orphans the wedged slot and installs a fresh one while the handle keeps
+    // pointing at the orphan, so handle and graph disagree permanently.
+    //
+    // `signal()` now reserves the queue entry at construction, so the hook
+    // cannot fail. This pins that.
+    const S = OomSignalState;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.source_value = 0;
+    const source = try CellMod.cell(u32, ctx, S.getSource, null);
+    const sig = try signal(u32, ctx, S.getDerived, null);
+    defer ctx.allocator.destroy(sig);
+
+    try std.testing.expectEqual(@as(u32, 0), sig.get().*);
+    try std.testing.expect(ctx.pending_recompute.capacity >= 1);
+
+    // Warm the edge-set capacity so the recompute's re-subscribe needs no
+    // allocation either, then starve the allocator completely.
+    S.source_value = 1;
+    source.set(1);
+    try std.testing.expectEqual(@as(u32, 10), sig.get().*);
+
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    ctx.allocator = failing.allocator();
+    defer ctx.allocator = backing;
+
+    S.source_value = 2;
+    source.set(2);
+
+    // The assertion that fails against the old `catch {}`: the handle observes
+    // the new value even with no memory available.
+    try std.testing.expectEqual(@as(u32, 20), sig.get().*);
+    try std.testing.expectEqual(@as(u64, 0), ctx.eager_enqueue_drops);
+
+    // Still attached — a second starved write reaches it too.
+    S.source_value = 3;
+    source.set(3);
+    try std.testing.expectEqual(@as(u32, 30), sig.get().*);
 }
