@@ -211,6 +211,70 @@ respective sizes: a bounded-viewport edit never pays for the off-viewport sheet.
   `cold_full_recalc`. Per-cell figures still divide by `2N` for cross-language
   comparability.
 
+## Pending/scheduled-effect queue audit (`#lzspecedgeindex`) — NEGATIVE
+
+`zig build audit-pending` — audits for the defect lazily-rs, lazily-cpp and
+lazily-kt all shipped: a **linear scan of the pending/scheduled effect
+collection for an id that cannot be there**, O(W²) per publish or per teardown.
+rs measured 222x at width 65,536; kt measured 10,677x on teardown. It is not an
+edge-set problem, so the `#lzspecedgeindex` edge index does not cover it.
+
+**Result: the defect is absent in lazily-zig on both paths.** `pending_recompute`
+is a plain `ArrayList` that is `append`-ed under an O(1) `slot.stale` guard and
+`pop()`-drained; `Signal.dispose` / `Effect.dispose` null the hooks and never
+touch the queue. Nothing in the engine scans it.
+
+### Why the flat column is trustworthy
+
+A flat column alone is equally consistent with "no defect" and "blind harness",
+and the pre-existing `zig build load-fanout` harness *is* blind here — every
+node in it is a lazy pull-based `slotKeyed`, so nothing ever enters
+`pending_recompute`. The audit therefore forces the path back to the naive form
+behind declared build flags and measures the delta. Total work is held fixed at
+65,536 eager Signals and only fan-out width varies, so every rung does identical
+work; the assertion is against a narrow-fan-out (width 8) control at equal node
+count, never against absolute growth.
+
+Worst wide/narrow ratio at width 65,536, four arms built from the same tree and
+run interleaved (ratios only — absolute ns were taken under concurrent load,
+1-min load average 3.3 to 8.1):
+
+| arm | build flags | publish | dispose (drained) | dispose (saturated) |
+|---|---|---|---|---|
+| **shipped** | *(defaults)* | **1.40x** | **4.05x** | **1.92x** |
+| naive publish scan | `-Dnaive_pending_scan=true` | 113.07x | 1.84x | 3.00x |
+| naive teardown scan, length | `-Dnaive_dispose_scan=len` | 1.19x | 4.12x | 2229.91x |
+| naive teardown scan, capacity | `-Dnaive_dispose_scan=capacity` | 1.30x | 1243.35x | 1573.77x |
+
+Detection margins: **113x** on the publish path, **2230x** on the teardown path.
+Neither detected anything in the shipped arm. The shipped dispose columns sit
+near 1 ns/node, where clock granularity alone moves the ratio by 2-3x run to
+run — hence the wider (8x) gate on those two columns, which costs no detection
+power against margins three orders of magnitude away.
+
+### Two things the arms establish that inspection could not
+
+1. **The scan is not always on the notify path.** rs and cpp had it in
+   `run_effect`; kt had it in `disposeEffect`, so kt saw it in the *teardown*
+   column and not in notify. Both paths are forced and measured separately.
+2. **"The collection is empty, so the scan is free" is runtime-specific.** The
+   two teardown arms answer this for Zig directly. After a `pop()` drain an
+   `ArrayList` has `items.len == 0` but retains capacity, so a **length** scan
+   is genuinely free when drained (4.12x, i.e. flat — it only fires at 2229.91x
+   on the saturated arm) while a **capacity** scan over `allocatedSlice()` costs
+   1243.35x on the *same drained queue*. kt scanned its never-shrinking backing
+   array and paid; dart scans length and does not. Zig would land on whichever
+   form the code used — it uses neither.
+
+The `saturated` arm exists because a drained-only teardown arm can be inert
+without looking inert: lazily-dart's first attempt wrapped the work in `batch()`,
+which defers the cascade, leaving the pending list empty throughout and
+reporting 1.2x under forced-naive — indistinguishable from a clean negative. The
+saturated arm disposes each cohort while its siblings are still queued, and
+asserts `pending_recompute.items.len == width` before timing, so a harness that
+silently stops saturating fails loudly. **A low forced-naive margin means
+suspect the harness before concluding absence.**
+
 ## Thread-safe contention — graph mutex under load (`#lzcontentionbench`)
 
 `zig build bench-contention` — N worker threads hammer `lock + counter++ + unlock`

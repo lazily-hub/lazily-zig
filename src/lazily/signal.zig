@@ -41,6 +41,7 @@ pub fn Signal(comptime T: type) type {
         }
 
         pub fn dispose(self: *Self) void {
+            naiveDisposeScan(self.slot);
             self.slot.on_invalidate = null;
             self.slot.recompute = null;
             self.active = false;
@@ -52,7 +53,50 @@ pub fn Signal(comptime T: type) type {
     };
 }
 
+/// AUDIT ONLY (`#lzspecedgeindex`, `build_options.naive_pending_scan`).
+///
+/// Reinstates the defect the rest of the family shipped: dedupe the pending
+/// queue by scanning it instead of by the O(1) `stale` flag. During a wide
+/// publish the queue holds every already-enqueued sibling, so this is O(W^2)
+/// per publish. Compiles to nothing in shipped builds.
+pub var naive_scan_sink: usize = 0;
+
+pub inline fn naiveEnqueueScan(s: *Slot) void {
+    if (comptime !build_options.naive_pending_scan) return;
+    var hits: usize = 0;
+    for (s.ctx.pending_recompute.items) |q| {
+        if (q == s) hits += 1;
+    }
+    // Observable so the scan cannot be elided; the enqueue decision itself is
+    // still made by the real (`stale`-flag) logic so semantics are unchanged.
+    @atomicStore(usize, &naive_scan_sink, naive_scan_sink +% hits, .monotonic);
+}
+
+/// AUDIT ONLY (`#lzspecedgeindex`, `build_options.naive_pending_scan`).
+///
+/// Reinstates lazily-kt's `disposeEffect` shape: scan the pending collection for
+/// an id that cannot be there, over the *retained backing array* rather than the
+/// live length. kt's deque was empty at teardown and its `indexOf` still walked
+/// the whole never-shrinking array (the wraparound branch fires when
+/// `head >= tail`, which empty satisfies), so "the collection is empty, so the
+/// scan is free" did not hold. `clearRetainingCapacity`/pop-drain leave the same
+/// retained capacity here, so the emulation walks `allocatedSlice()`.
+pub inline fn naiveDisposeScan(s: *Slot) void {
+    const form = comptime build_options.naive_dispose_scan;
+    if (comptime std.mem.eql(u8, form, "none")) return;
+    const region = if (comptime std.mem.eql(u8, form, "capacity"))
+        s.ctx.pending_recompute.allocatedSlice()
+    else
+        s.ctx.pending_recompute.items;
+    var hits: usize = 0;
+    for (region) |q| {
+        if (q == s) hits += 1;
+    }
+    @atomicStore(usize, &naive_scan_sink, naive_scan_sink +% hits, .monotonic);
+}
+
 fn on_invalidate_hook(s: *Slot) void {
+    naiveEnqueueScan(s);
     if (!s.stale) {
         s.stale = true;
         s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {};
@@ -171,6 +215,80 @@ pub fn signal(
         .active = true,
     };
     return self;
+}
+
+/// Runtime-keyed `signal`, mirroring `slotKeyed` vs `slot`. `signal` keys the
+/// backing slot by its comptime `valueFn` pointer, so a single body can only
+/// ever back one Signal. This variant takes the cache key explicitly, so N
+/// distinct eager nodes can share one body — required to vary fan-out width
+/// with node count held fixed (`#lzspecedgeindex`, src/benches/pending_audit.zig).
+/// Hooks are the same `on_invalidate_hook` / `makeRecomputeFn` `signal` installs.
+pub fn signalKeyed(
+    comptime T: type,
+    ctx: *Context,
+    cache_key: usize,
+    valueFn: *const ValueFn(T),
+    deinitPayload: ?DeinitPayloadFn,
+) !*Signal(T) {
+    _ = try slotKeyed(T, ctx, cache_key, valueFn, deinitPayload);
+
+    const slot_ptr = ctx.cacheLookup(cache_key) orelse return error.SlotNotFound;
+    slot_ptr.on_invalidate = &on_invalidate_hook;
+    slot_ptr.recompute = makeRecomputeFn(T);
+
+    const self = try ctx.allocator.create(Signal(T));
+    self.* = .{ .ctx = ctx, .slot = slot_ptr, .active = true };
+    return self;
+}
+
+const KeyedTestState = struct {
+    var source_value: i64 = 0;
+};
+
+fn keyedSourceFn(_: *Context) anyerror!i64 {
+    return KeyedTestState.source_value;
+}
+
+fn keyedDerivedFn(ctx: *Context) anyerror!i64 {
+    const p = try slotKeyed(i64, ctx, 100, keyedSourceFn, null);
+    return p.* * 2;
+}
+
+test "lazily/signal: signalKeyed gives distinct eager nodes from one body" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    KeyedTestState.source_value = 1;
+    _ = try slotKeyed(i64, ctx, 100, keyedSourceFn, null);
+
+    // Two Signals over the SAME body fn — impossible with `signal`, which keys
+    // the backing slot by the body pointer.
+    const a = try signalKeyed(i64, ctx, 201, keyedDerivedFn, null);
+    defer ctx.allocator.destroy(a);
+    const b = try signalKeyed(i64, ctx, 202, keyedDerivedFn, null);
+    defer ctx.allocator.destroy(b);
+
+    try std.testing.expect(a.slot != b.slot);
+    try std.testing.expectEqual(@as(i64, 2), a.get().*);
+    try std.testing.expectEqual(@as(i64, 2), b.get().*);
+
+    // Both are on the eager path: the hooks `signal` installs are installed here.
+    try std.testing.expect(a.slot.on_invalidate != null);
+    try std.testing.expect(a.slot.recompute != null);
+
+    // A publish reaches both, eagerly (no read in between).
+    KeyedTestState.source_value = 5;
+    const src = ctx.cacheLookup(100).?;
+    const src_ptr = try src.getPtr(i64);
+    src_ptr.* = 5;
+    src.emitChange();
+
+    try std.testing.expectEqual(@as(i64, 10), a.get().*);
+    try std.testing.expectEqual(@as(i64, 10), b.get().*);
+
+    a.dispose();
+    try std.testing.expect(!a.is_active());
 }
 
 const SignalTestState = struct {

@@ -58,6 +58,10 @@ pub const StateChart = @import("./lazily/statechart.zig").StateChart;
 pub const ChartDef = @import("./lazily/statechart.zig").ChartDef;
 pub const Signal = @import("./lazily/signal.zig").Signal;
 pub const signal = @import("./lazily/signal.zig").signal;
+/// Compile-time build flags (see build.zig). Exposed so audit harnesses can
+/// report which arm they were compiled as (`#lzspecedgeindex`).
+pub const build_options = @import("build_options");
+pub const signalKeyed = @import("./lazily/signal.zig").signalKeyed;
 pub const Effect = @import("./lazily/effect.zig").Effect;
 pub const effect = @import("./lazily/effect.zig").effect;
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;

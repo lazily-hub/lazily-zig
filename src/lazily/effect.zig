@@ -8,6 +8,7 @@ const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const slotKeyed = @import("slot.zig").slotKeyed;
 const ValueFn = @import("context.zig").ValueFn;
 const CellMod = @import("cell.zig");
+const SignalMod = @import("signal.zig");
 
 /// An Effect is a side-effecting observer that reruns whenever a tracked
 /// dependency invalidates. It is the 4th reactive primitive
@@ -43,6 +44,8 @@ pub fn Effect(comptime Cleanup: type) type {
         }
 
         pub fn dispose(self: *Self) void {
+            // AUDIT ONLY (#lzspecedgeindex): kt's `disposeEffect` scanned here.
+            SignalMod.naiveDisposeScan(self.slot);
             // Remove the eager-recompute hooks so no further reruns fire.
             self.slot.on_invalidate = null;
             self.slot.recompute = null;
@@ -124,6 +127,8 @@ pub fn effectNoCleanup(
 }
 
 fn on_invalidate_hook(s: *Slot) void {
+    // AUDIT ONLY (#lzspecedgeindex): rs/cpp `run_effect` scanned here.
+    SignalMod.naiveEnqueueScan(s);
     if (!s.stale) {
         s.stale = true;
         s.ctx.pending_recompute.append(s.ctx.allocator, s) catch {};

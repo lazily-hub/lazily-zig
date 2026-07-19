@@ -31,6 +31,32 @@ pub fn build(b: *std.Build) void {
         "Link libc for artifacts that need C allocator/libc symbols (default: false)",
     ) orelse false;
     build_options.addOption(bool, "link_libc", link_libc);
+    // `#lzspecedgeindex` audit flag. Forces the pending-recompute queue back to
+    // the naive forms that lazily-rs/-cpp (`run_effect`) and lazily-kt
+    // (`disposeEffect`) shipped: a linear scan of the pending/scheduled effect
+    // collection for an id that cannot be there. OFF in every shipped build;
+    // only `zig build audit-pending-naive` turns it on, so the audit harness can
+    // prove it has a detection margin instead of reporting a flat column that a
+    // blind harness would also report. See src/benches/pending_audit.zig.
+    const naive_pending_scan = b.option(
+        bool,
+        "naive_pending_scan",
+        "AUDIT ONLY (#lzspecedgeindex): restore the O(W^2) pending-queue scan (default: false)",
+    ) orelse false;
+    build_options.addOption(bool, "naive_pending_scan", naive_pending_scan);
+    // Teardown-path variant selector. lazily-kt's `disposeEffect` scanned the
+    // never-shrinking *backing array* (its wraparound branch fires when
+    // `head >= tail`, which an empty deque satisfies), so an empty collection
+    // was NOT a free scan. lazily-dart scans length and IS free when empty.
+    // Which one a Zig `ArrayList` behaves like after a pop-drain is a question
+    // to measure, not to read: "len" walks `items`, "capacity" walks
+    // `allocatedSlice()` (the region `clearRetainingCapacity`/pop-drain retain).
+    const naive_dispose_scan = b.option(
+        []const u8,
+        "naive_dispose_scan",
+        "AUDIT ONLY (#lzspecedgeindex): teardown scan form — none|len|capacity (default: none)",
+    ) orelse "none";
+    build_options.addOption([]const u8, "naive_dispose_scan", naive_dispose_scan);
 
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
@@ -438,6 +464,39 @@ pub fn build(b: *std.Build) void {
     });
     const run_load_fanout = b.addRunArtifact(load_fanout_exe);
     load_fanout_step.dependOn(&run_load_fanout.step);
+
+    // --- pending/scheduled-effect queue audit (`zig build audit-pending`) ---
+    // #lzspecedgeindex — manual/on-demand ONLY (never in `zig build test`).
+    // Total node count is FIXED; only fan-out width varies. See
+    // src/benches/pending_audit.zig. The `-naive` step forces the queue back to
+    // the scanning form so the harness can report a detection margin.
+    const audit_pending_step = b.step(
+        "audit-pending",
+        "Run the pending/scheduled-effect queue audit (LAZILY_AUDIT_TOTAL / _REPS)",
+    );
+    const audit_pending_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = link_libc,
+    });
+    audit_pending_mod.addOptions("build_options", build_options);
+    const audit_pending_root = b.createModule(.{
+        .root_source_file = b.path("src/benches/pending_audit.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "lazily", .module = audit_pending_mod },
+        },
+        .link_libc = link_libc,
+    });
+    const audit_pending_exe = b.addExecutable(.{
+        .name = "lazily-audit-pending",
+        .root_module = audit_pending_root,
+    });
+    b.installArtifact(audit_pending_exe);
+    const run_audit_pending = b.addRunArtifact(audit_pending_exe);
+    audit_pending_step.dependOn(&run_audit_pending.step);
 
     // --- thread-safe contention benchmark (`zig build bench-contention`) ---
     // #lzcontentionbench — N-writer throughput on a shared cell. Mirrors
