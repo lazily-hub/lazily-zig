@@ -801,8 +801,15 @@ pub const CrdtSync = struct {
     }
 
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !CrdtSync {
+        // `frontier` is optional (#lzspecfrontiersuppress): an omitted frontier
+        // is equivalent to `[]` and means "unchanged since the last accepted
+        // frame" — the receiver reuses its last-merged frontier.
+        const frontier: []const FrontierEntry = if (objectGet(value, "frontier")) |raw|
+            try parseFrontier(allocator, raw)
+        else
+            &.{};
         return .{
-            .frontier = try parseFrontier(allocator, try field(value, "frontier")),
+            .frontier = frontier,
             .ops = try parseCrdtOps(allocator, try field(value, "ops")),
         };
     }
@@ -1481,6 +1488,32 @@ test "lazily/ipc: CrdtSync IpcMessage round-trip" {
     try std.testing.expectEqualStrings("scores/alice", decoded.ops[0].key.?);
     try std.testing.expect(decoded.ops[1].key == null);
     try std.testing.expectEqual(@as(u64, 20), decoded.ops[1].node);
+}
+
+test "lazily/ipc: CrdtSync decodes an omitted frontier as empty" {
+    // #lzspecfrontiersuppress: schemas/distributed.json makes `frontier`
+    // optional — omitting it is equivalent to sending `[]` and means
+    // "unchanged since the last accepted frame". Mirrors the
+    // crdt_sync_frontier_suppressed frame in
+    // lazily-spec/conformance/distributed/crdt_sync_frames.json.
+    const allocator = std.testing.allocator;
+
+    const wire =
+        \\{"CrdtSync":{"ops":[{"node":7,"key":"counter/global",
+        \\"stamp":{"wall_time":13,"logical":0,"peer":1},
+        \\"state":{"Inline":[7]}}]}}
+    ;
+    const flat = try std.mem.replaceOwned(u8, allocator, wire, "\n", "");
+    defer allocator.free(flat);
+
+    var parsed = try IpcMessage.decodeJson(allocator, flat);
+    defer parsed.deinit();
+
+    const decoded = parsed.message.CrdtSync;
+    try std.testing.expectEqual(@as(usize, 0), decoded.frontier.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.ops.len);
+    try std.testing.expectEqual(@as(u64, 7), decoded.ops[0].node);
+    try std.testing.expectEqualStrings("counter/global", decoded.ops[0].key.?);
 }
 
 test "lazily/ipc: CrdtSync filter_readable drops non-readable ops" {
