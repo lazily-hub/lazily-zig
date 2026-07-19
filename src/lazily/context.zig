@@ -347,6 +347,20 @@ pub const Context = struct {
         defer self.draining_recompute = false;
 
         while (self.pending_recompute.pop()) |slot| {
+            // Tombstone discard (`#lzspecedgeindex`). `destroySingleNodeUnlocked`
+            // clears `stale` in O(1) and leaves the queue entry behind rather
+            // than scanning for it, so a cleared flag here means one of:
+            //   - the slot was torn down after it was enqueued (the entry is a
+            //     tombstone; recomputing it would touch a deinit'd edge set and
+            //     freed storage — a use-after-free), or
+            //   - the slot's arena memory was recycled into a *fresh* slot that
+            //     has not been invalidated (running it would be a spurious
+            //     recompute of an unrelated node).
+            // Both are discards. A recycled-and-rescheduled slot is still safe:
+            // the drain is LIFO and the tombstone was appended first, so the
+            // live entry pops first, runs, and clears the flag; the tombstone
+            // then pops with the flag clear and is dropped.
+            if (!slot.stale) continue;
             slot.stale = false;
             if (slot.recompute) |recompute_fn| {
                 self.instrumentation.slot_recomputes += 1;
@@ -1206,6 +1220,26 @@ pub const Slot = struct {
         drainCascadeWorklist(ctx);
     }
 
+    /// AUDIT ONLY (`#lzspecedgeindex`, `build_options.naive_destroy_scan`).
+    ///
+    /// The naive alternative to the O(1) tombstone: search `pending_recompute`
+    /// for this slot's entry and compact it out. Modelled on lazily-rs's
+    /// pre-2b98ca6 `Vec::retain`, which walks `len` unconditionally rather than
+    /// stopping at the first hit — so a mass teardown while the queue is
+    /// saturated is O(pending) per node, O(W^2) per cohort. Compiles to nothing
+    /// in shipped builds.
+    inline fn naiveDestroyRemoveScan(self: *Slot) void {
+        if (comptime !build_options.naive_destroy_scan) return;
+        const items = self.ctx.pending_recompute.items;
+        var keep: usize = 0;
+        for (items) |q| {
+            if (q == self) continue;
+            items[keep] = q;
+            keep += 1;
+        }
+        self.ctx.pending_recompute.items.len = keep;
+    }
+
     pub fn destroy(self: *Slot, recurse: ?bool) void {
         // Capture ctx before destroyUnlocked: the destroy path frees `self`,
         // so the deferred unlock must not dereference freed `self.ctx`.
@@ -1300,6 +1334,20 @@ pub const Slot = struct {
     /// `recurse == false` fast path and the iterative `destroySelf` per-node
     /// step.
     fn destroySingleNodeUnlocked(self: *Slot) void {
+        // Tombstone this node's `pending_recompute` entry, if it has one
+        // (`#lzspecedgeindex`). A Signal/Effect-backed slot destroyed between
+        // its `on_invalidate` enqueue and the next drain would otherwise leave
+        // a pointer to torn-down (and arena-recycled) memory in the queue for
+        // `drainPendingRecompute` to pop and run — a use-after-free reachable
+        // from safe user code.
+        //
+        // The queue is scan-free by design (audit 70cf3e5), so this must NOT
+        // search for the entry. `stale` is already the O(1) enqueue guard and
+        // is only ever cleared at pop, so clearing it here marks the entry dead
+        // in O(1) and the drain discards it. Mirrors lazily-rs 2b98ca6.
+        self.stale = false;
+        naiveDestroyRemoveScan(self);
+
         if (self.storage) |storage| {
             if (self.deinitPayload) |deinitPayload| {
                 deinitPayload(self);

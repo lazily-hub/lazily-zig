@@ -107,7 +107,14 @@ const Rung = struct {
 /// was empty throughout and forced-naive came back at 1.2x. That reads exactly
 /// like a clean negative and was measuring nothing. A low forced-naive margin
 /// means suspect the harness first.
-const DisposeMode = enum { drained, saturated };
+/// `destroy_saturated` is the arm for `Slot.destroy` rather than
+/// `Signal.dispose`. The two are different code paths: `dispose` only nulls the
+/// hooks, while `destroy` tears the node down and returns its arena memory to
+/// the reuse free-list — and it is `destroy`, not `dispose`, that has to
+/// reconcile with a queue entry the slot may already own. It runs against a
+/// saturated queue for the same reason `saturated` exists: a drained queue
+/// gives a remove-by-scan nothing to walk.
+const DisposeMode = enum { drained, saturated, destroy_saturated };
 
 /// Build `total / width` sources each fanning out to `width` eager Signals,
 /// publish once per source (so every rung recomputes exactly `total` nodes),
@@ -204,6 +211,38 @@ fn runRung(total: usize, width: usize, dispose_mode: DisposeMode) !Rung {
                 publish_ns += nowNs() - t;
             }
         },
+        .destroy_saturated => {
+            for (0..sources) |s| {
+                g.current_source = s;
+                const src = ctx.cacheLookup(sourceKey(s)).?;
+                const src_ptr = src.getPtr(i64) catch unreachable;
+                src_ptr.* = 2;
+
+                var t = nowNs();
+                ctx.mutex.lock();
+                src.emitChangeUnlocked();
+                ctx.mutex.unlock();
+                publish_ns += nowNs() - t;
+
+                if (ctx.pending_recompute.items.len != width) return error.QueueNotSaturated;
+
+                // Tear the whole cohort down while every one of its members is
+                // still queued. Post-fix each `destroy` leaves an O(1)
+                // tombstone; the drain below discards them. Pre-fix this drain
+                // popped freed slots and ran `recompute` on a deinit'd edge
+                // set, so this arm is also the load-scale reproduction of the
+                // use-after-free the tombstone closes.
+                t = nowNs();
+                for (sigs[s * width ..][0..width]) |sig| sig.slot.destroy(false);
+                dispose_ns += nowNs() - t;
+
+                t = nowNs();
+                ctx.drainPendingRecompute();
+                publish_ns += nowNs() - t;
+
+                if (ctx.pending_recompute.items.len != 0) return error.QueueNotDrained;
+            }
+        },
     }
 
     const ftotal = @as(f64, @floatFromInt(total));
@@ -236,6 +275,7 @@ const control_width: usize = 8;
 /// True when neither naive arm is compiled in — the only configuration that
 /// asserts.
 const shipped = !lazily.build_options.naive_pending_scan and
+    !lazily.build_options.naive_destroy_scan and
     std.mem.eql(u8, lazily.build_options.naive_dispose_scan, "none");
 
 pub fn main() !void {
@@ -247,6 +287,7 @@ pub fn main() !void {
         \\lazily-zig pending/scheduled-effect queue audit (#lzspecedgeindex)
         \\  naive_pending_scan (publish path)  = {}
         \\  naive_dispose_scan (teardown path) = {s}
+        \\  naive_destroy_scan (Slot.destroy)  = {}
         \\  total eager Signals per rung = {d} (FIXED — only width varies)
         \\  narrow-fan-out control width = {d}
         \\  reps = {d} (best-of, ratios only; absolute ns are not trustworthy
@@ -256,6 +297,7 @@ pub fn main() !void {
     , .{
         lazily.build_options.naive_pending_scan,
         lazily.build_options.naive_dispose_scan,
+        lazily.build_options.naive_destroy_scan,
         total,
         control_width,
         reps,
@@ -263,24 +305,27 @@ pub fn main() !void {
 
     const widths = [_]usize{ control_width, 64, 256, 1024, 4096, 16384, 65536 };
 
-    std.debug.print("{s:>8} {s:>9} {s:>16} {s:>18} {s:>18}\n", .{
-        "width", "sources", "publish ns/node", "dispose ns/node", "dispose ns/node",
+    std.debug.print("{s:>8} {s:>9} {s:>16} {s:>18} {s:>18} {s:>18}\n", .{
+        "width",           "sources",         "publish ns/node",
+        "dispose ns/node", "dispose ns/node", "destroy ns/node",
     });
-    std.debug.print("{s:>8} {s:>9} {s:>16} {s:>18} {s:>18}\n", .{
-        "", "", "", "(drained queue)", "(saturated queue)",
+    std.debug.print("{s:>8} {s:>9} {s:>16} {s:>18} {s:>18} {s:>18}\n", .{
+        "", "", "", "(drained queue)", "(saturated queue)", "(saturated queue)",
     });
 
     var control_publish: f64 = 0;
     var control_drained: f64 = 0;
     var control_saturated: f64 = 0;
-    var worst = [_]f64{ 0, 0, 0 };
-    var worst_w = [_]usize{ 0, 0, 0 };
+    var control_destroy: f64 = 0;
+    var worst = [_]f64{ 0, 0, 0, 0 };
+    var worst_w = [_]usize{ 0, 0, 0, 0 };
 
     for (widths) |w| {
         if (w > total) continue;
 
         var drained = try runRung(total, w, .drained);
         var saturated = try runRung(total, w, .saturated);
+        var destroyed = try runRung(total, w, .destroy_saturated);
         // Best-of per column, independently. The drained dispose column lands
         // near 1 ns/node on the shipped engine, close enough to timer and
         // scheduler noise that a single sample's ratio is meaningless; the min
@@ -288,20 +333,24 @@ pub fn main() !void {
         for (1..reps) |_| {
             const d = try runRung(total, w, .drained);
             const t = try runRung(total, w, .saturated);
+            const x = try runRung(total, w, .destroy_saturated);
             drained.publish_ns_per_node = @min(drained.publish_ns_per_node, d.publish_ns_per_node);
             drained.dispose_ns_per_node = @min(drained.dispose_ns_per_node, d.dispose_ns_per_node);
             saturated.dispose_ns_per_node = @min(saturated.dispose_ns_per_node, t.dispose_ns_per_node);
+            destroyed.dispose_ns_per_node = @min(destroyed.dispose_ns_per_node, x.dispose_ns_per_node);
         }
 
-        std.debug.print("{d:>8} {d:>9} {d:>16.1} {d:>18.1} {d:>18.1}\n", .{
-            w, drained.sources, drained.publish_ns_per_node,
-            drained.dispose_ns_per_node, saturated.dispose_ns_per_node,
+        std.debug.print("{d:>8} {d:>9} {d:>16.1} {d:>18.1} {d:>18.1} {d:>18.1}\n", .{
+            w,                             drained.sources,
+            drained.publish_ns_per_node,   drained.dispose_ns_per_node,
+            saturated.dispose_ns_per_node, destroyed.dispose_ns_per_node,
         });
 
         if (w == control_width) {
             control_publish = drained.publish_ns_per_node;
             control_drained = drained.dispose_ns_per_node;
             control_saturated = saturated.dispose_ns_per_node;
+            control_destroy = destroyed.dispose_ns_per_node;
             continue;
         }
 
@@ -309,6 +358,7 @@ pub fn main() !void {
             drained.publish_ns_per_node / @max(control_publish, 0.0001),
             drained.dispose_ns_per_node / @max(control_drained, 0.0001),
             saturated.dispose_ns_per_node / @max(control_saturated, 0.0001),
+            destroyed.dispose_ns_per_node / @max(control_destroy, 0.0001),
         };
         for (ratios, 0..) |r, k| {
             if (r > worst[k]) {
@@ -324,12 +374,14 @@ pub fn main() !void {
         \\  publish            {d:>10.2}x at width {d}
         \\  dispose  drained   {d:>10.2}x at width {d}
         \\  dispose  saturated {d:>10.2}x at width {d}
+        \\  destroy  saturated {d:>10.2}x at width {d}
         \\
     , .{
         control_width,
         worst[0], worst_w[0],
         worst[1], worst_w[1],
         worst[2], worst_w[2],
+        worst[3], worst_w[3],
     });
 
     // Only the shipped arm asserts. The naive arms are expected to blow through
@@ -348,7 +400,11 @@ pub fn main() !void {
             std.debug.print("dispose cost scales with fan-out width at fixed node count\n", .{});
             return error.DisposeCostWidthDependent;
         }
-        std.debug.print("publish + dispose (drained AND saturated) within bound at every width\n", .{});
+        if (worst[3] >= 8.0) {
+            std.debug.print("destroy cost scales with fan-out width at fixed node count\n", .{});
+            return error.DestroyCostWidthDependent;
+        }
+        std.debug.print("publish + dispose + destroy within bound at every width\n", .{});
     }
 
     std.debug.print("sink = {d}\n", .{sink});

@@ -57,6 +57,19 @@ pub fn build(b: *std.Build) void {
         "AUDIT ONLY (#lzspecedgeindex): teardown scan form — none|len|capacity (default: none)",
     ) orelse "none";
     build_options.addOption([]const u8, "naive_dispose_scan", naive_dispose_scan);
+    // Destroy-path variant (`#lzspecedgeindex`). `Slot.destroy` on a slot that
+    // is queued in `pending_recompute` used to leave the entry behind for the
+    // drain to pop — a use-after-free. The obvious fix is to search the queue
+    // and remove the entry, which is exactly the O(pending) shape this audit
+    // exists to keep out; the shipped fix tombstones the entry in O(1) instead.
+    // This flag restores the search-and-remove form (lazily-rs `Vec::retain`
+    // walks `len` unconditionally) so the harness can prove it would see one.
+    const naive_destroy_scan = b.option(
+        bool,
+        "naive_destroy_scan",
+        "AUDIT ONLY (#lzspecedgeindex): remove-by-scan in Slot.destroy instead of an O(1) tombstone (default: false)",
+    ) orelse false;
+    build_options.addOption(bool, "naive_destroy_scan", naive_destroy_scan);
 
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including

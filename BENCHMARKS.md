@@ -247,7 +247,40 @@ run interleaved (ratios only — absolute ns were taken under concurrent load,
 | naive teardown scan, capacity | `-Dnaive_dispose_scan=capacity` | 1.30x | 1243.35x | 1573.77x |
 
 Detection margins: **113x** on the publish path, **2230x** on the teardown path.
-Neither detected anything in the shipped arm. The shipped dispose columns sit
+Neither detected anything in the shipped arm.
+
+### `Slot.destroy` arm (added with the tombstone fix)
+
+The three arms above cover `Signal.dispose`, which only nulls the hooks. They do
+not reach `Slot.destroy`, which tears the node down and returns its arena memory
+to the reuse free-list — and `destroy`, not `dispose`, is the path that has to
+reconcile with a queue entry the slot may already own. A slot destroyed between
+its `on_invalidate` enqueue and the next drain used to leave that entry behind
+for the drain to pop: a use-after-free (`recompute` iterating a deinit'd edge
+set), reproducible as a general protection exception.
+
+The obvious fix — search `pending_recompute` and remove the entry — is exactly
+the O(pending) shape this audit exists to keep out. The shipped fix clears the
+`stale` flag in O(1) and leaves the entry as a **tombstone** that the drain
+discards at pop (lazily-rs `2b98ca6`); `-Dnaive_destroy_scan=true` restores the
+search-and-remove form so the arm has a margin to report.
+
+`destroy ns/node` against a **saturated** queue, 65,536 eager Signals held fixed,
+ratios vs the width-8 control (1-min load average 2.6 to 3.9):
+
+| width | shipped | `-Dnaive_destroy_scan=true` |
+|---|---|---|
+| 8 | 12.6 | 14.2 |
+| 256 | 10.6 | 28.0 |
+| 1024 | 10.4 | 98.3 |
+| 4096 | 10.6 | 376.2 |
+| 16384 | 10.7 | 1463.3 |
+| 65536 | 11.1 | 5805.5 |
+| **worst ratio** | **0.88x** | **410.08x** |
+
+The naive column quadruples per 4x width — clean O(W) per destroy, O(W^2) per
+cohort. The shipped column is flat within noise, so teardown of a queued slot is
+O(1) and the queue remains scan-free on all three paths. The shipped dispose columns sit
 near 1 ns/node, where clock granularity alone moves the ratio by 2-3x run to
 run — hence the wider (8x) gate on those two columns, which costs no detection
 power against margins three orders of magnitude away.

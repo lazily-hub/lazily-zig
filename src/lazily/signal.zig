@@ -382,3 +382,225 @@ test "lazily/signal: dispose reverts to lazy semantics" {
     source.set(20);
     try std.testing.expectEqual(@as(u32, 1), SignalTestState.counter);
 }
+
+
+// ---------------------------------------------------------------------------
+// Destroying a slot that is queued in `pending_recompute` (`#lzspecedgeindex`)
+// ---------------------------------------------------------------------------
+//
+// `Slot.destroy` tears a node down and returns its arena memory to the reuse
+// free-list. A Signal/Effect-backed slot destroyed *between* its
+// `on_invalidate` enqueue and the next drain used to leave its pointer in
+// `pending_recompute`; the drain then popped it and ran `recompute`, which
+// iterates the slot's now-deinit'd `parents` edge set. Before the tombstone
+// fix the first test below aborts with a general protection exception at
+// `signal.zig` `const parent = ptr.*` inside `recompute`, called from
+// `drainPendingRecompute` at the batch exit.
+//
+// The fix does not *remove* the entry — the queue is scan-free (audit 70cf3e5)
+// and removal by search would make `destroy` O(pending). Teardown clears the
+// `stale` flag in O(1) and the drain discards entries whose flag is clear, so
+// the entry survives as a tombstone and dies at pop.
+
+const DestroyWhileQueuedState = struct {
+    var source: u32 = 0;
+    var runs: usize = 0;
+    var victim: ?*Slot = null;
+    /// Queue depth sampled inside the batch, right after the victim was
+    /// destroyed. The batch exit drains, so it has to be read before then.
+    var depth_after_destroy: usize = 0;
+
+    fn sourceFn(_: *Context) anyerror!u32 {
+        return source;
+    }
+
+    fn derivedFn(c: *Context) anyerror!u32 {
+        const src = try CellMod.cell(u32, c, sourceFn, null);
+        runs += 1;
+        return src.get() + 1;
+    }
+
+    fn runBatch(c: *Context) void {
+        const src = CellMod.cell(u32, c, sourceFn, null) catch return;
+        // Invalidates the Signal's slot -> `on_invalidate_hook` appends it to
+        // `pending_recompute`. The drain is deferred to the batch exit.
+        src.set(7);
+        std.debug.assert(c.pending_recompute.items.len == 1);
+        // Explicit teardown while the slot is queued.
+        victim.?.destroy(false);
+        depth_after_destroy = c.pending_recompute.items.len;
+    }
+};
+
+test "lazily/signal: destroying a queued slot tombstones its pending entry" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    DestroyWhileQueuedState.source = 0;
+    DestroyWhileQueuedState.runs = 0;
+    DestroyWhileQueuedState.depth_after_destroy = 0;
+
+    const sig = try signal(u32, ctx, DestroyWhileQueuedState.derivedFn, null);
+    defer ctx.allocator.destroy(sig);
+    try std.testing.expectEqual(@as(usize, 1), DestroyWhileQueuedState.runs);
+
+    DestroyWhileQueuedState.victim = sig.slot;
+
+    // enqueue -> destroy -> drain, all inside one batch boundary.
+    ctx.batch(DestroyWhileQueuedState.runBatch);
+
+    // The entry is left in place by design (O(1) teardown, no scan)...
+    try std.testing.expectEqual(@as(usize, 1), DestroyWhileQueuedState.depth_after_destroy);
+    // ...and the flag is cleared, so the drain discards it instead of running
+    // `recompute` on a torn-down slot. Pre-fix this crashed here.
+    try std.testing.expect(!sig.slot.stale);
+    try std.testing.expectEqual(@as(usize, 1), DestroyWhileQueuedState.runs);
+    // Drain still consumes the whole queue — the tombstone does not linger.
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
+}
+
+// A tombstone must also survive arena recycling: `destroy` returns the slot's
+// memory to `SlotArena`'s free-list, so the very next materialization can hand
+// the same address back out. The stale tombstone pointer then aliases a live,
+// unrelated slot. Popping it must not clear that slot's flag or run its body.
+
+const RecycleAfterDestroyState = struct {
+    var a_source: u32 = 0;
+    var victim_runs: usize = 0;
+    var survivor_runs: usize = 0;
+    var victim: ?*Slot = null;
+    var recycled_same_address = false;
+
+    fn sourceFn(_: *Context) anyerror!u32 {
+        return a_source;
+    }
+
+    fn victimFn(c: *Context) anyerror!u32 {
+        const src = try CellMod.cell(u32, c, sourceFn, null);
+        victim_runs += 1;
+        return src.get() + 1;
+    }
+
+    fn survivorFn(c: *Context) anyerror!u32 {
+        const src = try CellMod.cell(u32, c, sourceFn, null);
+        survivor_runs += 1;
+        return src.get() + 2;
+    }
+
+    fn runBatch(c: *Context) void {
+        const src = CellMod.cell(u32, c, sourceFn, null) catch return;
+        src.set(3);
+        victim.?.destroy(false);
+        // Recycles the freed arena slot (LIFO inline free-stack) for a brand
+        // new eager node, which then enqueues itself under the same address.
+        const survivor = signalKeyed(u32, c, 0xDEADBEEF, survivorFn, null) catch return;
+        recycled_same_address = (survivor.slot == victim.?);
+        c.allocator.destroy(survivor);
+        src.set(4);
+    }
+};
+
+test "lazily/signal: tombstone is safe when the arena recycles the slot" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    RecycleAfterDestroyState.a_source = 0;
+    RecycleAfterDestroyState.victim_runs = 0;
+    RecycleAfterDestroyState.survivor_runs = 0;
+    RecycleAfterDestroyState.recycled_same_address = false;
+
+    const sig = try signal(u32, ctx, RecycleAfterDestroyState.victimFn, null);
+    defer ctx.allocator.destroy(sig);
+    try std.testing.expectEqual(@as(usize, 1), RecycleAfterDestroyState.victim_runs);
+    RecycleAfterDestroyState.victim = sig.slot;
+
+    ctx.batch(RecycleAfterDestroyState.runBatch);
+
+    // The victim never ran again after teardown.
+    try std.testing.expectEqual(@as(usize, 1), RecycleAfterDestroyState.victim_runs);
+    // The queue drained fully, tombstone included.
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
+}
+
+// Reentrancy (`lazily-rs` de6b67b analogue): tearing a node down from *inside*
+// a recompute that the drain is currently running. The Zig drain is
+// `pop()`-based rather than a retain/iterate under a borrow, and teardown now
+// touches only a flag, so the reentrant destroy cannot invalidate an iterator.
+// `destroySelf` does share `Context.cascade_scratch` with the invalidation
+// cascade, but the pending drain runs outside that worklist, so the
+// `wl.items.len == 0` entry assert holds.
+
+const ReentrantDestroyState = struct {
+    var source: u32 = 0;
+    var neighbor: ?*Slot = null;
+    var neighbor_runs: usize = 0;
+    var destroyer_runs: usize = 0;
+    var did_destroy = false;
+    var neighbor_was_queued = false;
+
+    fn sourceFn(_: *Context) anyerror!u32 {
+        return source;
+    }
+
+    fn neighborFn(c: *Context) anyerror!u32 {
+        const src = try CellMod.cell(u32, c, sourceFn, null);
+        neighbor_runs += 1;
+        return src.get() + 1;
+    }
+
+    fn destroyerFn(c: *Context) anyerror!u32 {
+        const src = try CellMod.cell(u32, c, sourceFn, null);
+        destroyer_runs += 1;
+        // Runs from inside `drainPendingRecompute`, while the neighbor is
+        // still sitting in the queue below us.
+        if (!did_destroy) {
+            if (neighbor) |n| {
+                did_destroy = true;
+                // `stale` is set at enqueue and cleared at pop, so this proves
+                // the neighbor's entry is still live in the queue below us —
+                // i.e. the test is actually exercising destroy-during-drain
+                // and not just destroying an already-drained node.
+                neighbor_was_queued = n.stale;
+                n.destroy(false);
+            }
+        }
+        return src.get() + 5;
+    }
+
+    fn runBatch(c: *Context) void {
+        const src = CellMod.cell(u32, c, sourceFn, null) catch return;
+        src.set(11);
+    }
+};
+
+test "lazily/signal: destroying another slot from inside a drain is safe" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    ReentrantDestroyState.source = 0;
+    ReentrantDestroyState.neighbor_runs = 0;
+    ReentrantDestroyState.destroyer_runs = 0;
+    ReentrantDestroyState.did_destroy = false;
+    ReentrantDestroyState.neighbor_was_queued = false;
+
+    const victim = try signal(u32, ctx, ReentrantDestroyState.neighborFn, null);
+    defer ctx.allocator.destroy(victim);
+    const destroyer = try signal(u32, ctx, ReentrantDestroyState.destroyerFn, null);
+    defer ctx.allocator.destroy(destroyer);
+    ReentrantDestroyState.neighbor = victim.slot;
+
+    const neighbor_runs_before = ReentrantDestroyState.neighbor_runs;
+
+    // Both are queued by the single `set`; the drain pops the destroyer, which
+    // tears the still-queued neighbor down mid-drain.
+    ctx.batch(ReentrantDestroyState.runBatch);
+
+    try std.testing.expect(ReentrantDestroyState.did_destroy);
+    try std.testing.expect(ReentrantDestroyState.neighbor_was_queued);
+    // The torn-down neighbor was discarded, not recomputed.
+    try std.testing.expectEqual(neighbor_runs_before, ReentrantDestroyState.neighbor_runs);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
+}
