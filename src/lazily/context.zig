@@ -882,6 +882,25 @@ pub const Slot = struct {
     ptr_size: std.builtin.Type.Pointer.Size,
     storage_inline: bool = false,
     stale: bool = false,
+    /// Teardown re-entrancy guard (`#lzspecedgeindex`). Latched by
+    /// `destroySingleNodeUnlocked` before it runs the user's `deinitPayload`
+    /// and never cleared — the node is dead once set, and `initKeyed`'s struct
+    /// literal resets it to the default when the arena recycles the slot.
+    ///
+    /// The graph mutex is reentrant, so a payload destructor that touches the
+    /// graph re-enters `Slot.destroy` on the same thread and used to complete a
+    /// second, nested teardown of a node the outer frame was still midway
+    /// through. The outer frame then resumed against its stale locals and freed
+    /// the boxed payload, both edge sets, and the arena id a second time. One
+    /// bool tested at the three teardown entry points keeps that O(1) — the
+    /// cascade stays scan-free (audit 70cf3e5).
+    destroying: bool = false,
+    /// Set when a `destroy` arrives while `destroying` is latched. The teardown
+    /// path ignores it (the node is already dying). `makeRecomputeFn` latches
+    /// `destroying` only around its own `deinitPayload` call, so it reads this
+    /// afterwards and performs the deferred teardown once `s` is no longer in
+    /// use by that frame (`#lzspecedgeindex`).
+    destroy_requested: bool = false,
 
     /// Inline-storage budget (`#lzinline`). 16 bytes / 16-byte alignment covers
     /// the overwhelming majority of reactive value types — `i64`, `f64`,
@@ -1250,6 +1269,16 @@ pub const Slot = struct {
     }
 
     pub fn destroyUnlocked(self: *Slot, recurse: ?bool) void {
+        // Already claimed by an outer frame (`#lzspecedgeindex`) — the way to
+        // get here is a `deinitPayload` calling back into the graph. That frame
+        // owns the node's lifetime, so record the request and absorb this call
+        // rather than tearing the same node down a second time. `destroySelf`
+        // (teardown) drops the request; `makeRecomputeFn` honors it.
+        if (self.destroying) {
+            self.destroy_requested = true;
+            return;
+        }
+
         // Remove from cache if not already cleared by Context.deinit
         if (self.cache_key) |cache_key| {
             self.ctx.cacheRemove(cache_key);
@@ -1277,6 +1306,8 @@ pub const Slot = struct {
     /// `dependent.parents.remove(node)` for subscribers). The iterated set is
     /// cleared right after the drain, never mutated mid-iteration.
     pub fn destroySelf(self: *Slot, recurse: ?bool) void {
+        if (self.destroying) return; // see `destroyUnlocked`
+
         if (recurse == false) {
             self.destroySingleNodeUnlocked();
             return;
@@ -1284,8 +1315,16 @@ pub const Slot = struct {
 
         const ctx = self.ctx;
         const wl = &ctx.cascade_scratch;
-        std.debug.assert(wl.items.len == 0); // always empty on entry
-        defer wl.clearRetainingCapacity();
+        // Nested cascades share this scratch worklist (`#lzspecedgeindex`): a
+        // `deinitPayload` running under `destroySingleNodeUnlocked` can destroy
+        // some *other* live node, and that cascade nests inside this one. Claim
+        // the region above `base` rather than assuming sole ownership. The old
+        // `assert(wl.items.len == 0)` tripped on any nested cascade in Debug,
+        // and in release the paired `clearRetainingCapacity()` dropped the
+        // outer cascade's not-yet-destroyed nodes on the floor — leaking them
+        // and leaving their reverse edges pointing at freed parents.
+        const base = wl.items.len;
+        defer wl.items.len = base;
 
         wl.append(ctx.allocator, self) catch {
             // OOM seeding the worklist — at least free this node.
@@ -1293,7 +1332,8 @@ pub const Slot = struct {
             return;
         };
 
-        while (wl.pop()) |node| {
+        while (wl.items.len > base) {
+            const node = wl.pop().?;
             // Only a node with live storage owns edges to tear down (matches
             // the original `if (self.storage) |storage|` guard).
             if (node.storage != null) {
@@ -1334,6 +1374,15 @@ pub const Slot = struct {
     /// `recurse == false` fast path and the iterative `destroySelf` per-node
     /// step.
     fn destroySingleNodeUnlocked(self: *Slot) void {
+        // Re-entrancy latch (`#lzspecedgeindex`). Set BEFORE `deinitPayload`
+        // runs, so a destructor that calls back into the graph finds the node
+        // already claimed and its nested teardown is absorbed. Without this the
+        // nested frame ran to completion — freeing the boxed payload, both edge
+        // sets, and the arena id — and then this frame resumed and freed all
+        // three again from its stale `storage` local.
+        if (self.destroying) return;
+        self.destroying = true;
+
         // Tombstone this node's `pending_recompute` entry, if it has one
         // (`#lzspecedgeindex`). A Signal/Effect-backed slot destroyed between
         // its `on_invalidate` enqueue and the next drain would otherwise leave

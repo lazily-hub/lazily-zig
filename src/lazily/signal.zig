@@ -150,9 +150,19 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
 
                 changed = true;
 
-                // Deinit old payload value
+                // Deinit old payload value.
+                //
+                // This is the *second* `deinitPayload` call site — a mid-session
+                // value change, not teardown (`#lzspecedgeindex`). A destructor
+                // that destroys its own slot here would free `old_storage` and
+                // return `s` to the arena while this frame still holds both, so
+                // latch the same re-entrancy guard `destroySingleNodeUnlocked`
+                // uses. `destroyUnlocked` then records the request instead of
+                // acting on it, and it is honored below once `s` is idle.
                 if (s.deinitPayload) |deinit_fn| {
+                    s.destroying = true;
                     deinit_fn(s); // reads s.storage (old)
+                    s.destroying = false;
                 }
 
                 // Free old allocation for indirect mode — but NOT inline storage
@@ -162,6 +172,18 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
                     if (s.free) |free_fn| {
                         free_fn(ctx.allocator, old_storage.payload.single_ptr);
                     }
+                }
+
+                // Deferred teardown requested from inside the destructor above.
+                // The old box is already freed, so drop `storage` before handing
+                // off — otherwise `destroySingleNodeUnlocked` frees it again and
+                // re-runs the payload destructor. No new value is published: the
+                // node is gone, so there is nothing to emit a change for.
+                if (s.destroy_requested) {
+                    s.destroy_requested = false;
+                    s.storage = null;
+                    s.destroyUnlocked(true);
+                    return;
                 }
 
                 // Store new value. Mirror initKeyed: inline small indirect
@@ -603,4 +625,78 @@ test "lazily/signal: destroying another slot from inside a drain is safe" {
     // The torn-down neighbor was discarded, not recomputed.
     try std.testing.expectEqual(neighbor_runs_before, ReentrantDestroyState.neighbor_runs);
     try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
+}
+
+
+// ---------------------------------------------------------------------------
+// The OTHER `deinitPayload` call site (`#lzspecedgeindex`)
+// ---------------------------------------------------------------------------
+//
+// `destroySingleNodeUnlocked` is not the only place user payload destructors
+// run. `makeRecomputeFn`'s step 3 calls `deinitPayload` on every value change
+// where the memo guard fails — a mid-session path with no teardown involved at
+// all, and reachable from a plain `Cell.set` rather than an explicit `destroy`.
+//
+// Pre-fix, a destructor that destroyed its own slot here ran a full, real
+// teardown (nothing was in progress to absorb it): the old box was freed and
+// `s` was handed back to the arena, and then the recompute frame carried on and
+// freed `old_storage` a second time and wrote the new value into a slot that
+// had already been recycled. Under `std.testing.allocator` in Debug:
+//
+//     panic: double free of [addr: 7f3a1f2a0598, len: 32 (0x20) align: 8]
+//
+// The fix latches `Slot.destroying` around this call site too, so the nested
+// destroy is recorded rather than performed, and the teardown is run by this
+// frame once `s` is no longer in use.
+
+const RecomputeReentrantDestroyState = struct {
+    const Big = struct { words: [4]u64 };
+    const cache_key: usize = 0x5164_0001;
+
+    var source: u64 = 0;
+    var payload_deinits: usize = 0;
+
+    fn sourceFn(_: *Context) anyerror!u64 {
+        return source;
+    }
+
+    fn derivedFn(c: *Context) anyerror!Big {
+        const src = try CellMod.cell(u64, c, sourceFn, null);
+        return .{ .words = .{ src.get(), 0, 0, 0 } };
+    }
+
+    fn deinitBig(s: *Slot) void {
+        payload_deinits += 1;
+        if (payload_deinits > 1) return;
+        s.destroy(true);
+    }
+
+    fn runBatch(c: *Context) void {
+        const src = CellMod.cell(u64, c, sourceFn, null) catch return;
+        src.set(99); // invalidate -> enqueue; drain at batch exit -> recompute
+    }
+};
+
+test "lazily/signal: destroying a slot from its payload destructor during recompute" {
+    const S = RecomputeReentrantDestroyState;
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    S.source = 1;
+    S.payload_deinits = 0;
+
+    const sig = try signalKeyed(S.Big, ctx, S.cache_key, S.derivedFn, S.deinitBig);
+    defer ctx.allocator.destroy(sig);
+
+    ctx.batch(S.runBatch);
+
+    // Destructor ran once, for the old value being replaced.
+    try std.testing.expectEqual(@as(usize, 1), S.payload_deinits);
+    // The deferred destroy was honored: the slot is gone from the cache and no
+    // new value was published in its place.
+    try std.testing.expect(ctx.cacheLookup(S.cache_key) == null);
+    // Queue fully drained, scratch worklist balanced.
+    try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.cascade_scratch.items.len);
 }

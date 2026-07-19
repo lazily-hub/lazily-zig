@@ -644,3 +644,190 @@ test "lazily/slot: concurrent set+get soak — invalidate-in-place (#lzinplace)"
     try std.testing.expectEqual(@as(u64, 20_000), ops.load(.monotonic));
     if (err) |e| return e;
 }
+
+
+// ---------------------------------------------------------------------------
+// Re-entrant `destroy` from a payload destructor (`#lzspecedgeindex`)
+// ---------------------------------------------------------------------------
+//
+// `destroySingleNodeUnlocked` runs the user's `deinitPayload` *before* it frees
+// the node's boxed storage, edge sets, and arena id. The graph mutex is
+// reentrant (`#lzparkingmutex`), so a payload destructor that touches the graph
+// re-enters `Slot.destroy` on the same thread and completes a second, nested
+// teardown of a node the outer teardown is still in the middle of. The outer
+// frame then resumed against its stale locals and tore the node down again:
+//
+//   * `free_fn(storage.payload.single_ptr)` twice — `storage` is a by-value
+//     local captured before the payload ran, so the inner frame's
+//     `self.storage = null` did not stop it. Double free of the boxed payload.
+//   * `change_subscribers.deinit` / `parents.deinit` twice — the second call
+//     re-ran `indexFree` on an already-freed `Index` once the set was wide
+//     enough to have promoted to an index.
+//   * `arena.free(self.id)` twice — the same `SlotId` landed on the reuse
+//     free-list twice, so two later, unrelated materializations aliased one
+//     `Slot`. That corruption surfaced far from here, typically as the
+//     `indexFree` double free at `Context.deinit`.
+//
+// Not a regression: reproduces identically on 70cf3e5, before the pending-queue
+// tombstone work.
+
+const ReentrantPayloadDestroyState = struct {
+    /// > `Slot.inline_cap` (16 bytes), so the payload is heap-boxed and the
+    /// per-slot `free_fn` actually runs — an inline payload would hide the
+    /// first of the three double frees.
+    const Big = struct { words: [4]u64 };
+
+    const cache_key: usize = 0x7e57_de57;
+
+    var payload_deinits: usize = 0;
+
+    fn bigFn(_: *Context) anyerror!Big {
+        return .{ .words = .{ 1, 2, 3, 4 } };
+    }
+
+    /// A payload destructor that touches the graph. Guarded to fire its
+    /// re-entrant destroy exactly once — without the guard the nested teardown
+    /// re-enters this same function and recurses until the stack is gone.
+    fn deinitBig(s: *Slot) void {
+        payload_deinits += 1;
+        if (payload_deinits > 1) return;
+        s.destroy(true);
+    }
+};
+
+test "lazily/slot: destroy re-entered from a payload destructor tears the node down once" {
+    const S = ReentrantPayloadDestroyState;
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    S.payload_deinits = 0;
+
+    _ = try slotKeyed(S.Big, ctx, S.cache_key, S.bigFn, S.deinitBig);
+    const victim = ctx.cacheLookup(S.cache_key).?;
+
+    victim.destroy(true);
+
+    // The payload destructor runs exactly once, and the nested `destroy` it
+    // fires is absorbed rather than completing a second teardown. Pre-fix this
+    // aborted with `double free` inside the destructor's nested `destroy`.
+    try std.testing.expectEqual(@as(usize, 1), S.payload_deinits);
+    // The node really is gone — the guard absorbs the duplicate, it does not
+    // turn the teardown into a no-op.
+    try std.testing.expectEqual(@as(usize, 0), ctx.cache.count());
+}
+
+// A payload destructor may also destroy some *other* live node, nesting a whole
+// cascade inside the one already running. `destroySelf` shares
+// `Context.cascade_scratch` across those frames, so the nested cascade must
+// claim only the region above the outer frame's high-water mark. The old
+// `assert(wl.items.len == 0)` entry check made this a Debug panic, and in
+// release the paired `clearRetainingCapacity()` discarded the outer cascade's
+// remaining nodes.
+
+const NestedCascadeState = struct {
+    const Big = struct { words: [4]u64 };
+    const victim_key: usize = 0x7e57_0002;
+
+    var source: u64 = 0;
+    var bystander: ?*Slot = null;
+    var payload_deinits: usize = 0;
+
+    fn bystanderSourceFn(_: *Context) anyerror!u64 {
+        return source;
+    }
+    fn bystanderLeafFn(c: *Context) anyerror!u64 {
+        return (try slot(u64, c, bystanderSourceFn, null)).* + 1;
+    }
+
+    fn bigFn(_: *Context) anyerror!Big {
+        return .{ .words = .{ 9, 9, 9, 9 } };
+    }
+
+    /// Reads the victim, so the victim gains a dependent and the outer cascade
+    /// has that dependent sitting on the worklist at the moment the victim's
+    /// payload destructor fires.
+    fn victimDependentFn(c: *Context) anyerror!u64 {
+        _ = try slotKeyed(Big, c, victim_key, bigFn, deinitBig);
+        return 1;
+    }
+
+    /// Destroys an unrelated two-node chain from inside the victim's teardown,
+    /// so the nested cascade runs while the outer worklist is non-empty.
+    fn deinitBig(_: *Slot) void {
+        payload_deinits += 1;
+        if (bystander) |b| {
+            bystander = null;
+            b.destroy(true);
+        }
+    }
+};
+
+test "lazily/slot: a cascade nested inside a payload destructor keeps the outer worklist" {
+    const S = NestedCascadeState;
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    S.source = 3;
+    S.payload_deinits = 0;
+
+    // Bystander chain: source -> leaf. Torn down from inside the victim's
+    // destructor.
+    _ = try slot(u64, ctx, S.bystanderLeafFn, null);
+    S.bystander = ctx.cacheLookup(valueFnCacheKey(S.bystanderSourceFn)).?;
+
+    // Victim with a dependent, so the outer cascade's worklist is non-empty at
+    // the moment the destructor fires. Without a dependent the nested cascade
+    // would find the worklist already drained and the test would be vacuous.
+    _ = try slot(u64, ctx, S.victimDependentFn, null);
+    const victim = ctx.cacheLookup(S.victim_key).?;
+    try std.testing.expect(victim.change_subscribers.count() == 1);
+
+    victim.destroy(true);
+
+    try std.testing.expectEqual(@as(usize, 1), S.payload_deinits);
+    // Both the victim and the whole bystander chain are gone, and the nested
+    // cascade left the shared scratch worklist balanced.
+    try std.testing.expectEqual(@as(usize, 0), ctx.cache.count());
+    try std.testing.expectEqual(@as(usize, 0), ctx.cascade_scratch.items.len);
+}
+
+// A cascade reaches a diamond dependent through BOTH of its parents. This is
+// NOT a double-teardown: LIFO pop order always drains the dependent before the
+// parent still holding an edge to it, and the dependent scrubs itself from
+// every remaining parent's subscriber set as it goes. Pinned so the
+// re-entrancy guard is never mistaken for what makes this case safe.
+
+const DiamondCascadeState = struct {
+    var source: u64 = 0;
+
+    fn aFn(_: *Context) anyerror!u64 {
+        return source;
+    }
+    fn bFn(c: *Context) anyerror!u64 {
+        return (try slot(u64, c, aFn, null)).* + 1;
+    }
+    fn cFn(c: *Context) anyerror!u64 {
+        return (try slot(u64, c, aFn, null)).* + 2;
+    }
+    fn dFn(c: *Context) anyerror!u64 {
+        return (try slot(u64, c, bFn, null)).* + (try slot(u64, c, cFn, null)).*;
+    }
+};
+
+test "lazily/slot: cascade tears a diamond dependent down exactly once" {
+    const S = DiamondCascadeState;
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    S.source = 10;
+    _ = try slot(u64, ctx, S.dFn, null);
+
+    const a = ctx.cacheLookup(valueFnCacheKey(S.aFn)).?;
+    // A -> {B, C} -> D. Tearing A down reaches D through both B and C.
+    a.destroy(true);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.cache.count());
+}
