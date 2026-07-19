@@ -613,9 +613,9 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
             while (true) : (i = (i + 1) & mask) {
                 const e = ix.entries[@intCast(i)];
                 if (e == idx_empty) {
-                    const at = first_tomb orelse i;
+                    const write_at = first_tomb orelse i;
                     if (first_tomb != null) ix.tombs -= 1;
-                    ix.entries[@intCast(at)] = @intCast(pos + 2);
+                    ix.entries[@intCast(write_at)] = @intCast(pos + 2);
                     return;
                 }
                 if (e == idx_tomb and first_tomb == null) first_tomb = i;
@@ -643,6 +643,13 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
                 ix.on = false;
             }
 
+            self.indexRebuildInPlace();
+        }
+
+        /// Refill the index from `spill` without touching the allocation.
+        /// Valid whenever the live count only shrank (compaction), since the
+        /// table was sized to >= 2x a count that is now smaller.
+        fn indexRebuildInPlace(self: *Self) void {
             const ix = self.index.?;
             @memset(ix.entries, idx_empty);
             ix.tombs = 0;
@@ -763,10 +770,10 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         pub fn remove(self: *Self, key: K) bool {
             if (self.spill.items.len > 0) {
                 if (self.indexed()) {
-                    const at = self.indexFind(key) orelse return false;
+                    const found = self.indexFind(key) orelse return false;
                     const ix = self.index.?;
-                    const pos: usize = ix.entries[at] - 2;
-                    ix.entries[at] = idx_tomb;
+                    const pos: usize = ix.entries[found] - 2;
+                    ix.entries[found] = idx_tomb;
                     ix.tombs += 1;
                     const last = self.spill.items.len - 1;
                     if (pos != last) {
@@ -802,6 +809,91 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
                 }
             }
             return false;
+        }
+
+        // --- position-stable iteration support (`#lzdartobservercow`) --------
+        //
+        // `remove` is swap-remove, so it relocates the tail entry. A site that
+        // is iterating the set when a callback re-enters `remove` therefore
+        // loses whichever entry was swapped backwards past the cursor — the
+        // observer-list reentrancy bug. `at` + `tombstone` + `compactTombstones`
+        // give such a site position-stable iteration with no snapshot
+        // allocation: entries are overwritten with a caller-chosen sentinel
+        // that iteration skips, and the holes are compacted once the outermost
+        // iteration finishes.
+        //
+        // Contract: while any tombstone is live, the set must be mutated only
+        // via `getOrPut` (append) and `tombstone`. `remove`'s indexed path
+        // repairs the index for the entry it swaps in and would see a sentinel
+        // that is deliberately absent from the index.
+
+        /// Positional read. `i` must be `< count()`.
+        pub fn at(self: *const Self, i: usize) K {
+            if (self.spill.items.len > 0) return self.spill.items[i];
+            return self.buf[i];
+        }
+
+        /// Overwrite `key` with `tomb` in place, preserving every entry's
+        /// position (unlike `remove`). Returns whether `key` was present.
+        /// `tomb` must never be a real member of the set.
+        pub fn tombstone(self: *Self, key: K, tomb: K) bool {
+            if (self.spill.items.len > 0) {
+                if (self.indexed()) {
+                    const found = self.indexFind(key) orelse return false;
+                    const ix = self.index.?;
+                    const pos: usize = ix.entries[found] - 2;
+                    // Drop the key from the index but keep its slot occupied in
+                    // `spill`, so no later entry shifts position.
+                    ix.entries[found] = idx_tomb;
+                    ix.tombs += 1;
+                    self.spill.items[pos] = tomb;
+                    return true;
+                }
+                for (self.spill.items) |*e| {
+                    if (std.meta.eql(e.*, key)) {
+                        e.* = tomb;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            for (self.buf[0..self.len]) |*e| {
+                if (std.meta.eql(e.*, key)) {
+                    e.* = tomb;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// Drop every `tomb` entry, keeping the survivors in order. Allocation-
+        /// free: the index only ever shrinks here, so it is refilled into its
+        /// existing table.
+        pub fn compactTombstones(self: *Self, tomb: K) void {
+            if (self.spill.items.len > 0) {
+                var write: usize = 0;
+                for (self.spill.items) |e| {
+                    if (std.meta.eql(e, tomb)) continue;
+                    self.spill.items[write] = e;
+                    write += 1;
+                }
+                if (write == self.spill.items.len) return;
+                self.spill.shrinkRetainingCapacity(write);
+                if (self.indexed()) {
+                    // An emptied spill reverts the set to the inline path, so
+                    // the index must go with it (same rule as `remove`).
+                    if (write == 0) self.indexDeactivate() else self.indexRebuildInPlace();
+                }
+                return;
+            }
+            var write: usize = 0;
+            var i: usize = 0;
+            while (i < self.len) : (i += 1) {
+                if (std.meta.eql(self.buf[i], tomb)) continue;
+                self.buf[write] = self.buf[i];
+                write += 1;
+            }
+            self.len = write;
         }
 
         pub fn clearRetainingCapacity(self: *Self) void {
