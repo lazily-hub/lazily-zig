@@ -410,6 +410,35 @@ pub fn build(b: *std.Build) void {
     const run_bench_scale = b.addRunArtifact(bench_scale_exe);
     bench_scale_step.dependOn(&run_bench_scale.step);
 
+    // --- fan-out width ladder load test (`zig build load-fanout`) ---
+    // #lzspecedgeindex — manual/on-demand ONLY (never in `zig build test`).
+    // Width, not node count, is the swept axis. See src/benches/fanout_load.zig.
+    const load_fanout_step = b.step(
+        "load-fanout",
+        "Run the fan-out width ladder load test (LAZILY_FANOUT_MAX / LAZILY_FANOUT_FLOOR_MB)",
+    );
+    const load_fanout_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = link_libc,
+    });
+    load_fanout_mod.addOptions("build_options", build_options);
+    const load_fanout_exe = b.addExecutable(.{
+        .name = "lazily-load-fanout",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benches/fanout_load.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lazily", .module = load_fanout_mod },
+            },
+            .link_libc = link_libc,
+        }),
+    });
+    const run_load_fanout = b.addRunArtifact(load_fanout_exe);
+    load_fanout_step.dependOn(&run_load_fanout.step);
+
     // --- thread-safe contention benchmark (`zig build bench-contention`) ---
     // #lzcontentionbench — N-writer throughput on a shared cell. Mirrors
     // lazily-cpp `ts_contention_for`. Measures the graph mutex under load:

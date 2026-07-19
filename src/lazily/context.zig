@@ -493,11 +493,176 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         /// edge set with no behavioral change.
         spill: std.ArrayList(K) = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(K).empty,
 
+        /// Wide-fanout hash index (`#lzspecedgeindex`), or null while the set
+        /// has never been wide. A single nullable pointer, not inline fields:
+        /// every `Slot` carries two edge sets, so inlining the table header
+        /// would add 48 bytes to a ~256-byte `Slot` that is almost never wide
+        /// (`#lzzigslotpack`). Only nodes that actually cross
+        /// `promote_threshold` pay for the header.
+        index: ?*Index = null,
+
+        // --- wide-fanout hash index (`#lzspecedgeindex`) ---------------------
+        //
+        // The linear dedup scan above is O(degree) per registration, so building
+        // a width-N fan-out is N^2/2 comparisons and `remove` — which runs
+        // per-edge during cascade — is another O(degree) scan. Above a measured
+        // threshold the spill switches to an open-addressed hash index over
+        // `spill`, making both amortized O(1) in degree.
+        //
+        // Threshold justification (measured on this machine, zig master
+        // 0.17.0-dev, ReleaseFast, median of 9, picoseconds/op — see the
+        // `#lzspecedgeindex` crossover microbenchmark):
+        //
+        //     n     build scan / index      remove scan / index
+        //     32      2299 /  4327 (0.53)     2080 /  2190 (0.95)
+        //     48      3473 /  5505 (0.63)     3118 /  1978 (1.58)
+        //     64      5624 /  4567 (1.23)     3849 /  1937 (1.99)
+        //     96     12205 /  6114 (2.00)     5446 /  1832 (2.97)
+        //    256     31518 /  5437 (5.80)    16886 /  1908 (8.85)
+        //   1024    107739 /  5784 (18.6)    57468 /  1859 (30.9)
+        //
+        // Registration crosses over near degree 56-64; `remove` crosses over
+        // near degree 24-32. 64 is the conservative choice: it is at (not past)
+        // the registration crossover, so promotion never makes registration
+        // slower than the scan it replaces, while `remove` is already ~2x
+        // better there. The number is NOT portable — lazily-rs measured ~170
+        // with SipHash and ~40 with a multiply-shift finalizer. This is Zig's
+        // own measurement with the `mixKey` finalizer below; changing the hash
+        // invalidates it. Results were within noise for pointer strides of 256
+        // and 1024 bytes, so the finalizer is not sensitive to slot alignment.
+        pub const promote_threshold: usize = 64;
+
+        /// Whether `K` can be hashed cheaply (pointer or integer). Non-indexable
+        /// key types keep the pure-scan behaviour.
+        const indexable = switch (@typeInfo(K)) {
+            .pointer, .int => true,
+            else => false,
+        };
+
+        const idx_empty: u32 = 0;
+        const idx_tomb: u32 = 1;
+
+        /// Open-addressed table of `pos + 2` into `spill` (`0` = empty,
+        /// `1` = tombstone). `entries.len` is always a power of two.
+        /// `on` is the "currently indexed" discriminator and is separate from
+        /// the allocation: `clearRetainingCapacity` turns the index *off* but
+        /// keeps the table, so a cleared wide node re-promotes without
+        /// reallocating.
+        const Index = struct {
+            entries: []u32,
+            tombs: u32 = 0,
+            on: bool = false,
+        };
+
+        inline fn mixKey(key: K) u64 {
+            var x: u64 = switch (@typeInfo(K)) {
+                .pointer => @intFromPtr(key),
+                .int => @intCast(key),
+                else => unreachable,
+            };
+            // Multiply-shift finalizer (fmix64). Slot pointers stride by a fixed
+            // `@sizeOf(Slot)`, i.e. the low bits are near-constant, so the
+            // finalizer — not the raw value — is what keeps probe chains short.
+            // The measured threshold above is specific to this function.
+            x ^= x >> 33;
+            x *%= 0xff51afd7ed558ccd;
+            x ^= x >> 33;
+            x *%= 0xc4ceb9fe1a85ec53;
+            x ^= x >> 33;
+            return x;
+        }
+
+        inline fn indexed(self: *const Self) bool {
+            if (!indexable) return false;
+            return if (self.index) |ix| ix.on else false;
+        }
+
+        /// Table position holding `key`, or null. Requires `indexed()`.
+        fn indexFind(self: *Self, key: K) ?usize {
+            const ix = self.index.?;
+            const mask: u64 = @as(u64, ix.entries.len) - 1;
+            var i: u64 = mixKey(key) & mask;
+            while (true) : (i = (i + 1) & mask) {
+                const e = ix.entries[@intCast(i)];
+                if (e == idx_empty) return null;
+                if (e == idx_tomb) continue;
+                if (std.meta.eql(self.spill.items[e - 2], key)) return @intCast(i);
+            }
+        }
+
+        /// Record `key` at `pos`. Requires `indexed()` and spare capacity.
+        fn indexPut(self: *Self, key: K, pos: usize) void {
+            const ix = self.index.?;
+            const mask: u64 = @as(u64, ix.entries.len) - 1;
+            var i: u64 = mixKey(key) & mask;
+            var first_tomb: ?u64 = null;
+            while (true) : (i = (i + 1) & mask) {
+                const e = ix.entries[@intCast(i)];
+                if (e == idx_empty) {
+                    const at = first_tomb orelse i;
+                    if (first_tomb != null) ix.tombs -= 1;
+                    ix.entries[@intCast(at)] = @intCast(pos + 2);
+                    return;
+                }
+                if (e == idx_tomb and first_tomb == null) first_tomb = i;
+            }
+        }
+
+        /// (Re)build the index from `spill`, sizing the table to >= 2x the live
+        /// count. Also the promotion path.
+        fn indexRebuild(self: *Self, allocator: std.mem.Allocator) !void {
+            var want: usize = 16;
+            while (want < self.spill.items.len * 2) want *= 2;
+
+            if (self.index == null) {
+                const ix = try allocator.create(Index);
+                ix.* = .{ .entries = allocator.alloc(u32, want) catch |e| {
+                    allocator.destroy(ix);
+                    return e;
+                } };
+                self.index = ix;
+            } else if (want > self.index.?.entries.len) {
+                const ix = self.index.?;
+                const grown = try allocator.alloc(u32, want);
+                allocator.free(ix.entries);
+                ix.entries = grown;
+                ix.on = false;
+            }
+
+            const ix = self.index.?;
+            @memset(ix.entries, idx_empty);
+            ix.tombs = 0;
+            ix.on = true;
+            for (self.spill.items, 0..) |k, p| self.indexPut(k, p);
+        }
+
+        /// Turn the index off, retaining its allocation. Called whenever the
+        /// backing list is cleared or drained: the arena recycles `Slot`s, and a
+        /// recycled owner must never inherit a stale index
+        /// (`#lzspecedgeindex`). The retained table is safe because
+        /// `indexRebuild` always `@memset`s before refilling.
+        inline fn indexDeactivate(self: *Self) void {
+            if (self.index) |ix| {
+                ix.on = false;
+                ix.tombs = 0;
+            }
+        }
+
+        /// Free the index (teardown only).
+        fn indexFree(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.index) |ix| {
+                allocator.free(ix.entries);
+                allocator.destroy(ix);
+                self.index = null;
+            }
+        }
+
         pub fn init() Self {
             return .{};
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.indexFree(allocator);
             self.spill.deinit(allocator);
             self.* = undefined;
         }
@@ -512,10 +677,33 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         /// spill and its amortized growth.
         pub fn getOrPut(self: *Self, key: K, allocator: std.mem.Allocator) !void {
             if (self.spill.items.len > 0) {
+                if (self.indexed()) {
+                    if (self.indexFind(key) != null) return; // already present
+                    try self.spill.append(allocator, key);
+                    // Keep the table under a 3/4 load (live + tombstones) so
+                    // probe chains stay short and `indexFind` always terminates.
+                    const ix = self.index.?;
+                    if ((self.spill.items.len + ix.tombs) * 4 >= ix.entries.len * 3) {
+                        try self.indexRebuild(allocator);
+                    } else {
+                        self.indexPut(key, self.spill.items.len - 1);
+                    }
+                    return;
+                }
                 for (self.spill.items) |e| {
                     if (std.meta.eql(e, key)) return; // already present
                 }
                 try self.spill.append(allocator, key);
+                // Promote once the scan stops paying for itself. There is no
+                // demotion: the index is dropped only when the list is cleared
+                // or the owner torn down. A shared promote/demote boundary makes
+                // a list oscillating by one rebuild its index on every
+                // recompute (~4x steady-state cost at exactly threshold+1), and
+                // the spec's other option — demote well below promote — buys
+                // nothing here because the cascade clears these sets wholesale.
+                if (indexable and self.spill.items.len >= promote_threshold) {
+                    try self.indexRebuild(allocator);
+                }
                 return;
             }
             for (self.buf[0..self.len]) |e| {
@@ -542,6 +730,9 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         /// Key-identity only (never dereferences `key`).
         pub fn contains(self: *const Self, key: K) bool {
             if (self.spill.items.len > 0) {
+                if (self.indexed()) {
+                    return @constCast(self).indexFind(key) != null;
+                }
                 for (self.spill.items) |e| {
                     if (std.meta.eql(e, key)) return true;
                 }
@@ -557,6 +748,28 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         /// swap-remove (set is unordered; all iteration sites snapshot first).
         pub fn remove(self: *Self, key: K) bool {
             if (self.spill.items.len > 0) {
+                if (self.indexed()) {
+                    const at = self.indexFind(key) orelse return false;
+                    const ix = self.index.?;
+                    const pos: usize = ix.entries[at] - 2;
+                    ix.entries[at] = idx_tomb;
+                    ix.tombs += 1;
+                    const last = self.spill.items.len - 1;
+                    if (pos != last) {
+                        // Swap-remove moves the tail entry; repoint its slot.
+                        const moved = self.spill.items[last];
+                        self.spill.items[pos] = moved;
+                        const moved_at = self.indexFind(moved).?;
+                        ix.entries[moved_at] = @intCast(pos + 2);
+                    }
+                    _ = self.spill.pop();
+                    // Draining the spill reverts the set to the inline path
+                    // (`spill.items.len > 0` is the spilled discriminator), so
+                    // the index must go with it — otherwise the next
+                    // `contains`/`remove` reads a stale table over inline keys.
+                    if (self.spill.items.len == 0) self.indexDeactivate();
+                    return true;
+                }
                 for (self.spill.items, 0..) |e, i| {
                     if (std.meta.eql(e, key)) {
                         self.spill.items[i] = self.spill.items[self.spill.items.len - 1];
@@ -580,6 +793,8 @@ pub fn EdgeSet(comptime K: type, comptime cap: usize) type {
         pub fn clearRetainingCapacity(self: *Self) void {
             self.spill.clearRetainingCapacity();
             self.len = 0;
+            // A recycled owner must not inherit an index (`#lzspecedgeindex`).
+            self.indexDeactivate();
         }
 
         /// Iterator matching `AutoHashMap.keyIterator()`: `next()` yields
@@ -1568,3 +1783,181 @@ test "lazily/context.SlotEdgeSet: inline swap-remove keeps remaining keys, no sp
     try std.testing.expect(set.spill.items.len == 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// Wide-fanout hash index (`#lzspecedgeindex`).
+//
+// The pre-existing SlotEdgeSet tests top out at `inline_cap + 1` = 3 entries,
+// so they never reach `promote_threshold`. These exercise the promoted path:
+// promotion boundary, dedup/remove/contains equivalence with the scan, the
+// swap-remove reindex, tombstone reclamation, clear-drops-the-index (recycled
+// owners), and the threshold+-1 oscillation that thrashes a naive
+// promote/demote pair.
+// ---------------------------------------------------------------------------
+
+test "lazily/context.SlotEdgeSet index: promotes exactly at the threshold" {
+    const a = std.testing.allocator;
+    var set = SlotEdgeSet.init();
+    defer set.deinit(a);
+
+    var i: usize = 0;
+    while (i < SlotEdgeSet.promote_threshold - 1) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+    try std.testing.expect(!set.indexed());
+    try std.testing.expectEqual(SlotEdgeSet.promote_threshold - 1, set.count());
+
+    try set.getOrPut(fakeSlot(SlotEdgeSet.promote_threshold - 1), a);
+    try std.testing.expect(set.indexed());
+    try std.testing.expectEqual(SlotEdgeSet.promote_threshold, set.count());
+}
+
+test "lazily/context.SlotEdgeSet index: dedup, contains, remove match the scan" {
+    const a = std.testing.allocator;
+    const n = SlotEdgeSet.promote_threshold * 8;
+
+    var set = SlotEdgeSet.init();
+    defer set.deinit(a);
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+    try std.testing.expect(set.indexed());
+    try std.testing.expectEqual(n, set.count());
+
+    // Every key present; a key never inserted is absent.
+    i = 0;
+    while (i < n) : (i += 1) try std.testing.expect(set.contains(fakeSlot(i)));
+    try std.testing.expect(!set.contains(fakeSlot(n + 1)));
+
+    // Re-adding every key is a no-op (dedup through the index).
+    i = 0;
+    while (i < n) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+    try std.testing.expectEqual(n, set.count());
+
+    // Remove every *odd* key. The swap-remove has to repoint the moved tail
+    // entry or the survivors go missing.
+    i = 1;
+    while (i < n) : (i += 2) try std.testing.expect(set.remove(fakeSlot(i)));
+    try std.testing.expectEqual(n / 2, set.count());
+    try std.testing.expect(!set.remove(fakeSlot(1)));
+
+    i = 0;
+    while (i < n) : (i += 1) {
+        const want_present = (i % 2 == 0);
+        try std.testing.expectEqual(want_present, set.contains(fakeSlot(i)));
+    }
+
+    // Iteration still yields exactly the survivors, once each.
+    var seen: usize = 0;
+    var it = set.keyIterator();
+    while (it.next()) |ptr| {
+        try std.testing.expect(set.contains(ptr.*));
+        seen += 1;
+    }
+    try std.testing.expectEqual(n / 2, seen);
+}
+
+test "lazily/context.SlotEdgeSet index: tombstones are reclaimed under churn" {
+    const a = std.testing.allocator;
+    const n = SlotEdgeSet.promote_threshold * 2;
+
+    var set = SlotEdgeSet.init();
+    defer set.deinit(a);
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+
+    // Remove-then-reinsert the whole set many times. Without tombstone
+    // reclamation the table saturates and `indexFind` never terminates.
+    var round: usize = 0;
+    while (round < 50) : (round += 1) {
+        i = 0;
+        while (i < n) : (i += 1) try std.testing.expect(set.remove(fakeSlot(i)));
+        try std.testing.expectEqual(@as(usize, 0), set.count());
+        i = 0;
+        while (i < n) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+        try std.testing.expectEqual(n, set.count());
+    }
+    i = 0;
+    while (i < n) : (i += 1) try std.testing.expect(set.contains(fakeSlot(i)));
+}
+
+test "lazily/context.SlotEdgeSet index: clear drops the index (recycled owner)" {
+    const a = std.testing.allocator;
+    var set = SlotEdgeSet.init();
+    defer set.deinit(a);
+
+    var i: usize = 0;
+    while (i < SlotEdgeSet.promote_threshold) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+    try std.testing.expect(set.indexed());
+
+    set.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), set.count());
+    try std.testing.expect(!set.indexed());
+    // The allocation is retained, but the *contents* must not be trusted: a
+    // recycled owner refilling with unrelated keys must not see the old ones.
+    try std.testing.expect(set.index != null and set.index.?.entries.len > 0);
+
+    try set.getOrPut(fakeSlot(9999), a);
+    try std.testing.expectEqual(@as(usize, 1), set.count());
+    try std.testing.expect(set.contains(fakeSlot(9999)));
+    i = 0;
+    while (i < SlotEdgeSet.promote_threshold) : (i += 1) {
+        try std.testing.expect(!set.contains(fakeSlot(i)));
+    }
+
+    // Refilling past the threshold re-promotes without reallocating.
+    i = 0;
+    while (i < SlotEdgeSet.promote_threshold) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+    try std.testing.expect(set.indexed());
+    i = 0;
+    while (i < SlotEdgeSet.promote_threshold) : (i += 1) try std.testing.expect(set.contains(fakeSlot(i)));
+}
+
+test "lazily/context.SlotEdgeSet index: oscillating across the threshold is stable" {
+    // A dependent list that gains and loses one edge per recompute sits exactly
+    // on the promote boundary. With no demotion this must stay indexed and
+    // must not rebuild; correctness is asserted either way.
+    const a = std.testing.allocator;
+    const t = SlotEdgeSet.promote_threshold;
+
+    var set = SlotEdgeSet.init();
+    defer set.deinit(a);
+
+    var i: usize = 0;
+    while (i < t) : (i += 1) try set.getOrPut(fakeSlot(i), a);
+    try std.testing.expect(set.indexed());
+    const cap_after_promote = set.index.?.entries.len;
+
+    var round: usize = 0;
+    while (round < 1000) : (round += 1) {
+        try std.testing.expect(set.remove(fakeSlot(t - 1)));
+        try std.testing.expectEqual(t - 1, set.count());
+        try std.testing.expect(set.indexed()); // no demotion => no thrash
+        try set.getOrPut(fakeSlot(t - 1), a);
+        try std.testing.expectEqual(t, set.count());
+    }
+    // Table never had to grow: the oscillation is not leaking tombstones.
+    try std.testing.expectEqual(cap_after_promote, set.index.?.entries.len);
+    i = 0;
+    while (i < t) : (i += 1) try std.testing.expect(set.contains(fakeSlot(i)));
+}
+
+test "lazily/context: SubscriberEdgeSet-shaped usize keys index correctly" {
+    // `cell.zig` uses `EdgeSet(usize, 1)`. Integer keys take the same index
+    // path as pointers; the inline_cap=1 small-vector path must be unaffected.
+    const a = std.testing.allocator;
+    const S = EdgeSet(usize, 1);
+    var set = S.init();
+    defer set.deinit(a);
+
+    try set.getOrPut(7, a);
+    try std.testing.expectEqual(@as(usize, 1), set.count());
+    try std.testing.expect(set.spill.items.len == 0); // still inline
+    try std.testing.expect(!set.indexed());
+
+    var i: usize = 0;
+    while (i < S.promote_threshold * 4) : (i += 1) try set.getOrPut(i * 3 + 100, a);
+    try std.testing.expect(set.indexed());
+    i = 0;
+    while (i < S.promote_threshold * 4) : (i += 1) try std.testing.expect(set.contains(i * 3 + 100));
+    try std.testing.expect(set.contains(7));
+}
