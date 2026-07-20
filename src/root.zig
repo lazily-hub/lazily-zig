@@ -64,6 +64,14 @@ pub const build_options = @import("build_options");
 pub const signalKeyed = @import("./lazily/signal.zig").signalKeyed;
 pub const Effect = @import("./lazily/effect.zig").Effect;
 pub const effect = @import("./lazily/effect.zig").effect;
+pub const effectKeyed = @import("./lazily/effect.zig").effectKeyed;
+pub const EffectBodyFn = @import("./lazily/effect.zig").EffectBodyFn;
+pub const cellKeyed = @import("./lazily/cell.zig").cellKeyed;
+pub const TeardownScope = @import("./lazily/context.zig").Context.TeardownScope;
+pub const NodeHandle = @import("./lazily/context.zig").Context.NodeHandle;
+// Disposal semantics 2 and 3, asserted directly so they hold in a bare clone
+// without the lazily-spec sibling checkout (`#lzspecedgeindex`).
+pub const disposal_test = @import("./lazily/disposal_test.zig");
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;

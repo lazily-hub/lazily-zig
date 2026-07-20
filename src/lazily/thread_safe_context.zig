@@ -101,6 +101,32 @@ pub const ThreadSafeContext = struct {
         edges_incomplete: bool = false,
         deps: std.ArrayList(u64), // nodes this reads
         dependents: std.ArrayList(u64), // nodes that read this
+        /// Graph-disposal tombstone (`#lzspecedgeindex`). The node stays in
+        /// `nodes` so a read through a handle can report "torn down" rather
+        /// than tripping the `.?` on a missing entry.
+        disposed: bool = false,
+        /// A side effect rather than a value. Load-bearing at teardown: an
+        /// effect reached by the disposal walk must be neither run nor queued.
+        is_effect: bool = false,
+        effect_ran: bool = false,
+        cleanup_ptr: ?*anyopaque = null,
+        cleanup_fn: ?*const fn (*anyopaque) void = null,
+        /// Visited stamp for the teardown walk; an epoch so it never needs
+        /// resetting (teardown gets no second pass).
+        teardown_mark: u64 = 0,
+        /// This node is in the dependent cone of something that was disposed,
+        /// so its next read is an error
+        /// (`read_after_dispose_is_an_error.json`).
+        ///
+        /// The flag is needed because disposal *detaches* the edge: afterwards a
+        /// live reader no longer names its disposed dependency anywhere, and
+        /// this context's `ComputeFn(T)` returns a plain `T` with no error
+        /// channel a recompute could report through. So the cone is stamped at
+        /// teardown time, while the edges describing it still exist, and
+        /// `tryGet` reports it. Never cleared: a reader that named a disposed
+        /// node cannot un-name it, matching the permanent tombstones the other
+        /// two contexts keep.
+        reads_disposed: bool = false,
     };
 
     allocator: std.mem.Allocator,
@@ -116,6 +142,24 @@ pub const ThreadSafeContext = struct {
     /// and fell back to marking every computed node dirty. Non-zero means the
     /// graph was conservatively over-invalidated. Mirrors `Context.cascade_oom_fallbacks`.
     invalidate_oom_fallbacks: u64 = 0,
+    /// Every effect node, in creation order. This context is lazy-on-read —
+    /// `setCell` only marks `dirty` — so without an explicit eager list nothing
+    /// would ever observe a publish, and `observed_by` would be vacuous.
+    effects: std.ArrayList(u64) = .empty,
+    /// Effects reached by the *current publish*, awaiting their flush.
+    ///
+    /// Scoping the flush to this list rather than sweeping every dirty effect is
+    /// load-bearing (`disposal_does_not_run_surviving_effects.json`). Disposal
+    /// also marks its surviving cone dirty, and a sweep would then run those
+    /// effects at the next unrelated publish — a spurious rerun the caller never
+    /// triggered, which is precisely the deferred-flush failure shape that
+    /// fixture's final step exists to catch. Only `invalidateDependentsUnlocked`
+    /// fills this; the teardown walk deliberately does not.
+    pending_effects: std.ArrayList(u64) = .empty,
+    /// Worklist for the teardown walk, pre-grown to the live node count so the
+    /// walk cannot allocate. See `reserveTeardown`.
+    teardown_scratch: std.ArrayList(u64) = .empty,
+    teardown_epoch: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -135,6 +179,18 @@ pub const ThreadSafeContext = struct {
             node.dependents.deinit(self.allocator);
         }
         self.nodes.deinit();
+        self.effects.deinit(self.allocator);
+        self.pending_effects.deinit(self.allocator);
+        self.teardown_scratch.deinit(self.allocator);
+    }
+
+    /// Pay for teardown up front (`#lzspecedgeindex`). Called on every node
+    /// creation so that disposal — which runs from a `defer` with nowhere to
+    /// report failure — walks pre-grown storage and cannot fail. The bound is
+    /// the live node count: the epoch stamp visits each node at most once.
+    fn reserveTeardown(self: *Self) !void {
+        try self.teardown_scratch.ensureTotalCapacity(self.allocator, self.nodes.count());
+        try self.pending_effects.ensureTotalCapacity(self.allocator, self.nodes.count());
     }
 
     // --- type-erased box helpers (monomorphic per T) ---
@@ -174,6 +230,7 @@ pub const ThreadSafeContext = struct {
             .deps = .empty,
             .dependents = .empty,
         });
+        try self.reserveTeardown();
         return .{ .id = id };
     }
 
@@ -191,7 +248,7 @@ pub const ThreadSafeContext = struct {
 
     fn getUnlocked(self: *Self, comptime T: type, id: u64) T {
         const node = self.nodes.getPtr(id).?;
-        if (node.dirty) {
+        if (node.dirty and !node.disposed) {
             if (node.recompute_fn) |rf| rf(self, id);
         }
         return readBox(T, self.nodes.getPtr(id).?.box);
@@ -207,6 +264,8 @@ pub const ThreadSafeContext = struct {
         const p: *T = @ptrCast(@alignCast(node.box));
         p.* = value;
         self.invalidateDependentsUnlocked(handle.id);
+        // A publish, unlike a teardown, does run the effects it reaches.
+        self.flushEffectsUnlocked();
     }
 
     // --- computed slots ---
@@ -235,8 +294,56 @@ pub const ThreadSafeContext = struct {
             .deps = .empty,
             .dependents = .empty,
         });
+        try self.reserveTeardown();
         Recompute(T).run(self, id);
         return .{ .id = id };
+    }
+
+    /// A side effect rather than a value: a computed slot flagged so the
+    /// teardown walk never runs it, registered in `effects` so it observes a
+    /// publish even though this context is otherwise lazy-on-read.
+    pub fn effectClosure(
+        self: *Self,
+        comptime T: type,
+        ptr: *anyopaque,
+        compute: ComputeFn(T),
+        cleanup_ptr: ?*anyopaque,
+        cleanup_fn: ?*const fn (*anyopaque) void,
+    ) !TsHandle(T) {
+        const handle = try self.computedClosure(T, ptr, compute);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.nodes.getPtr(handle.id).?;
+        n.is_effect = true;
+        n.effect_ran = true;
+        n.cleanup_ptr = cleanup_ptr;
+        n.cleanup_fn = cleanup_fn;
+        try self.effects.append(self.allocator, handle.id);
+        return handle;
+    }
+
+    /// Run every dirty effect. Called after a publish, because this context has
+    /// no scheduler of its own; disposal deliberately does NOT call it.
+    pub fn flushEffects(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.flushEffectsUnlocked();
+    }
+
+    fn flushEffectsUnlocked(self: *Self) void {
+        // Index-based: an effect body may create nodes and enqueue more.
+        var i: usize = 0;
+        while (i < self.pending_effects.items.len) : (i += 1) {
+            const id = self.pending_effects.items[i];
+            const n = self.nodes.getPtr(id) orelse continue;
+            if (n.disposed or !n.dirty) continue;
+            if (n.effect_ran) {
+                if (n.cleanup_fn) |cf| cf(n.cleanup_ptr.?);
+            }
+            n.effect_ran = true;
+            if (n.recompute_fn) |rf| rf(self, id);
+        }
+        self.pending_effects.clearRetainingCapacity();
     }
 
     /// A derived slot from a **pure** compute (no captured state).
@@ -289,6 +396,13 @@ pub const ThreadSafeContext = struct {
     fn addEdgeUnlocked(self: *Self, slot_id: u64, dep_id: u64) !void {
         if (slot_id == dep_id) return; // a self-read is not an edge
         const slot = self.nodes.getPtr(slot_id) orelse return;
+        // Never rebuild an edge onto or out of a disposed node: a recompute
+        // racing a teardown would otherwise resurrect the edge the disposal
+        // just removed (`#lzspecedgeindex`).
+        if (slot.disposed) return;
+        if (self.nodes.getPtr(dep_id)) |d| {
+            if (d.disposed) return;
+        }
         for (slot.deps.items) |d| {
             if (d == dep_id) return;
         }
@@ -337,10 +451,167 @@ pub const ThreadSafeContext = struct {
             const dep = self.nodes.getPtr(dep_slot) orelse continue;
             if (!dep.dirty) {
                 dep.dirty = true;
+                if (dep.is_effect and self.pending_effects.capacity > self.pending_effects.items.len) {
+                    self.pending_effects.appendAssumeCapacity(dep_slot);
+                }
                 self.invalidateDependentsUnlocked(dep_slot);
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Graph disposal, degree introspection, teardown scopes (`#lzspecedgeindex`)
+    // -----------------------------------------------------------------------
+
+    /// Nodes that read this one. A count, never the collection: handing out
+    /// `dependents` would hand out the graph's own bookkeeping.
+    pub fn dependentCount(self: *Self, id: u64) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.nodes.getPtr(id) orelse return 0;
+        return n.dependents.items.len;
+    }
+
+    /// Nodes this one reads. See `dependentCount`.
+    pub fn dependencyCount(self: *Self, id: u64) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.nodes.getPtr(id) orelse return 0;
+        return n.deps.items.len;
+    }
+
+    pub fn isDisposed(self: *Self, id: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.nodes.getPtr(id) orelse return false;
+        return n.disposed;
+    }
+
+    /// The checked read. `get` returns the boxed value with no liveness check,
+    /// which is what makes it the fast path; `tryGet` is the boundary form and
+    /// reports a disposed node as an error rather than as a stale value.
+    pub fn tryGet(self: *Self, comptime T: type, handle: TsHandle(T)) error{NodeDisposed}!T {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.nodes.getPtr(handle.id) orelse return error.NodeDisposed;
+        if (n.disposed or n.reads_disposed) return error.NodeDisposed;
+        return self.getUnlocked(T, handle.id);
+    }
+
+    /// Mark the surviving dependent cone dirty without running a single effect.
+    ///
+    /// This context's cascade does not consume edges — `invalidateDependentsUnlocked`
+    /// only sets `dirty` — so an effect skipped here keeps everything it had and
+    /// is reached normally by the next publish. What must not happen is the
+    /// *run*: an effect body executed mid-teardown reads back through the node
+    /// being disposed.
+    ///
+    /// Allocation-free: `teardown_scratch` was grown to the live node count at
+    /// every creation, and `teardown_mark` dedupes.
+    fn dirtyDependentConeForTeardownUnlocked(self: *Self, root: u64) void {
+        self.teardown_epoch += 1;
+        const epoch = self.teardown_epoch;
+        self.teardown_scratch.clearRetainingCapacity();
+        self.pushTeardownDependents(root, epoch);
+        while (self.teardown_scratch.pop()) |id| {
+            self.pushTeardownDependents(id, epoch);
+        }
+    }
+
+    fn pushTeardownDependents(self: *Self, id: u64, epoch: u64) void {
+        const node = self.nodes.getPtr(id) orelse return;
+        var i: usize = 0;
+        while (i < node.dependents.items.len) : (i += 1) {
+            const dep_id = node.dependents.items[i];
+            const dep = self.nodes.getPtr(dep_id) orelse continue;
+            if (dep.disposed or dep.teardown_mark == epoch) continue;
+            dep.teardown_mark = epoch;
+            dep.reads_disposed = true;
+            // An effect is marked dirty but never flushed here: `dirty` is this
+            // context's pull flag, not a queue, so marking it costs nothing and
+            // the next `flushEffects` (i.e. the next real publish) runs it.
+            dep.dirty = true;
+            std.debug.assert(self.teardown_scratch.capacity > self.teardown_scratch.items.len);
+            self.teardown_scratch.appendAssumeCapacity(dep_id);
+        }
+    }
+
+    /// Tear one node out of the graph. Idempotent, allocation-free, infallible.
+    pub fn disposeNode(self: *Self, id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.disposeNodeUnlocked(id);
+    }
+
+    fn disposeNodeUnlocked(self: *Self, id: u64) void {
+        const node = self.nodes.getPtr(id) orelse return;
+        if (node.disposed) return; // idempotent
+
+        // Dirty the cone while the edges describing it still exist.
+        self.dirtyDependentConeForTeardownUnlocked(id);
+
+        const n = self.nodes.getPtr(id).?;
+        if (n.is_effect and n.effect_ran) {
+            if (n.cleanup_fn) |cf| cf(n.cleanup_ptr.?);
+        }
+
+        // Detach both directions.
+        self.clearDepsUnlocked(id);
+        const me = self.nodes.getPtr(id).?;
+        while (me.dependents.items.len > 0) {
+            const dependent_id = me.dependents.items[me.dependents.items.len - 1];
+            if (self.nodes.getPtr(dependent_id)) |d| {
+                var j: usize = 0;
+                while (j < d.deps.items.len) {
+                    if (d.deps.items[j] == id) _ = d.deps.swapRemove(j) else j += 1;
+                }
+            }
+            _ = self.nodes.getPtr(id).?.dependents.pop();
+        }
+
+        const final = self.nodes.getPtr(id).?;
+        final.disposed = true;
+        final.cleanup_fn = null;
+        final.recompute_fn = null;
+        final.dirty = false;
+    }
+
+    pub fn scope(self: *Self) TeardownScope {
+        return .{ .ctx = self, .owned = .empty };
+    }
+
+    /// See `Context.TeardownScope`. `own` allocates; `deinit` cannot fail.
+    pub const TeardownScope = struct {
+        ctx: *Self,
+        owned: std.ArrayList(u64),
+        armed: bool = true,
+
+        pub fn own(self: *TeardownScope, id: u64) !void {
+            if (!self.armed) return;
+            try self.owned.append(self.ctx.allocator, id);
+        }
+
+        pub fn len(self: *const TeardownScope) usize {
+            return self.owned.items.len;
+        }
+
+        pub fn disarm(self: *TeardownScope) void {
+            self.armed = false;
+            self.owned.clearRetainingCapacity();
+        }
+
+        pub fn deinit(self: *TeardownScope) void {
+            if (self.armed) {
+                var i = self.owned.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    self.ctx.disposeNode(self.owned.items[i]);
+                }
+            }
+            self.owned.deinit(self.ctx.allocator);
+            self.* = undefined;
+        }
+    };
 
     // --- batch ---
 

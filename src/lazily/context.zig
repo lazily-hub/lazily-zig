@@ -438,6 +438,122 @@ pub const Context = struct {
 
     /// True when inside a `batch(run)` boundary. `Cell.set` checks this to
     /// defer the eager-recompute drain to the outermost batch exit.
+    // -----------------------------------------------------------------------
+    // Graph disposal, degree introspection, teardown scopes (`#lzspecedgeindex`)
+    // -----------------------------------------------------------------------
+
+    /// A copyable handle naming one node in this graph.
+    ///
+    /// The sync `Context` identifies a node by its *cache key*, not by a `*Slot`:
+    /// invalidate-in-place (`#lzinplace`) orphans a stale slot and materializes a
+    /// replacement, so a raw `*Slot` stops naming the node the moment anything it
+    /// reads changes. The cache key survives that, which is what makes it the
+    /// honest handle. Handles are ids, not owners — dropping every copy of one
+    /// reclaims nothing; the reverse edge each dependency holds keeps the node
+    /// and its edge sets alive for the life of the Context, which is precisely
+    /// the leak `churn_returns_to_baseline.json` pins.
+    pub const NodeHandle = struct { key: usize };
+
+    pub const DisposeError = error{NodeDisposed};
+
+    /// Number of nodes that read this one. A count, never the collection: there
+    /// is deliberately no accessor that hands out the edge set, because a caller
+    /// holding it could mutate the graph's own bookkeeping.
+    pub fn dependentCount(self: *Context, h: NodeHandle) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.cacheLookup(h.key) orelse return 0;
+        return s.change_subscribers.count();
+    }
+
+    /// Number of nodes this one reads. See `dependentCount` on why it is a count.
+    pub fn dependencyCount(self: *Context, h: NodeHandle) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.cacheLookup(h.key) orelse return 0;
+        return s.parents.count();
+    }
+
+    pub fn isDisposed(self: *Context, h: NodeHandle) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.cacheLookup(h.key) orelse return false;
+        return s.disposed;
+    }
+
+    /// Tear one node out of the graph. Idempotent, allocation-free, infallible.
+    /// A handle naming a node that was never materialized is a no-op.
+    pub fn disposeNode(self: *Context, h: NodeHandle) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.cacheLookup(h.key) orelse return;
+        s.disposeUnlocked();
+    }
+
+    /// Open a teardown scope. Ends at `defer scope.deinit()` — the idiom that
+    /// already means "this ends when the enclosing block does", and the closest
+    /// thing this binding has to lazily-rs's `Drop`.
+    pub fn scope(self: *Context) TeardownScope {
+        return .{ .ctx = self, .owned = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(NodeHandle).empty };
+    }
+
+    /// A named set of nodes and a moment at which they go away.
+    ///
+    /// A scope introduces no disposal semantics of its own: ending it is
+    /// observationally equal to disposing each member individually, in reverse
+    /// creation order (`scope_teardown_equals_fold_of_disposals.json`, proved as
+    /// `disposeScope_eq_disposeAll` in lazily-formal).
+    ///
+    /// **Teardown cannot fail.** The whole cost of ownership is paid in `own`,
+    /// which is a `!void` the caller can still handle; `deinit` runs from a
+    /// `defer` where there is nowhere to report an error, so it only walks a
+    /// list it already owns and calls a disposal that provably cannot allocate
+    /// (see `Slot.dirtyDependentConeForTeardown`). This is the same class of bug
+    /// as the dropped-cascade-push family fixed earlier in this file: teardown
+    /// that can run out of memory partway leaves a half-dismantled graph and no
+    /// caller able to do anything about it.
+    pub const TeardownScope = struct {
+        ctx: *Context,
+        owned: std.ArrayList(NodeHandle),
+        armed: bool = true,
+
+        /// Take ownership of a node. Reserves here, so `deinit` never allocates.
+        pub fn own(self: *TeardownScope, h: NodeHandle) !void {
+            if (!self.armed) return;
+            try self.owned.append(self.ctx.allocator, h);
+        }
+
+        /// How many nodes this scope will tear down. Zero after `disarm`.
+        pub fn len(self: *const TeardownScope) usize {
+            return self.owned.items.len;
+        }
+
+        /// Cancel this scope's teardown. Does nothing to the nodes: they keep
+        /// their values, their edges and their individual disposability, and
+        /// revert to plain Context ownership — the state every unscoped node is
+        /// already in (`disarm_disposes_nothing.json`).
+        pub fn disarm(self: *TeardownScope) void {
+            self.armed = false;
+            self.owned.clearRetainingCapacity();
+        }
+
+        /// End the scope: dispose every member in reverse creation order, so a
+        /// dependent is always gone before what it reads and the set never
+        /// transiently dangles inside itself. Effect cleanups are side effects,
+        /// which is the only way that ordering is observable.
+        pub fn deinit(self: *TeardownScope) void {
+            if (self.armed) {
+                var i = self.owned.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    self.ctx.disposeNode(self.owned.items[i]);
+                }
+            }
+            self.owned.deinit(self.ctx.allocator);
+            self.* = undefined;
+        }
+    };
+
     pub fn isBatching(self: *const Context) bool {
         return self.batch_depth > 0;
     }
@@ -1062,6 +1178,32 @@ pub const Slot = struct {
     /// afterwards and performs the deferred teardown once `s` is no longer in
     /// use by that frame (`#lzspecedgeindex`).
     destroy_requested: bool = false,
+    /// Graph-disposal tombstone (`#lzspecedgeindex`). Disposal is not the same
+    /// operation as `destroy`: `destroy` reclaims a node whose *value* is no
+    /// longer wanted and lets the next read re-materialize it, whereas
+    /// `disposeUnlocked` removes the node from the graph permanently. The slot
+    /// stays in the cache with `storage == null` precisely so that the next
+    /// `slotKeyed` for its key finds the tombstone and returns
+    /// `error.NodeDisposed` instead of silently minting a replacement — which
+    /// is what `read_after_dispose_is_an_error.json` forbids.
+    disposed: bool = false,
+    /// Intrusive teardown-cascade link (`#lzspecedgeindex`).
+    ///
+    /// The publish cascade uses `Context.cascade_scratch`, an `ArrayList` that
+    /// can fail to grow — every caller therefore carries an OOM degradation
+    /// path. Teardown cannot afford one: a scope's `deinit` runs from a `defer`
+    /// and has no way to report failure, and a partially-dirtied cone is the
+    /// exact bug `5db90d2` fixed in lazily-rs. So the teardown walk threads its
+    /// worklist through the nodes themselves. `stale` doubles as the visited
+    /// mark, so a node is on the list at most once and one link field suffices.
+    /// Cost: 8 bytes per slot, and teardown that provably cannot allocate.
+    cascade_link: ?*Slot = null,
+    /// Type-erased cleanup captured by the last Effect body run, plus the
+    /// trampoline that runs and frees it. Held on the slot rather than on the
+    /// `Effect(Cleanup)` handle because the recompute and teardown paths both
+    /// only ever have the `*Slot`. Null for every non-Effect node.
+    cleanup_state: ?*anyopaque = null,
+    run_cleanup: ?*const fn (*Slot) void = null,
 
     /// Inline-storage budget (`#lzinline`). 16 bytes / 16-byte alignment covers
     /// the overwhelming majority of reactive value types — `i64`, `f64`,
@@ -1152,7 +1294,26 @@ pub const Slot = struct {
         pushTracking(&frame);
         defer popTracking(&frame);
 
-        const value = try valueFn(ctx);
+        // A `valueFn` that errors leaves a node that never became a graph
+        // member, and until now it was simply abandoned: still holding an arena
+        // id, still holding two allocator-backed edge maps, and still listed in
+        // the `parents` of whatever was reading it and in the
+        // `change_subscribers` of whatever it managed to read before failing.
+        // Nothing owned it — it was in neither the cache nor `orphaned_slots` —
+        // so nothing ever freed it and the dangling half-edges outlived it.
+        //
+        // Previously unreachable in practice because no shipped `valueFn`
+        // errored. `read_after_dispose_is_an_error.json` makes it the *normal*
+        // path: a live reader that names a disposed dependency errors on every
+        // recompute, so the leak would recur on every such read.
+        //
+        // `destroySelf` is not the tool here. `recurse == false` leaves the
+        // reverse edges dangling, and `recurse == true` would tear down the very
+        // dependent that is mid-read waiting on this value.
+        const value = valueFn(ctx) catch |err| {
+            self.abortInitUnlocked();
+            return err;
+        };
         self.value_fn_ptr = @ptrCast(@constCast(valueFn));
 
         switch (comptime Mode(T)) {
@@ -1203,6 +1364,21 @@ pub const Slot = struct {
         }
         try ctx.cachePublish(cache_key, self);
         return self;
+    }
+
+    /// Unwind a slot whose `valueFn` failed: drop both halves of every edge it
+    /// managed to form, release the edge maps, and return the arena id. The
+    /// node is not in the cache and not on `orphaned_slots`, so this is its
+    /// only chance to be reclaimed.
+    fn abortInitUnlocked(self: *Slot) void {
+        const ctx = self.ctx;
+        var piter = self.parents.keyIterator();
+        while (piter.next()) |ptr| _ = ptr.*.change_subscribers.remove(self);
+        var siter = self.change_subscribers.keyIterator();
+        while (siter.next()) |ptr| _ = ptr.*.parents.remove(self);
+        self.change_subscribers.deinit(ctx.allocator);
+        self.parents.deinit(ctx.allocator);
+        ctx.arena.free(self.id);
     }
 
     pub const GetError = error{SlotMissingPtr};
@@ -1487,6 +1663,137 @@ pub const Slot = struct {
         drainCascadeWorklist(ctx);
     }
 
+    // -----------------------------------------------------------------------
+    // Graph disposal (`#lzspecedgeindex`)
+    // -----------------------------------------------------------------------
+
+    /// Mark the surviving transitive dependent cone stale, without scheduling a
+    /// single eager node and without consuming a single edge.
+    ///
+    /// **Semantic 1 — disposal MUST dirty the surviving cone.** Detaching a
+    /// node's edges without marking what still reads it leaves those readers
+    /// permanently frozen on the value they cached before the disposal. That is
+    /// the defect `lazily-rs 5db90d2` and `lazily-js 4d20670` both shipped.
+    ///
+    /// **Semantic 2 — effects reached by this walk are NOT scheduled.** Disposal
+    /// is not a publish. Running an effect body here would re-enter a compute
+    /// that reads the very node being torn down, from inside the teardown that
+    /// is dismantling it. This binding's *publish* cascade
+    /// (`emitChangeUnlocked` / `drainCascadeWorklist`) **consumes** the reverse
+    /// edge as it walks — it drops `child.parents` and clears
+    /// `change_subscribers`, relying on the recompute to rebuild them. Reusing
+    /// that walk here and merely skipping the `on_invalidate` hook would
+    /// therefore *orphan* every skipped effect: its edges would be gone and the
+    /// recompute that rebuilds them would never run. So this walk consumes
+    /// nothing at all. Over-notification on the next publish is the safe
+    /// direction and is already the degradation
+    /// `cascadeFallbackMarkAllStaleUnlocked` chooses for the same reason.
+    ///
+    /// Allocation-free by construction: the worklist is threaded through the
+    /// slots themselves via `cascade_link`, and `stale` doubles as the visited
+    /// mark. A teardown that could fail to allocate is not a teardown.
+    ///
+    /// Eager nodes are traversed *through* rather than marked, so a lazy node
+    /// downstream of an effect still gets dirtied. That recursion is bounded by
+    /// the length of the longest chain of consecutive eager nodes, which is 0 or
+    /// 1 in every graph this binding builds (an Effect's slot stores a dummy
+    /// `u8` that nothing reads, so effects are leaves in practice).
+    fn dirtyDependentConeForTeardown(self: *Slot) void {
+        var head: ?*Slot = null;
+        pushTeardownDependents(&head, self);
+        while (head) |node| {
+            head = node.cascade_link;
+            node.cascade_link = null;
+            pushTeardownDependents(&head, node);
+        }
+    }
+
+    fn pushTeardownDependents(head: *?*Slot, node: *Slot) void {
+        if (node.change_subscribers.count() == 0) return;
+        var iter = node.change_subscribers.keyIterator();
+        while (iter.next()) |ptr| {
+            const child = ptr.*;
+            if (child.disposed or child.destroying) continue;
+            if (child.on_invalidate != null) {
+                // Semantic 2: neither marked nor queued. `stale` is this
+                // binding's `pending_recompute` dedupe key, so latching it here
+                // without an enqueue would mark the effect "already queued"
+                // forever and nothing could ever revive it (see
+                // `effect.on_invalidate_hook`). Leaving it wholly untouched
+                // keeps it wired: the next real publish reaches it normally.
+                pushTeardownDependents(head, child);
+                continue;
+            }
+            if (child.stale) continue; // its cone is already stale — the invariant
+            child.stale = true;
+            child.cascade_link = head.*;
+            head.* = child;
+        }
+    }
+
+    /// Remove this node from the graph permanently (`#lzspecedgeindex`).
+    ///
+    /// Distinct from `destroy`: `destroy` reclaims a node whose value is no
+    /// longer wanted and lets the next read re-materialize it, whereas disposal
+    /// is terminal. The slot stays in the cache as a tombstone with
+    /// `storage == null` and `disposed == true`, so the next `slotKeyed` for its
+    /// key returns `error.NodeDisposed` rather than silently minting a
+    /// replacement. Idempotent: disposing twice is a no-op, so teardown paths
+    /// stay composable.
+    ///
+    /// Cannot allocate, and cannot fail. Assumes `ctx.mutex` is held.
+    pub fn disposeUnlocked(self: *Slot) void {
+        if (self.disposed or self.destroying) return;
+
+        const ctx = self.ctx;
+
+        // Order matters: dirty the cone while the edges that describe it still
+        // exist, then run this node's own cleanup, then detach.
+        self.dirtyDependentConeForTeardown();
+
+        if (self.run_cleanup) |run| run(self);
+
+        if (self.parents.count() > 0) {
+            var piter = self.parents.keyIterator();
+            while (piter.next()) |ptr| {
+                _ = ptr.*.change_subscribers.remove(self);
+                ctx.bump("dependency_edges_removed");
+            }
+            self.parents.clearRetainingCapacity();
+        }
+        if (self.change_subscribers.count() > 0) {
+            var siter = self.change_subscribers.keyIterator();
+            while (siter.next()) |ptr| {
+                _ = ptr.*.parents.remove(self);
+                ctx.bump("dependency_edges_removed");
+            }
+            self.change_subscribers.clearRetainingCapacity();
+        }
+
+        // Stop every eager rerun, and tombstone this node's `pending_recompute`
+        // entry in O(1) the way `destroySingleNodeUnlocked` does — clearing
+        // `stale` is what makes the drain discard it.
+        self.on_invalidate = null;
+        self.recompute = null;
+        self.stale = false;
+        naiveDestroyRemoveScan(self);
+
+        // The payload is deliberately NOT freed here, and the slot is
+        // deliberately left in the cache. Both are the tombstone.
+        //
+        // Handles are copyable ids that callers keep — `Cell(T)` is itself the
+        // slot's payload, so freeing it at disposal would turn every live
+        // `*Cell(T)` into a dangling pointer and `tryGet`'s "this node was
+        // disposed" answer into a use-after-free. A disposed node therefore
+        // costs one slot plus one payload box until `Context.deinit`, which
+        // reclaims both through the ordinary `destroyUnlocked` path. That is a
+        // bounded, per-disposed-node cost, and it is not what
+        // `churn_returns_to_baseline.json` measures: that fixture asserts on the
+        // dependent-set *size*, explicitly not on any allocator or free-list
+        // statistic, and the edge sets above are emptied.
+        self.disposed = true;
+    }
+
     /// AUDIT ONLY (`#lzspecedgeindex`, `build_options.naive_destroy_scan`).
     ///
     /// The naive alternative to the O(1) tombstone: search `pending_recompute`
@@ -1670,6 +1977,13 @@ pub const Slot = struct {
         // in O(1) and the drain discards it. Mirrors lazily-rs 2b98ca6.
         self.stale = false;
         naiveDestroyRemoveScan(self);
+
+        // An Effect's outstanding cleanup is owned by the slot, so the slot's
+        // end of life is its last chance to run and free it — otherwise an
+        // effect that is never explicitly disposed leaks its cleanup box at
+        // `Context.deinit`. Running it here is also the right semantics: a
+        // context going away is a teardown, and teardown runs cleanups.
+        if (self.run_cleanup) |run| run(self);
 
         if (self.storage) |storage| {
             if (self.deinitPayload) |deinitPayload| {

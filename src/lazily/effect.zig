@@ -4,6 +4,7 @@ const Slot = @import("context.zig").Slot;
 const TrackingFrame = @import("context.zig").TrackingFrame;
 const pushTracking = @import("context.zig").pushTracking;
 const popTracking = @import("context.zig").popTracking;
+const currentSlotFor = @import("context.zig").currentSlotFor;
 const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const slotKeyed = @import("slot.zig").slotKeyed;
 const ValueFn = @import("context.zig").ValueFn;
@@ -53,7 +54,23 @@ pub fn Effect(comptime Cleanup: type) type {
         }
 
         pub fn isActive(self: *const Self) bool {
-            return self.active;
+            return self.active and !self.slot.disposed;
+        }
+
+        pub fn handle(self: *const Self) Context.NodeHandle {
+            return .{ .key = self.slot.cache_key.? };
+        }
+
+        /// Tear this effect out of the *graph* (`#lzspecedgeindex`).
+        ///
+        /// `dispose` keeps its older, narrower meaning — deactivate the eager
+        /// puller and leave the node in place — so graph teardown takes the new
+        /// name, exactly as it does for `Signal` in lazily-go. This runs the
+        /// pending cleanup, detaches both edge directions, and tombstones the
+        /// node so a later read of it is an error.
+        pub fn disposeNode(self: *Self) void {
+            self.active = false;
+            self.ctx.disposeNode(self.handle());
         }
     };
 }
@@ -77,6 +94,53 @@ pub fn effect(
     ctx: *Context,
     comptime bodyFn: EffectBodyFn(Cleanup),
 ) !*Effect(Cleanup) {
+    return effectKeyed(Cleanup, ctx, valueFnCacheKey(bodyFn), bodyFn);
+}
+
+/// Store the cleanup a body run just produced on the slot, replacing any
+/// previous one. Held on the slot rather than on the `Effect(Cleanup)` handle
+/// because the recompute and teardown paths only ever have the `*Slot`.
+///
+/// A zero-sized `Cleanup` (the `effectNoCleanup` case) is never boxed: there is
+/// nothing to run and nothing to free.
+fn storeCleanup(comptime Cleanup: type, s: *Slot, produced: ?Cleanup) void {
+    if (comptime @sizeOf(Cleanup) == 0) return;
+    const value = produced orelse return;
+    const boxed = s.ctx.allocator.create(Cleanup) catch {
+        // Same class as the eager-enqueue drop: the body already ran, so this
+        // cannot be un-done, and there is no caller to report to. Count it.
+        s.ctx.effect_body_errors += 1;
+        return;
+    };
+    boxed.* = value;
+    s.cleanup_state = @ptrCast(boxed);
+    s.run_cleanup = makeRunCleanup(Cleanup);
+}
+
+fn runStoredCleanup(s: *Slot) void {
+    if (s.run_cleanup) |run| run(s);
+}
+
+fn makeRunCleanup(comptime Cleanup: type) *const fn (*Slot) void {
+    return struct {
+        fn run(s: *Slot) void {
+            const state = s.cleanup_state orelse return;
+            const boxed: *Cleanup = @ptrCast(@alignCast(state));
+            // Clear first: `destroy()` is user code and may re-enter teardown.
+            s.cleanup_state = null;
+            boxed.destroy();
+            s.ctx.allocator.destroy(boxed);
+        }
+    }.run;
+}
+
+/// `effect` with a caller-supplied cache key, mirroring `signalKeyed`.
+pub fn effectKeyed(
+    comptime Cleanup: type,
+    ctx: *Context,
+    cache_key: usize,
+    comptime bodyFn: EffectBodyFn(Cleanup),
+) !*Effect(Cleanup) {
     const T = u8; // The slot stores a dummy u8; the real work is the side effect.
 
     // Build the valueFn that runs the effect body inside a tracking frame.
@@ -88,9 +152,11 @@ pub fn effect(
             // an Effect whose body errored every run was indistinguishable
             // from one that ran clean. Count it so the failure is at least
             // observable, without changing behaviour or any signature.
-            _ = bodyFn(_ctx) catch {
+            const produced = bodyFn(_ctx) catch blk: {
                 _ctx.effect_body_errors += 1;
+                break :blk null;
             };
+            if (currentSlotFor(_ctx)) |s| storeCleanup(Cleanup, s, produced);
             return 0; // dummy value
         }
     }.call;
@@ -99,13 +165,13 @@ pub fn effect(
     _ = try slotKeyed(
         T,
         ctx,
-        valueFnCacheKey(bodyFn),
+        cache_key,
         getEffectValue,
         null, // no payload deinit — the slot stores a dummy u8
     );
 
     // Get the slot pointer from cache
-    const slot_ptr = ctx.getSlot(bodyFn) orelse return error.SlotNotFound;
+    const slot_ptr = ctx.cacheLookup(cache_key) orelse return error.SlotNotFound;
 
     // Reserve this Effect's `pending_recompute` entry up front so
     // `on_invalidate_hook` never has to allocate. See
@@ -117,6 +183,10 @@ pub fn effect(
     // Install eager-recompute hooks (same machinery as Signal)
     slot_ptr.on_invalidate = &on_invalidate_hook;
     slot_ptr.recompute = makeEffectRecomputeFn(Cleanup, bodyFn);
+    // Re-arm a node whose key was disposed and then re-created. `slotKeyed`
+    // refuses to resurrect a tombstone, so reaching here means this is a fresh
+    // node on a fresh key; the assignment is defensive and free.
+    slot_ptr.disposed = false;
 
     const self = try ctx.allocator.create(Effect(Cleanup));
     self.* = .{
@@ -213,10 +283,16 @@ fn makeEffectRecomputeFn(comptime Cleanup: type, comptime bodyFn: EffectBodyFn(C
             // edge, and the body is what re-registers them. A body that errors
             // BEFORE its first dependency read therefore detaches the Effect
             // permanently. The counter is what makes that diagnosable.
-            _ = bodyFn(ctx) catch {
+            // Cleanup-before-body (`reactive-graph.md`): the previous run's
+            // cleanup completes before the next body starts, and it runs outside
+            // the graph lock because it is user code.
+            runStoredCleanup(s);
+
+            const produced = bodyFn(ctx) catch blk: {
                 ctx.effect_body_errors += 1;
-                return;
+                break :blk null;
             };
+            storeCleanup(Cleanup, s, produced);
 
             // The body's side effect has been performed. No value swap needed
             // (the slot stores a dummy u8). Downstream dependents (if any)

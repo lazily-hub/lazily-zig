@@ -39,6 +39,19 @@ pub fn Cell(comptime T: type) type {
             comptime valueFn: *const ValueFn(T),
             comptime deinitCellValue: ?DeinitCellValueFn(T),
         ) !*@This() {
+            return initKeyed(ctx, valueFnCacheKey(valueFn), valueFn, deinitCellValue);
+        }
+
+        /// `init` with a caller-supplied cache key, mirroring `slotKeyed` and
+        /// `signalKeyed`. Needed wherever one comptime `valueFn` must back many
+        /// distinct nodes — including a disposed cell's replacement, which must
+        /// be a *new* node rather than a resurrection of the tombstone.
+        pub fn initKeyed(
+            ctx: *Context,
+            cache_key: usize,
+            comptime valueFn: *const ValueFn(T),
+            comptime deinitCellValue: ?DeinitCellValueFn(T),
+        ) !*@This() {
             const getCell = struct {
                 fn call(_ctx: *Context) anyerror!Cell(T) {
                     const initial_value = try valueFn(_ctx);
@@ -56,7 +69,7 @@ pub fn Cell(comptime T: type) type {
             const self = try slotKeyed(
                 Cell(T),
                 ctx,
-                valueFnCacheKey(valueFn),
+                cache_key,
                 getCell,
                 deinitSlotValue(Cell(T), struct {
                     fn deinitValue(
@@ -82,6 +95,27 @@ pub fn Cell(comptime T: type) type {
 
         pub fn get(self: *const @This()) T {
             return self.value;
+        }
+
+        /// The checked read (`#lzspecedgeindex`). `get` returns the cell's
+        /// value with no graph interaction at all, which is what makes it the
+        /// fast path — and also what makes it unable to notice that the node was
+        /// disposed. `tryGet` is the boundary form: a disposed cell reads as an
+        /// error, never as a stale, default, or recycled value, so callers can
+        /// distinguish "torn down" from "legitimately this value".
+        pub fn tryGet(self: *const @This()) error{NodeDisposed}!T {
+            if (self.slot.disposed) return error.NodeDisposed;
+            return self.value;
+        }
+
+        pub fn handle(self: *const @This()) Context.NodeHandle {
+            return .{ .key = self.slot.cache_key.? };
+        }
+
+        /// Tear this cell out of the graph. `dispose_cell` and `dispose_slot`
+        /// share one contract — see `read_after_dispose_is_an_error.json`.
+        pub fn disposeNode(self: *@This()) void {
+            self.ctx.disposeNode(self.handle());
         }
 
         pub fn set(self: *@This(), new_value: T) void {
@@ -134,6 +168,17 @@ pub fn cell(
     // re-subscribe to its dependencies.  slotKeyed returns the cached slot
     // when it exists, so the valueFn is not re-run.
     return Cell(T).init(ctx, valueFn, deinitFn);
+}
+
+/// `cell` with a caller-supplied cache key. See `Cell(T).initKeyed`.
+pub fn cellKeyed(
+    comptime T: type,
+    ctx: *Context,
+    cache_key: usize,
+    comptime valueFn: *const ValueFn(T),
+    comptime deinitFn: ?DeinitCellValueFn(T),
+) !*Cell(T) {
+    return Cell(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
 }
 
 test "lazily/cell.cell: returns Cell(T) with initial value and caches computation" {

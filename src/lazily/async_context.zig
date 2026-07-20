@@ -84,6 +84,13 @@ pub fn AsyncContext(comptime V: type) type {
             /// `get` and `awaitResolved` report it. A visibly failed slot
             /// beats a silently wrong one.
             pub fn readCell(self: *ComputeContext, cell_id: u64) !void {
+                // A live reader that still names a disposed node errors on its
+                // next recompute, rather than observing a stale, default or
+                // recycled value (`read_after_dispose_is_an_error.json`). This
+                // guard is also what stops a recompute racing a teardown from
+                // rebuilding an edge the disposal just removed.
+                if (self.async_ctx.isDisposed(cell_id)) return error.NodeDisposed;
+                if (self.async_ctx.isDisposed(self.slot_id)) return error.NodeDisposed;
                 try self.async_ctx.addEdge(self.slot_id, cell_id);
             }
         };
@@ -108,6 +115,25 @@ pub fn AsyncContext(comptime V: type) type {
             dependents: std.ArrayList(u64),
             /// True when a compute is queued for this slot (waiting for settle()).
             queued: bool = false,
+            /// Graph-disposal tombstone (`#lzspecedgeindex`). The node stays in
+            /// `slots` so a read through a handle reports `error.NodeDisposed`
+            /// rather than `error.AsyncUnresolved` — "torn down" and "never
+            /// existed" are different answers and callers depend on the
+            /// difference.
+            disposed: bool = false,
+            /// Marks this node as a side effect rather than a value. Load-bearing
+            /// for disposal: an effect reached by the teardown walk must not be
+            /// scheduled (see `dirtyDependentConeForTeardown`).
+            is_effect: bool = false,
+            /// True once the effect body has run at least once, so
+            /// cleanup-before-body does not fire a cleanup that never happened.
+            effect_ran: bool = false,
+            cleanup_ptr: ?*anyopaque = null,
+            cleanup_fn: ?*const fn (*anyopaque) void = null,
+            /// Visited stamp for the teardown walk. An epoch counter rather than
+            /// a bool so the walk never has to reset it — resetting would need a
+            /// second pass, and teardown gets no second chances.
+            teardown_mark: u64 = 0,
 
             pub fn init() SlotNode {
                 return .{ .dependencies = .empty, .dependents = .empty };
@@ -134,6 +160,14 @@ pub fn AsyncContext(comptime V: type) type {
         cells: std.AutoHashMap(u64, V),
         slots: std.AutoHashMap(u64, SlotNode),
         settled: bool = false,
+        /// Disposal tombstones for *cells*. Slots carry theirs on `SlotNode`;
+        /// `cells` is a bare `id -> V` map, so its tombstones live here.
+        /// Capacity is reserved at node-creation time — see `reserveTeardown`.
+        disposed_cells: std.AutoHashMap(u64, void),
+        /// Worklist for the teardown walk, pre-grown to the live node count so
+        /// the walk never allocates. See `reserveTeardown`.
+        teardown_scratch: std.ArrayList(u64),
+        teardown_epoch: u64 = 0,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -144,12 +178,16 @@ pub fn AsyncContext(comptime V: type) type {
                 .reverse_edges = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
                 .cells = std.AutoHashMap(u64, V).init(allocator),
                 .slots = std.AutoHashMap(u64, SlotNode).init(allocator),
+                .disposed_cells = std.AutoHashMap(u64, void).init(allocator),
+                .teardown_scratch = .empty,
             };
         }
 
         pub fn deinit(self: *Self) void {
             self.generations.deinit();
             self.pending.deinit(self.allocator);
+            self.disposed_cells.deinit();
+            self.teardown_scratch.deinit(self.allocator);
             var e1 = self.edges.valueIterator();
             while (e1.next()) |list| list.deinit(self.allocator);
             self.edges.deinit();
@@ -168,11 +206,38 @@ pub fn AsyncContext(comptime V: type) type {
             const id = self.next_id;
             self.next_id += 1;
             try self.cells.put(id, value);
+            try self.reserveTeardown();
             return id;
         }
 
         pub fn getCell(self: *Self, id: u64) ?V {
             return self.cells.get(id);
+        }
+
+        /// The checked cell read. See `Cell(T).tryGet` in the sync binding: a
+        /// disposed node reads as an error, never as a stale or default value.
+        pub fn tryGetCell(self: *Self, id: u64) error{ NodeDisposed, MissingCell }!V {
+            if (self.disposed_cells.contains(id)) return error.NodeDisposed;
+            return self.cells.get(id) orelse error.MissingCell;
+        }
+
+        /// Pay for teardown up front (`#lzspecedgeindex`).
+        ///
+        /// Every allocation disposal could possibly need is made here, at node
+        /// creation, where the caller still has an error to handle. Teardown
+        /// itself then walks pre-grown storage and cannot fail: a scope's
+        /// `deinit` runs from a `defer` with nowhere to report, and a cascade
+        /// that stops halfway leaves exactly the frozen-reader graph this whole
+        /// change exists to prevent.
+        ///
+        /// Both bounds are the live node count: the teardown worklist can hold
+        /// at most every node once (the epoch stamp dedupes), and `pending` can
+        /// hold at most every slot once (the `queued` flag dedupes).
+        fn reserveTeardown(self: *Self) !void {
+            const n = self.slots.count() + self.cells.count();
+            try self.teardown_scratch.ensureTotalCapacity(self.allocator, n);
+            try self.pending.ensureTotalCapacity(self.allocator, n);
+            try self.disposed_cells.ensureTotalCapacity(@intCast(n));
         }
 
         /// Synchronous write. If not inside a settle, invalidates dependent slots
@@ -203,7 +268,26 @@ pub fn AsyncContext(comptime V: type) type {
             node.compute_fn = compute;
             node.state = .computing;
             try self.slots.put(id, node);
+            try self.reserveTeardown();
             try self.enqueueCompute(id);
+            return id;
+        }
+
+        /// A side effect rather than a value: same node machinery, but flagged
+        /// so the teardown walk never schedules it, and carrying an optional
+        /// cleanup that runs before every rerun and once at disposal.
+        pub fn effectAsyncClosure(
+            self: *Self,
+            ptr: *anyopaque,
+            compute: ComputeFn,
+            cleanup_ptr: ?*anyopaque,
+            cleanup_fn: ?*const fn (*anyopaque) void,
+        ) !u64 {
+            const id = try self.computedAsyncClosure(ptr, compute);
+            const n = self.slots.getPtr(id).?;
+            n.is_effect = true;
+            n.cleanup_ptr = cleanup_ptr;
+            n.cleanup_fn = cleanup_fn;
             return id;
         }
 
@@ -274,9 +358,21 @@ pub fn AsyncContext(comptime V: type) type {
             const slot_id = self.pending.orderedRemove(0);
             var node = self.slots.getPtr(slot_id) orelse return false;
             node.queued = false;
+            // A disposed node can still be sitting in the queue from before its
+            // disposal. Returning `true` (rather than `false`) is load-bearing:
+            // `settle` stops at the first `false`, so reporting "nothing ran"
+            // here would abandon every entry behind it.
+            if (node.disposed) return true;
             const at_revision = node.revision;
             const compute = node.compute_fn orelse return false;
             const ptr = node.compute_ptr;
+
+            // Cleanup-before-body: the previous run's cleanup completes before
+            // the next body starts.
+            if (node.is_effect and node.effect_ran) {
+                if (node.cleanup_fn) |cf| cf(node.cleanup_ptr.?);
+            }
+            if (node.is_effect) node.effect_ran = true;
 
             // Reset dependencies before recompute (the compute re-registers them).
             if (self.edges.getPtr(slot_id)) |deps| {
@@ -343,17 +439,198 @@ pub fn AsyncContext(comptime V: type) type {
 
         fn enqueueCompute(self: *Self, slot_id: u64) !void {
             var node = self.slots.getPtr(slot_id) orelse return;
-            if (node.queued) return;
+            if (node.queued or node.disposed) return;
             node.queued = true;
             node.state = .computing;
             try self.pending.append(self.allocator, slot_id);
         }
 
+        /// `enqueueCompute` for the teardown path. `reserveTeardown` grew
+        /// `pending` to the live node count at every creation, and the `queued`
+        /// flag bounds the queue to one entry per node, so the capacity is
+        /// guaranteed and this cannot fail.
+        fn enqueueComputeInfallible(self: *Self, slot_id: u64) void {
+            var node = self.slots.getPtr(slot_id) orelse return;
+            if (node.queued or node.disposed) return;
+            node.queued = true;
+            node.state = .computing;
+            std.debug.assert(self.pending.capacity > self.pending.items.len);
+            self.pending.appendAssumeCapacity(slot_id);
+        }
+
         fn invalidateSlot(self: *Self, slot_id: u64) !void {
             var node = self.slots.getPtr(slot_id) orelse return;
+            if (node.disposed) return;
             node.revision += 1; // supersede any in-flight compute
             try self.enqueueCompute(slot_id);
         }
+
+        // -------------------------------------------------------------------
+        // Graph disposal, degree introspection, teardown scopes
+        // (`#lzspecedgeindex`)
+        // -------------------------------------------------------------------
+
+        /// Nodes that read this one. A count, never the collection.
+        pub fn dependentCount(self: *Self, id: u64) usize {
+            const list = self.reverse_edges.getPtr(id) orelse return 0;
+            return list.items.len;
+        }
+
+        /// Nodes this one reads. See `dependentCount`.
+        pub fn dependencyCount(self: *Self, id: u64) usize {
+            const list = self.edges.getPtr(id) orelse return 0;
+            return list.items.len;
+        }
+
+        pub fn isDisposed(self: *Self, id: u64) bool {
+            if (self.slots.getPtr(id)) |n| return n.disposed;
+            return self.disposed_cells.contains(id);
+        }
+
+        /// Mark the surviving dependent cone for recompute without running a
+        /// single effect.
+        ///
+        /// Unlike the sync binding, this context's invalidation does **not**
+        /// consume the reverse edge — `invalidateSlot` only bumps a revision and
+        /// queues, and `settleOnce` clears a slot's dependencies at the top of
+        /// its *own* recompute. So an effect skipped here keeps every edge it
+        /// had and is reached normally by the next real publish; there is no
+        /// re-attachment to do. What must not happen is the enqueue: draining it
+        /// would run the effect body, which reads back through the node being
+        /// disposed, from inside the teardown dismantling it.
+        ///
+        /// Allocation-free: `teardown_scratch` and `pending` were both grown to
+        /// the live node count at creation (`reserveTeardown`), and
+        /// `teardown_mark` dedupes so each node is visited once.
+        fn dirtyDependentConeForTeardown(self: *Self, root: u64) void {
+            self.teardown_epoch += 1;
+            const epoch = self.teardown_epoch;
+            self.teardown_scratch.clearRetainingCapacity();
+            self.pushTeardownDependents(root, epoch);
+            while (self.teardown_scratch.pop()) |id| {
+                self.pushTeardownDependents(id, epoch);
+            }
+        }
+
+        fn pushTeardownDependents(self: *Self, id: u64, epoch: u64) void {
+            const list = self.reverse_edges.getPtr(id) orelse return;
+            // Iterate by index: nothing below mutates this list, but the
+            // worklist push may reallocate a *different* list in the same map.
+            var i: usize = 0;
+            while (i < list.items.len) : (i += 1) {
+                const dep_id = list.items[i];
+                const n = self.slots.getPtr(dep_id) orelse continue;
+                if (n.disposed or n.teardown_mark == epoch) continue;
+                n.teardown_mark = epoch;
+                if (!n.is_effect) {
+                    n.revision += 1; // supersede any in-flight compute
+                    self.enqueueComputeInfallible(dep_id);
+                }
+                std.debug.assert(self.teardown_scratch.capacity > self.teardown_scratch.items.len);
+                self.teardown_scratch.appendAssumeCapacity(dep_id);
+            }
+        }
+
+        fn detachEdge(self: *Self, slot_id: u64, dep_id: u64) void {
+            if (self.edges.getPtr(slot_id)) |deps| {
+                var i: usize = 0;
+                while (i < deps.items.len) {
+                    if (deps.items[i] == dep_id) _ = deps.swapRemove(i) else i += 1;
+                }
+            }
+            if (self.reverse_edges.getPtr(dep_id)) |dents| {
+                var i: usize = 0;
+                while (i < dents.items.len) {
+                    if (dents.items[i] == slot_id) _ = dents.swapRemove(i) else i += 1;
+                }
+            }
+        }
+
+        /// Tear one node out of the graph. Idempotent, allocation-free,
+        /// infallible — see `reserveTeardown`.
+        pub fn disposeNode(self: *Self, id: u64) void {
+            const is_slot = self.slots.contains(id);
+            const is_cell = self.cells.contains(id);
+            if (!is_slot and !is_cell) return;
+            if (self.isDisposed(id)) return; // idempotent
+
+            // Dirty the cone while the edges describing it still exist.
+            self.dirtyDependentConeForTeardown(id);
+
+            if (self.slots.getPtr(id)) |n| {
+                if (n.is_effect and n.effect_ran) {
+                    if (n.cleanup_fn) |cf| cf(n.cleanup_ptr.?);
+                }
+            }
+
+            // Detach both directions.
+            if (self.edges.getPtr(id)) |deps| {
+                // Copy-free: walk backwards so `swapRemove` inside `detachEdge`
+                // cannot skip an entry.
+                while (deps.items.len > 0) {
+                    const dep_id = deps.items[deps.items.len - 1];
+                    self.detachEdge(id, dep_id);
+                }
+            }
+            if (self.reverse_edges.getPtr(id)) |dents| {
+                while (dents.items.len > 0) {
+                    const s_id = dents.items[dents.items.len - 1];
+                    self.detachEdge(s_id, id);
+                }
+            }
+
+            if (self.slots.getPtr(id)) |n| {
+                n.disposed = true;
+                n.state = .err;
+                n.err_value = error.NodeDisposed;
+                n.value = null;
+                n.queued = false;
+                n.revision += 1;
+                n.cleanup_fn = null;
+            } else {
+                // Capacity reserved at `cell()`.
+                self.disposed_cells.putAssumeCapacity(id, {});
+            }
+        }
+
+        pub fn scope(self: *Self) TeardownScope {
+            return .{ .ctx = self, .owned = .empty };
+        }
+
+        /// See `Context.TeardownScope`: a scope names a set and a moment, adds
+        /// no disposal semantics of its own, and tears down in reverse creation
+        /// order. `own` is where the allocation happens; `deinit` cannot fail.
+        pub const TeardownScope = struct {
+            ctx: *Self,
+            owned: std.ArrayList(u64),
+            armed: bool = true,
+
+            pub fn own(self: *TeardownScope, id: u64) !void {
+                if (!self.armed) return;
+                try self.owned.append(self.ctx.allocator, id);
+            }
+
+            pub fn len(self: *const TeardownScope) usize {
+                return self.owned.items.len;
+            }
+
+            pub fn disarm(self: *TeardownScope) void {
+                self.armed = false;
+                self.owned.clearRetainingCapacity();
+            }
+
+            pub fn deinit(self: *TeardownScope) void {
+                if (self.armed) {
+                    var i = self.owned.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        self.ctx.disposeNode(self.owned.items[i]);
+                    }
+                }
+                self.owned.deinit(self.ctx.allocator);
+                self.* = undefined;
+            }
+        };
 
         /// All-or-nothing: reserve both lists before mutating either. Appending
         /// the forward edge first and only then discovering the reverse append

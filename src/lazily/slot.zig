@@ -67,6 +67,17 @@ pub fn slotKeyed(
         defer ctx.mutex.unlock();
 
         if (ctx.cacheLookup(cache_key)) |cached_slot| {
+            // Disposal tombstone (`#lzspecedgeindex`). This check must come
+            // first: a disposed slot has `storage == null` and `stale == false`,
+            // so without it the fall-through would treat the tombstone as a
+            // plain cache miss and mint a replacement — silently resurrecting a
+            // node the caller tore down, and returning a value where
+            // `read_after_dispose_is_an_error.json` requires an error. It also
+            // covers the transitive case the same fixture pins: a live reader
+            // that still names a disposed dependency reaches this line from
+            // inside its own recompute, so the error propagates out of the
+            // reader rather than the reader serving its pre-disposal cache.
+            if (cached_slot.disposed) return error.NodeDisposed;
             if (cached_slot.storage != null and !cached_slot.stale) {
                 // Fresh cached value — return it.
                 const current_slot: ?*Slot = currentSlotFor(ctx);
