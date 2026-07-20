@@ -196,6 +196,16 @@ pub const Context = struct {
     // Context. Backs the `pending_recompute` capacity reservation — see
     // `reserveEagerRecomputeSlot`.
     eager_nodes: u64 = 0,
+    // Count of destroy cascades (`Slot.destroySelf`) that could not reserve
+    // worklist capacity for a node's subscriber batch and left those
+    // dependents alive instead of destroying them. The survivors keep their
+    // last value and stay in the cache, so `Context.deinit` still reclaims
+    // them — the cost is deferred reclamation plus one conservative stale
+    // mark, not a leak and not a dangling parent edge. Non-zero means a
+    // teardown was incomplete at the time it ran. Deliberately NOT a field of
+    // `Instrumentation`, which mirrors lazily-rs `InstrumentationCounters`
+    // one-for-one and must not drift (same rationale as `cascade_oom_fallbacks`).
+    destroy_cascade_oom_survivors: u64 = 0,
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
@@ -1577,14 +1587,40 @@ pub const Slot = struct {
                 // for destruction. `cacheRemove` runs here so a re-entrant
                 // materialization cannot re-publish a doomed slot.
                 if (node.change_subscribers.count() > 0) {
-                    var siter = node.change_subscribers.keyIterator();
-                    while (siter.next()) |ptr| {
-                        const dependent_slot = ptr.*;
-                        _ = dependent_slot.parents.remove(node);
-                        if (dependent_slot.cache_key) |ck| ctx.cacheRemove(ck);
-                        wl.append(ctx.allocator, dependent_slot) catch {};
+                    // Pay for the whole batch BEFORE the first mutation
+                    // (`b8f09eb` shape: hoist the allocation to a point where
+                    // failure is still reportable). The per-append `catch {}`
+                    // this replaces failed *after* `cacheRemove` had already
+                    // run for that dependent, so the survivor was neither in
+                    // the cache nor on `orphaned_slots` — unreachable from
+                    // every teardown path, and its `parents` /
+                    // `change_subscribers` backing maps leaked for the life of
+                    // the process. Reserving up-front makes the batch
+                    // all-or-nothing.
+                    if (wl.ensureUnusedCapacity(ctx.allocator, node.change_subscribers.count())) |_| {
+                        var siter = node.change_subscribers.keyIterator();
+                        while (siter.next()) |ptr| {
+                            const dependent_slot = ptr.*;
+                            _ = dependent_slot.parents.remove(node);
+                            if (dependent_slot.cache_key) |ck| ctx.cacheRemove(ck);
+                            wl.appendAssumeCapacity(dependent_slot);
+                        }
+                        node.change_subscribers.clearRetainingCapacity();
+                    } else |_| {
+                        // Conservative degradation. Nothing has been evicted
+                        // yet, so the dependents are still reachable from the
+                        // cache and `Context.deinit` will reclaim them. Drop
+                        // both halves of every remaining edge (a one-sided
+                        // edge here IS the dangling pointer — see
+                        // `drainCascadeWorklist`) and mark the survivors stale,
+                        // since the dependency they cached against is about to
+                        // disappear. Not destroying a dependent costs a
+                        // deferred free; half-destroying one costs a UAF.
+                        ctx.destroy_cascade_oom_survivors += 1;
+                        var siter = node.change_subscribers.keyIterator();
+                        while (siter.next()) |ptr| markStaleConservatively(ptr.*);
+                        dropRemainingSubscriberEdges(node);
                     }
-                    node.change_subscribers.clearRetainingCapacity();
                 }
             }
 

@@ -831,3 +831,90 @@ test "lazily/slot: cascade tears a diamond dependent down exactly once" {
 
     try std.testing.expectEqual(@as(usize, 0), ctx.cache.count());
 }
+
+// A destroy cascade that cannot grow the worklist must not strand a dependent.
+// The `wl.append(...) catch {}` this guards ran AFTER `ctx.cacheRemove(ck)` for
+// that same dependent, so the survivor was reachable from neither the cache nor
+// `orphaned_slots` — nothing would ever free its `parents` /
+// `change_subscribers` backing maps. The fix reserves the whole subscriber
+// batch before the first eviction, so the failure lands where nothing has been
+// torn down yet.
+
+const DestroyOomState = struct {
+    var source: u64 = 0;
+
+    fn victimFn(_: *Context) anyerror!u64 {
+        return source;
+    }
+    fn dependentFn(c: *Context) anyerror!u64 {
+        return (try slot(u64, c, victimFn, null)).* + 1;
+    }
+    fn dependent2Fn(c: *Context) anyerror!u64 {
+        return (try slot(u64, c, victimFn, null)).* + 2;
+    }
+};
+
+test "lazily/slot: OOM reserving the destroy worklist must not leak the dependent" {
+    const S = DestroyOomState;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.source = 7;
+    _ = try slot(u64, ctx, S.dependentFn, null);
+    _ = try slot(u64, ctx, S.dependent2Fn, null);
+
+    const victim = ctx.cacheLookup(valueFnCacheKey(S.victimFn)).?;
+    const dependent = ctx.cacheLookup(valueFnCacheKey(S.dependentFn)).?;
+    try std.testing.expectEqual(@as(usize, 2), victim.change_subscribers.count());
+    // The dependent's `parents` map has real backing capacity — that is the
+    // allocation the old code leaked, and what `std.testing.allocator` catches.
+    try std.testing.expect(dependent.parents.count() == 1);
+
+    // Saturate the shared worklist so its spare capacity is exactly one entry.
+    // `destroySelf` seeds `self` into that slot allocation-free; popping it
+    // hands the slot back, so the victim's TWO-subscriber batch reservation is
+    // one entry short and must grow — that growth is the path under test. The
+    // padding sits below the frame's `base` high-water mark, so the cascade
+    // never reads it.
+    try ctx.cascade_scratch.ensureTotalCapacity(backing, 8);
+    const pad = ctx.cascade_scratch.capacity - 1;
+    while (ctx.cascade_scratch.items.len < pad) ctx.cascade_scratch.appendAssumeCapacity(victim);
+
+    // `resize_fail_index` matters here: an ArrayList grows by trying an
+    // in-place remap first, and a FailingAllocator that only fails fresh
+    // allocations lets that remap through — the reservation then succeeds and
+    // the test is vacuous. (It passed that way before this line was added.)
+    var failing = std.testing.FailingAllocator.init(backing, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    ctx.allocator = failing.allocator();
+    victim.destroy(true);
+    ctx.allocator = backing;
+
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The victim is gone; the dependent survived instead of being half-torn-down.
+    try std.testing.expect(ctx.cacheLookup(valueFnCacheKey(S.victimFn)) == null);
+    try std.testing.expect(ctx.cacheLookup(valueFnCacheKey(S.dependentFn)) != null);
+    try std.testing.expect(ctx.cacheLookup(valueFnCacheKey(S.dependent2Fn)) != null);
+
+    // Both halves of the edge are gone, so the survivor holds no pointer to the
+    // freed victim, and it was marked stale because its dependency vanished.
+    try std.testing.expectEqual(@as(usize, 0), dependent.parents.count());
+    try std.testing.expect(dependent.stale);
+
+    // The assertion that actually fails against the old `catch {}`: the
+    // survivor is still cache-reachable, so `ctx.deinit` frees it. Under the
+    // old code it had already been `cacheRemove`d before the dropped append,
+    // and `std.testing.allocator` reports its edge maps as leaked here.
+    // The frame restored the worklist to exactly the padding it inherited.
+    try std.testing.expectEqual(pad, ctx.cascade_scratch.items.len);
+    ctx.cascade_scratch.clearRetainingCapacity();
+
+    // Checked last, and deliberately so: it is the only assertion here that
+    // cannot fail against the old code for a behavioural reason (the counter
+    // did not exist). The assertions above are the load-bearing ones.
+    try std.testing.expectEqual(@as(u64, 1), ctx.destroy_cascade_oom_survivors);
+}
