@@ -532,3 +532,56 @@ test "lazily/cell: OOM growing the cascade worklist must not strand a dependent 
     try std.testing.expectEqual(@as(u32, 1112), (try S.c(ctx)).*);
     try std.testing.expectEqual(@as(usize, 0), ctx.cascade_scratch.items.len);
 }
+
+// `invalidateSlotUnlocked`'s seed push had the same hole its own drain loop and
+// `emitChangeUnlocked` already closed — and worse placed: the function's early
+// `if (self.stale) return` means `stale` is still false when the push happens,
+// so a dropped seed left the slot itself, not just its cone, fresh-but-wrong.
+
+const InvalidateSeedOomChain = struct {
+    var source: u32 = 0;
+
+    fn getA(_: *Context) anyerror!u32 {
+        return source;
+    }
+    fn getB(c: *Context) anyerror!u32 {
+        return (try @import("slot.zig").slot(u32, c, getA, null)).* + 100;
+    }
+};
+
+test "lazily/cell: OOM seeding an invalidation must not leave the slot fresh-but-wrong" {
+    const S = InvalidateSeedOomChain;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.source = 1;
+    try std.testing.expectEqual(@as(u32, 101), (try @import("slot.zig").slot(u32, ctx, S.getB, null)).*);
+
+    const a = ctx.getSlot(S.getA).?;
+    try std.testing.expect(!a.stale);
+
+    var failing = std.testing.FailingAllocator.init(backing, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    ctx.allocator = failing.allocator();
+    ctx.mutex.lock();
+    a.invalidateSlotUnlocked();
+    ctx.mutex.unlock();
+    ctx.allocator = backing;
+
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The assertions that fail against the old bare `catch return`: the slot
+    // that was being invalidated is stale, and so is its dependent. Under the
+    // old code BOTH stayed false and nothing would ever retry.
+    try std.testing.expect(a.stale);
+    try std.testing.expect(ctx.getSlot(S.getB).?.stale);
+
+    // And the next read is correct.
+    S.source = 5;
+    try std.testing.expectEqual(@as(u32, 105), (try @import("slot.zig").slot(u32, ctx, S.getB, null)).*);
+
+    try std.testing.expectEqual(@as(u64, 1), ctx.cascade_oom_fallbacks);
+}

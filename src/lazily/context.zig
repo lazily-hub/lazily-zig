@@ -1474,7 +1474,16 @@ pub const Slot = struct {
         std.debug.assert(wl.items.len == 0); // always empty on entry
         defer wl.clearRetainingCapacity();
 
-        wl.append(ctx.allocator, self) catch return;
+        // A dropped seed is the same hole `emitChangeUnlocked` and
+        // `drainCascadeWorklist` already close, and it is the worst-placed one:
+        // the early `if (self.stale) return` means `self.stale` has NOT been
+        // set yet, so a bare `catch return` left this slot AND its entire
+        // dependent cone fresh-but-wrong, with nothing scheduled to retry.
+        // Degrade the same way the other two paths do.
+        wl.append(ctx.allocator, self) catch {
+            cascadeFallbackMarkAllStaleUnlocked(ctx);
+            return;
+        };
         drainCascadeWorklist(ctx);
     }
 
