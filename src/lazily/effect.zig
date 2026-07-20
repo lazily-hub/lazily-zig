@@ -82,7 +82,15 @@ pub fn effect(
     // Build the valueFn that runs the effect body inside a tracking frame.
     const getEffectValue = struct {
         fn call(_ctx: *Context) anyerror!u8 {
-            _ = bodyFn(_ctx) catch {};
+            // A failing effect body genuinely has nowhere to report: the body
+            // runs from an invalidation cascade, not from a caller, so the
+            // swallow is intentional and stays. But it was undiagnosable —
+            // an Effect whose body errored every run was indistinguishable
+            // from one that ran clean. Count it so the failure is at least
+            // observable, without changing behaviour or any signature.
+            _ = bodyFn(_ctx) catch {
+                _ctx.effect_body_errors += 1;
+            };
             return 0; // dummy value
         }
     }.call;
@@ -196,7 +204,19 @@ fn makeEffectRecomputeFn(comptime Cleanup: type, comptime bodyFn: EffectBodyFn(C
             pushTracking(&frame);
             defer popTracking(&frame);
 
-            _ = bodyFn(ctx) catch return;
+            // The rerun path's copy of the same intentional swallow (see
+            // `effect()`); nothing follows but comments, so the `return` is
+            // equivalent to `catch {}` and `popTracking` still runs via defer.
+            // Counted for the same reason.
+            //
+            // Worth knowing: Step 1 above has already dropped every parent
+            // edge, and the body is what re-registers them. A body that errors
+            // BEFORE its first dependency read therefore detaches the Effect
+            // permanently. The counter is what makes that diagnosable.
+            _ = bodyFn(ctx) catch {
+                ctx.effect_body_errors += 1;
+                return;
+            };
 
             // The body's side effect has been performed. No value swap needed
             // (the slot stores a dummy u8). Downstream dependents (if any)
@@ -386,4 +406,53 @@ test "lazily/effect: a genuinely undeliverable enqueue is counted, not latched" 
     // Not queued implies not stale.
     try std.testing.expect(!eff.slot.stale);
     try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
+}
+
+const FailingBodyState = struct {
+    var runs: u64 = 0;
+
+    fn getSource(_: *Context) anyerror!u32 {
+        return source;
+    }
+    var source: u32 = 0;
+
+    fn body(c: *Context) anyerror!void {
+        _ = try CellMod.cell(u32, c, getSource, null);
+        runs += 1;
+        return error.EffectBodyFailed;
+    }
+};
+
+test "lazily/effect: a failing effect body is counted rather than invisible" {
+    // The swallow at the top of `effect()` is intentional — the body runs from
+    // an invalidation cascade, so its error has no caller to reach. What it was
+    // NOT allowed to stay is undiagnosable: an Effect erroring on every run
+    // looked exactly like one running clean.
+    const S = FailingBodyState;
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    S.runs = 0;
+    S.source = 1;
+    const src = try CellMod.cell(u32, ctx, S.getSource, null);
+
+    const eff = try effectNoCleanup(ctx, S.body);
+    defer ctx.allocator.destroy(eff);
+    defer eff.dispose();
+
+    // The body ran and failed, and the Effect still constructed — behaviour is
+    // unchanged. The failure is simply visible now.
+    try std.testing.expectEqual(@as(u64, 1), S.runs);
+    try std.testing.expectEqual(@as(u64, 1), ctx.effect_body_errors);
+
+    // Every subsequent rerun is counted too, so a persistently broken body
+    // shows a climbing count rather than silence.
+    //
+    // This half of the test is what found the SECOND swallow: the first run
+    // goes through `effect()`'s `catch`, the rerun through
+    // `makeEffectRecomputeFn`'s separate `catch return`. With only the first
+    // one counted this read 1, not 2. Keep both paths covered.
+    src.set(2);
+    try std.testing.expectEqual(@as(u64, 2), S.runs);
+    try std.testing.expectEqual(@as(u64, 2), ctx.effect_body_errors);
 }

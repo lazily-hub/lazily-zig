@@ -206,6 +206,12 @@ pub const Context = struct {
     // `Instrumentation`, which mirrors lazily-rs `InstrumentationCounters`
     // one-for-one and must not drift (same rationale as `cascade_oom_fallbacks`).
     destroy_cascade_oom_survivors: u64 = 0,
+    // Count of Effect body invocations that returned an error. The body runs
+    // from an invalidation cascade rather than from a caller, so its error has
+    // nowhere to propagate and is deliberately swallowed — this makes the
+    // swallow observable instead of invisible. Deliberately NOT a field of
+    // `Instrumentation` (same rationale as `cascade_oom_fallbacks`).
+    effect_body_errors: u64 = 0,
     // Optional hook invoked AFTER `deinit` frees the Context struct, so it may
     // release a stateful allocator state that backed `allocator`. Used by the
     // FFI `init_context_with_mode` to own arena/debug/smp allocators. Native
