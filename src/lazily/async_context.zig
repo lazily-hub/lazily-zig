@@ -65,9 +65,26 @@ pub fn AsyncContext(comptime V: type) type {
             slot_id: u64,
 
             /// Register a cell dependency. The compute will be invalidated when
-            /// the cell is set. Errors are swallowed (best-effort edge reg).
-            pub fn readCell(self: *ComputeContext, cell_id: u64) void {
-                self.async_ctx.addEdge(self.slot_id, cell_id) catch {};
+            /// the cell is set.
+            ///
+            /// This used to swallow the error as "best-effort edge
+            /// registration". It is not best-effort: `reverse_edges` is the
+            /// ONLY path by which a slot is ever re-enqueued (`setCell` and
+            /// the two cascade walks in `settleOnce` all read it and nothing
+            /// else), and `settleOnce` clears a slot's edges before every
+            /// recompute. So a dropped edge is not one missed invalidation —
+            /// the slot never recomputes on that dependency again, and since
+            /// the recompute is what would rebuild the edge, nothing restores
+            /// it. That is permanent silent staleness, the same class as the
+            /// cascade-worklist bug.
+            ///
+            /// Every caller is a `ComputeFn`, whose return type is already
+            /// `anyerror!V`, so the failure propagates through an error union
+            /// that exists: `settleOnce` puts the slot in `.err`, where
+            /// `get` and `awaitResolved` report it. A visibly failed slot
+            /// beats a silently wrong one.
+            pub fn readCell(self: *ComputeContext, cell_id: u64) !void {
+                try self.async_ctx.addEdge(self.slot_id, cell_id);
             }
         };
 
@@ -338,17 +355,30 @@ pub fn AsyncContext(comptime V: type) type {
             try self.enqueueCompute(slot_id);
         }
 
+        /// All-or-nothing: reserve both lists before mutating either. Appending
+        /// the forward edge first and only then discovering the reverse append
+        /// is out of memory would leave a one-sided edge — a dependency the
+        /// slot believes it has and that no `setCell` will ever fire on.
         fn addEdge(self: *Self, slot_id: u64, cell_id: u64) !void {
             const gop1 = try self.edges.getOrPut(slot_id);
             if (!gop1.found_existing) gop1.value_ptr.* = .empty;
-            try gop1.value_ptr.append(self.allocator, cell_id);
 
             const gop2 = try self.reverse_edges.getOrPut(cell_id);
             if (!gop2.found_existing) gop2.value_ptr.* = .empty;
+
+            var needs_reverse = true;
             for (gop2.value_ptr.items) |s| {
-                if (s == slot_id) return;
+                if (s == slot_id) {
+                    needs_reverse = false;
+                    break;
+                }
             }
-            try gop2.value_ptr.append(self.allocator, slot_id);
+
+            try gop1.value_ptr.ensureUnusedCapacity(self.allocator, 1);
+            if (needs_reverse) try gop2.value_ptr.ensureUnusedCapacity(self.allocator, 1);
+
+            gop1.value_ptr.appendAssumeCapacity(cell_id);
+            if (needs_reverse) gop2.value_ptr.appendAssumeCapacity(slot_id);
         }
     };
 }
@@ -371,7 +401,7 @@ fn readACompute(_: *CC) anyerror!u32 {
 }
 
 fn readATimesTwo(cc: *CC) anyerror!u32 {
-    cc.readCell(AsyncTestState.cell_a);
+    try cc.readCell(AsyncTestState.cell_a);
     return 84;
 }
 
@@ -410,7 +440,7 @@ const DepState = struct {
     var runs: u64 = 0;
 
     fn compute(cc: *CC) anyerror!u32 {
-        cc.readCell(DepState.cell);
+        try cc.readCell(DepState.cell);
         DepState.runs += 1;
         return 0;
     }
@@ -456,7 +486,7 @@ test "lazily/async_context: memo guard suppresses cascade when value unchanged" 
     }.eq;
     const constantCompute = struct {
         fn call(cc: *CC) anyerror!u32 {
-            cc.readCell(AsyncTestState.cell_a);
+            try cc.readCell(AsyncTestState.cell_a);
             return 100;
         }
     }.call;
@@ -539,22 +569,22 @@ const ChainState = struct {
     }
 
     fn a(cc: *CC) anyerror!u32 {
-        cc.readCell(cell_id);
+        try cc.readCell(cell_id);
         a_runs += 1;
         return (cc.async_ctx.getCell(cell_id) orelse 0) + 10;
     }
     fn b(cc: *CC) anyerror!u32 {
-        cc.readCell(a_id);
+        try cc.readCell(a_id);
         b_runs += 1;
         return (cc.async_ctx.get(a_id) orelse 0) + 100;
     }
     fn c(cc: *CC) anyerror!u32 {
-        cc.readCell(b_id);
+        try cc.readCell(b_id);
         c_runs += 1;
         return (cc.async_ctx.get(b_id) orelse 0) + 1000;
     }
     fn d(cc: *CC) anyerror!u32 {
-        cc.readCell(c_id);
+        try cc.readCell(c_id);
         d_runs += 1;
         return (cc.async_ctx.get(c_id) orelse 0) + 10000;
     }
@@ -631,16 +661,16 @@ const DiamondState = struct {
     var sink_runs: u64 = 0;
 
     fn left(cc: *CC) anyerror!u32 {
-        cc.readCell(cell_id);
+        try cc.readCell(cell_id);
         return (cc.async_ctx.getCell(cell_id) orelse 0) + 1;
     }
     fn right(cc: *CC) anyerror!u32 {
-        cc.readCell(cell_id);
+        try cc.readCell(cell_id);
         return (cc.async_ctx.getCell(cell_id) orelse 0) + 2;
     }
     fn sink(cc: *CC) anyerror!u32 {
-        cc.readCell(left_id);
-        cc.readCell(right_id);
+        try cc.readCell(left_id);
+        try cc.readCell(right_id);
         sink_runs += 1;
         return (cc.async_ctx.get(left_id) orelse 0) +
             (cc.async_ctx.get(right_id) orelse 0);
@@ -683,11 +713,11 @@ const AsyncEffectState = struct {
     var last_seen: u32 = 0;
 
     fn mid(cc: *CC) anyerror!u32 {
-        cc.readCell(cell_id);
+        try cc.readCell(cell_id);
         return (cc.async_ctx.getCell(cell_id) orelse 0) * 2;
     }
     fn effect(cc: *CC) anyerror!u32 {
-        cc.readCell(mid_id);
+        try cc.readCell(mid_id);
         const v = cc.async_ctx.get(mid_id) orelse 0;
         effect_runs += 1;
         last_seen = v;
@@ -773,4 +803,75 @@ test "lazily/async_context: read before the queue drains observes a stale value 
     _ = try ctx.settle();
     try std.testing.expectEqual(@as(u32, 1112), ctx.get(S.c_id).?);
     try std.testing.expectEqual(@as(usize, 0), ctx.pending.items.len);
+}
+
+// A dropped dependency edge is permanent, not best-effort. `reverse_edges` is
+// the only thing `setCell`/`settleOnce` consult to decide what to re-enqueue,
+// and `settleOnce` clears a slot's edges before every recompute — so the
+// recompute that would rebuild a dropped edge is exactly the one that can no
+// longer be triggered. `readCell` therefore propagates through the
+// `anyerror!V` its callers already return, and the slot lands in `.err` where
+// a reader can see it.
+
+const EdgeOomState = struct {
+    var cell_a: u64 = 0;
+    var cell_b: u64 = 0;
+    var read_extra: bool = false;
+
+    fn compute(_: *anyopaque, cc: *CC) anyerror!u32 {
+        try cc.readCell(cell_a);
+        // Second run pulls in a dependency never registered before, so the
+        // edge lists genuinely have to grow — a re-registration of an existing
+        // edge reuses retained capacity and never touches the allocator.
+        if (read_extra) try cc.readCell(cell_b);
+        return 7;
+    }
+};
+
+test "lazily/async_context: a dropped dependency edge must surface, not resolve silently" {
+    const S = EdgeOomState;
+    const backing = std.testing.allocator;
+    var ctx = ACtx.init(backing);
+    defer ctx.deinit();
+
+    S.read_extra = false;
+    S.cell_a = 9001;
+    S.cell_b = 9002;
+    try ctx.setCell(S.cell_a, 1);
+    try ctx.setCell(S.cell_b, 1);
+
+    var dummy: u8 = 0;
+    const slot_id = try ctx.computedAsyncClosure(&dummy, S.compute);
+    _ = try ctx.settle();
+    try std.testing.expectEqual(@as(u32, 7), ctx.get(slot_id).?);
+
+    // Queue the recompute while memory is still available, so the failure
+    // under test is the edge registration and not the enqueue.
+    S.read_extra = true;
+    try ctx.setCell(S.cell_a, 2);
+
+    var failing = std.testing.FailingAllocator.init(backing, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    ctx.allocator = failing.allocator();
+    _ = try ctx.settle();
+    ctx.allocator = backing;
+
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The assertion that fails against the old `catch {}`: the slot reports the
+    // failure instead of publishing a value whose dependency set is a lie.
+    // Under the old code this was `.resolved` holding 7, with the `cell_b` edge
+    // silently missing forever.
+    try std.testing.expectEqual(AsyncSlotState.err, ctx.slots.getPtr(slot_id).?.state);
+    try std.testing.expect(ctx.get(slot_id) == null);
+    try std.testing.expectError(error.OutOfMemory, ctx.awaitResolved(slot_id));
+
+    // And it stays visibly failed rather than quietly serving a stale value:
+    // the recompute that would have rebuilt the edge is the one that can no
+    // longer be reached, so silence here would have been permanent.
+    try ctx.setCell(S.cell_b, 42);
+    _ = try ctx.settle();
+    try std.testing.expectEqual(AsyncSlotState.err, ctx.slots.getPtr(slot_id).?.state);
 }

@@ -388,7 +388,7 @@ const AsyncModel = struct {
         const d: *AsyncDesc = @ptrCast(@alignCast(ptr));
         // Ids are uniform across cells and slots, so one edge registration
         // covers both cases.
-        cc.readCell(d.dep_id);
+        try cc.readCell(d.dep_id);
         const base = cc.async_ctx.getCell(d.dep_id) orelse
             cc.async_ctx.get(d.dep_id) orelse
             return error.AsyncDependencyUnresolved;
