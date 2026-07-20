@@ -88,8 +88,16 @@ pub fn slotKeyed(
             // storage pointer may be held by a reader on another thread.
             // It's freed at Context.deinit.
             if (cached_slot.stale) {
+                // Register the orphan BEFORE evicting it, and propagate.
+                // `orphaned_slots` is the only remaining owner of this slot
+                // once it leaves the cache, so the old
+                // `cacheRemove` + `append(...) catch {}` ordering could drop it
+                // from both — the same unreachable-leak shape as the destroy
+                // cascade. Appending first makes the pair all-or-nothing: on
+                // failure the slot is still cached, still stale, and the next
+                // read retries. This function already returns `!Slot.Result(T)`.
+                try ctx.orphaned_slots.append(ctx.allocator, cached_slot);
                 ctx.cacheRemove(cache_key);
-                ctx.orphaned_slots.append(ctx.allocator, cached_slot) catch {};
             }
         }
     }
@@ -917,4 +925,62 @@ test "lazily/slot: OOM reserving the destroy worklist must not leak the dependen
     // cannot fail against the old code for a behavioural reason (the counter
     // did not exist). The assertions above are the load-bearing ones.
     try std.testing.expectEqual(@as(u64, 1), ctx.destroy_cascade_oom_survivors);
+}
+
+// The stale-slot orphan hand-off has the same unreachable-leak shape as the
+// destroy cascade: `orphaned_slots` becomes the slot's only owner the moment it
+// leaves the cache, so `cacheRemove` followed by a swallowed `append` dropped it
+// from both and nothing ever freed it. Registering first makes the pair
+// all-or-nothing.
+
+const OrphanOomState = struct {
+    var source: u64 = 0;
+
+    fn srcFn(_: *Context) anyerror!u64 {
+        return source;
+    }
+};
+
+test "lazily/slot: OOM registering a stale orphan must leave the slot cached" {
+    const S = OrphanOomState;
+    const backing = std.testing.allocator;
+    const ctx = try Context.init(backing);
+    defer ctx.deinit();
+
+    S.source = 1;
+    _ = try slot(u64, ctx, S.srcFn, null);
+    const victim = ctx.cacheLookup(valueFnCacheKey(S.srcFn)).?;
+
+    // Make it stale so the next read takes the orphan hand-off path.
+    victim.stale = true;
+
+    var failing = std.testing.FailingAllocator.init(backing, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    ctx.allocator = failing.allocator();
+    const res = slot(u64, ctx, S.srcFn, null);
+    ctx.allocator = backing;
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The load-bearing assertion, and the one that fails against the old
+    // `catch {}`: SOMETHING still owns `victim`, so `ctx.deinit` will free it.
+    // The old ordering evicted it and then dropped the `orphaned_slots` append,
+    // leaving it owned by neither — while the read went on to succeed with a
+    // freshly published slot, so nothing anywhere reported a problem.
+    var owned = ctx.cacheLookup(valueFnCacheKey(S.srcFn)) == victim;
+    for (ctx.orphaned_slots.items) |o| {
+        if (o == victim) owned = true;
+    }
+    try std.testing.expect(owned);
+
+    // The failure is a retry point, not a wedge: the slot is still cached and
+    // still stale, so the read is reported rather than silently resolved.
+    try std.testing.expectError(error.OutOfMemory, res);
+    try std.testing.expect(victim.stale);
+
+    // And the retry succeeds once memory is back, so the failure was a retry
+    // point rather than a wedge.
+    S.source = 2;
+    try std.testing.expectEqual(@as(u64, 2), (try slot(u64, ctx, S.srcFn, null)).*);
 }
