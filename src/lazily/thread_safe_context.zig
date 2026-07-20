@@ -264,8 +264,16 @@ pub const ThreadSafeContext = struct {
         const p: *T = @ptrCast(@alignCast(node.box));
         p.* = value;
         self.invalidateDependentsUnlocked(handle.id);
-        // A publish, unlike a teardown, does run the effects it reaches.
-        self.flushEffectsUnlocked();
+        // A publish, unlike a teardown, does run the effects it reaches — but
+        // inside a batch the flush is deferred to the outermost exit, so N
+        // writes coalesce into one effect run rather than N
+        // (`lazily-spec/docs/reactive-graph.md` § batch, clause 3 of *Signal
+        // eagerness*; `signal_materializes_once_per_batch.json`).
+        //
+        // Invalidation stays inline: it is idempotent and only marks `dirty`.
+        // The flush is the part that costs a recompute, and it is the only part
+        // a batch is allowed to coalesce.
+        if (self.batch_depth == 0) self.flushEffectsUnlocked();
     }
 
     // --- computed slots ---
@@ -615,9 +623,19 @@ pub const ThreadSafeContext = struct {
 
     // --- batch ---
 
-    /// Run `f(userdata)` inside a batch boundary. Recompute here is lazy (on
-    /// read), so batching only nests a depth counter — writes never trigger an
-    /// intermediate recompute regardless. Kept for API parity with `Context`.
+    /// Run `f(userdata)` inside a batch boundary: every write commits and marks
+    /// its cone dirty immediately, but the *effect flush* is held until the
+    /// outermost exit, so N writes rerun each reached effect once rather than N
+    /// times (`lazily-spec/docs/reactive-graph.md` § batch).
+    ///
+    /// The depth counter used to be the whole implementation, on the reasoning
+    /// that recompute here is lazy-on-read so a batch has nothing to coalesce.
+    /// That holds for a plain computed and fails for an effect: `setCell`
+    /// flushes the pending effects it reached, and an effect body pulls the
+    /// slots it reads, so an eager reader recomputed once per write inside the
+    /// batch. `signal_materializes_once_per_batch.json` measures exactly that
+    /// (correct values, N× the work), which is why the fixture asserts a compute
+    /// count and not a value.
     pub fn batch(self: *Self, comptime R: type, userdata: *anyopaque, f: *const fn (*anyopaque) R) R {
         self.mutex.lock();
         self.batch_depth += 1;
@@ -625,7 +643,11 @@ pub const ThreadSafeContext = struct {
         const r = f(userdata);
         self.mutex.lock();
         self.batch_depth -= 1;
+        const outermost = self.batch_depth == 0;
         self.mutex.unlock();
+        // Outside the lock: `flushEffects` takes it, and the effect bodies it
+        // runs re-enter the context.
+        if (outermost) self.flushEffects();
         return r;
     }
 };

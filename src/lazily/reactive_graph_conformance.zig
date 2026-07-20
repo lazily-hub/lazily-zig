@@ -41,6 +41,7 @@ const ContextMod = @import("context.zig");
 const Context = ContextMod.Context;
 const CellMod = @import("cell.zig");
 const EffectMod = @import("effect.zig");
+const SignalMod = @import("signal.zig");
 const slotKeyed = @import("slot.zig").slotKeyed;
 const AsyncContext = @import("async_context.zig").AsyncContext;
 const ThreadSafeContext = @import("thread_safe_context.zig").ThreadSafeContext;
@@ -75,10 +76,13 @@ const FIXTURES = [_][]const u8{
     "disarm_disposes_nothing.json",
     "disposal_does_not_run_surviving_effects.json",
     "dispose_detaches_edges_both_directions.json",
+    "dispose_signal_reverts_to_lazy.json",
     "read_after_dispose_is_an_error.json",
     "recycled_id_inherits_nothing.json",
     "scope_teardown_equals_fold_of_disposals.json",
     "scoping_bounds_teardown_not_visibility.json",
+    "signal_materializes_once_per_batch.json",
+    "signal_materializes_without_a_read.json",
     "teardown_runs_members_in_reverse_creation_order.json",
     "transitive_invalidation_reaches_depth.json",
 };
@@ -89,6 +93,8 @@ const SUPPORTED_OPS = [_][]const u8{
     "set_cell",     "dispose",    "fanout",         "dispose_fanout",
     "churn",        "begin_scope", "end_scope",     "disarm",
     "dispose_stale_handle",
+    // Signal eagerness (`#lzsignaleager`).
+    "signal",       "dispose_signal", "batch",
 };
 
 /// Assertion keys this runner can evaluate. An `expect` key outside this set
@@ -99,6 +105,11 @@ const SUPPORTED_ASSERTIONS = [_][]const u8{
     "readable",       "dependents_of",   "dependencies_of",
     "observed_by",    "observed_count",  "cleanup_order",
     "scope_owned_count",
+    // Signal eagerness (`#lzsignaleager`). The *only* observable that
+    // distinguishes an eager signal from the lazy memo it is built on, so it is
+    // counted for real — one increment per actual invocation of the compute the
+    // runner synthesizes — never derived from op shape.
+    "computes_of",
 };
 
 /// Fixtures that cannot run against `lazily-zig` today, with the first
@@ -113,7 +124,31 @@ const EXPECTED_SKIPS = [_]struct { fixture: []const u8, op: []const u8 }{};
 /// Divergences this binding currently exhibits, keyed
 /// `<model>/<fixture><label>#<step>:<key>`. See the module doc: findings, never
 /// relaxations, and asserted in both directions.
-const EXPECTED_DIVERGENCES = [_][]const u8{};
+const EXPECTED_DIVERGENCES = [_][]const u8{
+    // `#lzsignaleager` clause 4, on `AsyncContext` only. Disposing a signal's
+    // eager puller must revert the backing value to lazy: the write at step 3
+    // carries no read, so a de-eagered node must not re-materialize
+    // (`computes_of.sig` 1). `AsyncContext` recomputes 2.
+    //
+    // Mechanism, and why this is not a puller bug: `AsyncContext` has no lazy
+    // mode for derived slots at all. `setCell` walks `reverse_edges` and calls
+    // `invalidateSlot` on every dependent, which bumps the revision and
+    // `enqueueCompute`s it unconditionally — there is no demand check, no
+    // "is anything reading this", and `settle` then drains the whole queue.
+    // Every derived slot in that context is eager whether or not a puller is
+    // attached, so disposing the puller removes nothing observable and the
+    // signal cannot revert to a memo. Clauses 1-3 pass here for the same
+    // reason clause 4 fails.
+    //
+    // Not fixed rather than not fixable: making derived slots demand-driven
+    // means `get`/`awaitResolved` must be able to pull a stale slot on read and
+    // `invalidateSlot` must stop enqueueing unreached nodes. That is a rewrite
+    // of the async scheduler, not a contained change, and every other plane
+    // built on this context (reliable_sync, async_reactive_map) depends on the
+    // current drain discipline. Clauses 1-3 hold on all three contexts and
+    // clause 4 holds on `Context` and `ThreadSafeContext`.
+    "AsyncContext/dispose_signal_reverts_to_lazy.json#3:computes_of.sig",
+};
 
 // ---------------------------------------------------------------------------
 // Shared effect log
@@ -332,16 +367,47 @@ const NodeTable = Table(MAX_NODES, error.TooManyNodes);
 const ScopeTable = Table(MAX_SCOPES, error.TooManyScopes);
 
 /// What kind of node an index holds. Drives read dispatch and `readable`.
-const Kind = enum { unset, cell, computed, effect };
+///
+/// `.signal` is a `.computed` with an eager puller attached; it reads
+/// identically, which is the whole reason `computes_of` exists.
+const Kind = enum { unset, cell, computed, effect, signal };
+
+/// Upper bound on `reads` per derived node. The corpus needs 2
+/// (`signal_materializes_once_per_batch.json` sums two cells).
+const MAX_DEPS = 4;
+
+/// Cumulative compute invocations per node index, never reset per step
+/// (`#lzsignaleager`). Incremented inside each model's synthesized compute, so
+/// it counts what actually ran rather than what the op stream implies.
+var compute_counts: [MAX_NODES]usize = @splat(0);
 
 /// The per-index node definition, rewritten as a fixture replays. Shared by all
 /// three models: the synchronous model's comptime functions read it, and the
 /// other two use it only to know a node's kind and shape.
 const Def = struct {
     kind: Kind = .unset,
-    dep: ?usize = null,
+    /// Every id this node reads, in fixture order. A `computed`/`effect` uses at
+    /// most one; a `signal` may sum several.
+    deps: [MAX_DEPS]usize = @splat(0),
+    ndeps: usize = 0,
     offset: V = 0,
     initial: V = 0,
+
+    /// The single dependency, for the ops that only ever have one.
+    fn dep(self: Def) ?usize {
+        return if (self.ndeps == 0) null else self.deps[0];
+    }
+
+    fn depSlice(self: *const Def) []const usize {
+        return self.deps[0..self.ndeps];
+    }
+
+    fn withDeps(kind: Kind, deps: []const usize, offset: V) !Def {
+        if (deps.len > MAX_DEPS) return error.TooManyReads;
+        var d = Def{ .kind = kind, .ndeps = deps.len, .offset = offset };
+        for (deps, 0..) |x, i| d.deps[i] = x;
+        return d;
+    }
 };
 
 var defs: [MAX_NODES]Def = @splat(.{});
@@ -350,6 +416,7 @@ var gens: [MAX_NODES]usize = @splat(0);
 fn resetDefs() void {
     defs = @splat(.{});
     gens = @splat(0);
+    compute_counts = @splat(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,14 +455,16 @@ fn SyncNodeFns(comptime i: usize) type {
         }
 
         fn compute(ctx: *Context) anyerror!V {
+            compute_counts[i] += 1;
             const d = defs[i];
-            const dep = d.dep orelse return d.offset;
-            return (try syncReadIndex(ctx, dep)) + d.offset;
+            var acc: V = d.offset;
+            for (d.depSlice()) |dep| acc += try syncReadIndex(ctx, dep);
+            return acc;
         }
 
         fn effectBody(ctx: *Context) anyerror!?SyncCleanup {
             EffectLog.recordRun(i);
-            if (defs[i].dep) |dep| {
+            if (defs[i].dep()) |dep| {
                 // A read that fails because a dependency is gone is the
                 // contract, not a test failure: the effect simply observes it.
                 _ = syncReadIndex(ctx, dep) catch {};
@@ -412,7 +481,10 @@ fn SyncNodeFns(comptime i: usize) type {
         fn read(ctx: *Context) anyerror!V {
             return switch (defs[i].kind) {
                 .cell => (try CellMod.cellKeyed(V, ctx, syncKey(i), cellInit, null)).tryGet(),
-                .computed => (try slotKeyed(V, ctx, syncKey(i), compute, null)).*,
+                // A signal reads through its backing slot exactly like a memo —
+                // that indistinguishability is the fixture's premise, so the
+                // runner must not give the signal a privileged read path.
+                .computed, .signal => (try slotKeyed(V, ctx, syncKey(i), compute, null)).*,
                 .effect => error.EffectHasNoValue,
                 .unset => error.UnsetNode,
             };
@@ -426,6 +498,33 @@ const sync_read_fns: [MAX_NODES]*const fn (*Context) anyerror!V = blk: {
     break :blk a;
 };
 
+/// The synthesized compute per node index, as a runtime pointer — `signalKeyed`
+/// takes its `valueFn` at runtime, unlike `signal`, which keys the slot cache by
+/// the comptime function pointer and so can only ever back one node.
+const sync_compute_fns: [MAX_NODES]*const fn (*Context) anyerror!V = blk: {
+    var a: [MAX_NODES]*const fn (*Context) anyerror!V = undefined;
+    for (0..MAX_NODES) |i| a[i] = SyncNodeFns(i).compute;
+    break :blk a;
+};
+
+/// The writes a `batch` op carries, staged for `Context.batch`, whose `run` is
+/// comptime — the same reason `defs` is module-level.
+const BatchWrite = struct { idx: usize, value: V };
+var staged_batch: [MAX_NODES]BatchWrite = undefined;
+var staged_batch_len: usize = 0;
+/// Set when a staged write failed inside the batch body. `Context.batch`'s `run`
+/// cannot return an error, so the failure is latched and rethrown at the call
+/// site rather than swallowed.
+var staged_batch_failed: ?anyerror = null;
+
+fn applyStagedBatch(ctx: *Context) void {
+    for (staged_batch[0..staged_batch_len]) |w| {
+        sync_set_cell_fns[w.idx](ctx, w.value) catch |e| {
+            if (staged_batch_failed == null) staged_batch_failed = e;
+        };
+    }
+}
+
 const SyncModel = struct {
     pub const NAME = "Context";
 
@@ -434,6 +533,8 @@ const SyncModel = struct {
     /// Effect handles, so `isActive` and the allocator-owned `Effect` struct
     /// can both be reached. Indexed by node index.
     effects: [MAX_NODES]?*EffectMod.Effect(SyncCleanup) = @splat(null),
+    /// Eager-signal handles (`#lzsignaleager`), also allocator-owned.
+    signals: [MAX_NODES]?*SignalMod.Signal(V) = @splat(null),
 
     fn create(allocator: std.mem.Allocator) !SyncModel {
         return .{ .ctx = try Context.init(allocator) };
@@ -446,6 +547,9 @@ const SyncModel = struct {
         }
         for (self.effects) |maybe| {
             if (maybe) |e| self.ctx.allocator.destroy(e);
+        }
+        for (self.signals) |maybe| {
+            if (maybe) |s| self.ctx.allocator.destroy(s);
         }
         self.ctx.deinit();
     }
@@ -460,18 +564,45 @@ const SyncModel = struct {
         _ = try sync_read_fns[idx](self.ctx);
     }
 
-    fn addComputed(self: *SyncModel, idx: usize, dep: ?usize, offset: V) !void {
+    fn addComputed(self: *SyncModel, idx: usize, deps: []const usize, offset: V) !void {
         gens[idx] += 1;
-        defs[idx] = .{ .kind = .computed, .dep = dep, .offset = offset };
+        defs[idx] = try Def.withDeps(.computed, deps, offset);
         // Materialize eagerly so the node exists as a graph member. Its
         // dependency edge registers on the first *read*, which is why the
         // corpus reads before asserting a degree.
         _ = sync_read_fns[idx](self.ctx) catch {};
     }
 
+    /// `Context`'s own eager construct. `signalKeyed` rather than `signal`
+    /// because the latter keys the slot cache by the comptime `valueFn` pointer.
+    fn addSignal(self: *SyncModel, idx: usize, deps: []const usize, offset: V) !void {
+        gens[idx] += 1;
+        defs[idx] = try Def.withDeps(.signal, deps, offset);
+        // `signalKeyed` does not reserve the eager-recompute queue entry that
+        // `signal` does, and `on_invalidate_hook`'s append has no recovery
+        // available — a dropped enqueue leaves the node serving its
+        // pre-invalidation value for the life of the Context. Reserve here and
+        // propagate OOM rather than discovering it as silent staleness.
+        try self.ctx.reserveEagerRecomputeSlot();
+        self.signals[idx] = try SignalMod.signalKeyed(V, self.ctx, syncKey(idx), sync_compute_fns[idx], null);
+    }
+
+    fn disposeSignal(self: *SyncModel, idx: usize) void {
+        if (self.signals[idx]) |s| s.dispose();
+    }
+
+    fn batch(self: *SyncModel, writes: []const BatchWrite) !void {
+        if (writes.len > staged_batch.len) return error.TooManyBatchWrites;
+        staged_batch_len = writes.len;
+        for (writes, 0..) |w, i| staged_batch[i] = w;
+        staged_batch_failed = null;
+        self.ctx.batch(applyStagedBatch);
+        if (staged_batch_failed) |e| return e;
+    }
+
     fn addEffect(self: *SyncModel, comptime_idx: usize, dep: ?usize) !void {
         gens[comptime_idx] += 1;
-        defs[comptime_idx] = .{ .kind = .effect, .dep = dep };
+        defs[comptime_idx] = try Def.withDeps(.effect, if (dep) |d| &[_]usize{d} else &[_]usize{}, 0);
         if (self.effects[comptime_idx]) |old| {
             self.ctx.allocator.destroy(old);
             self.effects[comptime_idx] = null;
@@ -570,20 +701,32 @@ const TsModel = struct {
 
     ctx: ThreadSafeContext,
     ids: [MAX_NODES]u64 = @splat(0),
+    /// The eager puller effect backing a `signal`, by the signal's node index.
+    puller_ids: [MAX_NODES]?u64 = @splat(null),
     descs: [MAX_NODES]TsDesc = @splat(.{}),
     scopes: [MAX_SCOPES]?ThreadSafeContext.TeardownScope = @splat(null),
 
     fn compute(ptr: *anyopaque, cc: *ThreadSafeContext.ComputeContext) V {
         const d: *TsDesc = @ptrCast(@alignCast(ptr));
+        compute_counts[d.idx] += 1;
         const def = defs[d.idx];
-        const dep = def.dep orelse return def.offset;
-        return cc.readNode(V, .{ .id = d.model.ids[dep] }) + def.offset;
+        var acc: V = def.offset;
+        for (def.depSlice()) |dep| acc += cc.readNode(V, .{ .id = d.model.ids[dep] });
+        return acc;
+    }
+
+    /// The eager puller for a signal: an ordinary Effect that reads the backing
+    /// memo and nothing else. Deliberately not `effectCompute` — a puller is not
+    /// an `observed_by` subscriber, so it must stay out of `EffectLog`.
+    fn signalPuller(ptr: *anyopaque, cc: *ThreadSafeContext.ComputeContext) V {
+        const d: *TsDesc = @ptrCast(@alignCast(ptr));
+        return cc.readNode(V, .{ .id = d.model.ids[d.idx] });
     }
 
     fn effectCompute(ptr: *anyopaque, cc: *ThreadSafeContext.ComputeContext) V {
         const d: *TsDesc = @ptrCast(@alignCast(ptr));
         EffectLog.recordRun(d.idx);
-        if (defs[d.idx].dep) |dep| {
+        if (defs[d.idx].dep()) |dep| {
             _ = cc.readNode(V, .{ .id = d.model.ids[dep] });
         }
         return 0;
@@ -616,14 +759,52 @@ const TsModel = struct {
         self.ids[idx] = (try self.ctx.cell(V, value)).id;
     }
 
-    fn addComputed(self: *TsModel, idx: usize, dep: ?usize, offset: V) !void {
-        defs[idx] = .{ .kind = .computed, .dep = dep, .offset = offset };
+    fn addComputed(self: *TsModel, idx: usize, deps: []const usize, offset: V) !void {
+        defs[idx] = try Def.withDeps(.computed, deps, offset);
         const h = try self.ctx.computedClosure(V, @ptrCast(self.bindDesc(idx)), compute);
         self.ids[idx] = h.id;
     }
 
+    /// `ThreadSafeContext` has no `Signal` type, so the signal is built the way
+    /// the spec derives it: a memo plus an Effect that pulls it. Eagerness is
+    /// then a property of effect scheduling rather than of a bespoke node kind —
+    /// which is exactly what clause 3 measures.
+    fn addSignal(self: *TsModel, idx: usize, deps: []const usize, offset: V) !void {
+        try self.addComputed(idx, deps, offset);
+        defs[idx].kind = .signal;
+        const d = self.bindDesc(idx);
+        const puller = try self.ctx.effectClosure(V, @ptrCast(d), signalPuller, null, null);
+        self.puller_ids[idx] = puller.id;
+    }
+
+    fn disposeSignal(self: *TsModel, idx: usize) void {
+        if (self.puller_ids[idx]) |pid| {
+            self.ctx.disposeNode(pid);
+            self.puller_ids[idx] = null;
+        }
+    }
+
+    fn batch(self: *TsModel, writes: []const BatchWrite) !void {
+        const Body = struct {
+            model: *TsModel,
+            writes: []const BatchWrite,
+            /// `batch`'s body returns a plain value, so a failed write is
+            /// latched and rethrown at the call site rather than swallowed.
+            failed: ?anyerror = null,
+            fn run(ptr: *anyopaque) void {
+                const b: *@This() = @ptrCast(@alignCast(ptr));
+                for (b.writes) |w| b.model.setCell(w.idx, w.value) catch |e| {
+                    if (b.failed == null) b.failed = e;
+                };
+            }
+        };
+        var body = Body{ .model = self, .writes = writes };
+        self.ctx.batch(void, @ptrCast(&body), Body.run);
+        if (body.failed) |e| return e;
+    }
+
     fn addEffect(self: *TsModel, idx: usize, dep: ?usize) !void {
-        defs[idx] = .{ .kind = .effect, .dep = dep };
+        defs[idx] = try Def.withDeps(.effect, if (dep) |dd| &[_]usize{dd} else &[_]usize{}, 0);
         const d = self.bindDesc(idx);
         const h = try self.ctx.effectClosure(V, @ptrCast(d), effectCompute, @ptrCast(d), effectCleanup);
         self.ids[idx] = h.id;
@@ -700,6 +881,7 @@ const AsyncModel = struct {
 
     ctx: ACtx,
     ids: [MAX_NODES]u64 = @splat(0),
+    puller_ids: [MAX_NODES]?u64 = @splat(null),
     descs: [MAX_NODES]AsyncDesc = @splat(.{}),
     scopes: [MAX_SCOPES]?ACtx.TeardownScope = @splat(null),
 
@@ -714,15 +896,24 @@ const AsyncModel = struct {
 
     fn compute(ptr: *anyopaque, cc: *ACtx.ComputeContext) anyerror!V {
         const d: *AsyncDesc = @ptrCast(@alignCast(ptr));
+        compute_counts[d.idx] += 1;
         const def = defs[d.idx];
-        const dep = def.dep orelse return def.offset;
-        return (try readDep(cc, d.model.ids[dep])) + def.offset;
+        var acc: V = def.offset;
+        for (def.depSlice()) |dep| acc += try readDep(cc, d.model.ids[dep]);
+        return acc;
+    }
+
+    /// See `TsModel.signalPuller`: the eager puller is an ordinary Effect that
+    /// reads the backing memo, and it stays out of `EffectLog`.
+    fn signalPuller(ptr: *anyopaque, cc: *ACtx.ComputeContext) anyerror!V {
+        const d: *AsyncDesc = @ptrCast(@alignCast(ptr));
+        return readDep(cc, d.model.ids[d.idx]);
     }
 
     fn effectCompute(ptr: *anyopaque, cc: *ACtx.ComputeContext) anyerror!V {
         const d: *AsyncDesc = @ptrCast(@alignCast(ptr));
         EffectLog.recordRun(d.idx);
-        if (defs[d.idx].dep) |dep| {
+        if (defs[d.idx].dep()) |dep| {
             _ = readDep(cc, d.model.ids[dep]) catch {};
         }
         return 0;
@@ -755,16 +946,45 @@ const AsyncModel = struct {
         self.ids[idx] = try self.ctx.cell(value);
     }
 
-    fn addComputed(self: *AsyncModel, idx: usize, dep: ?usize, offset: V) !void {
-        defs[idx] = .{ .kind = .computed, .dep = dep, .offset = offset };
+    fn addComputed(self: *AsyncModel, idx: usize, deps: []const usize, offset: V) !void {
+        defs[idx] = try Def.withDeps(.computed, deps, offset);
         self.ids[idx] = try self.ctx.computedAsyncClosure(@ptrCast(self.bindDesc(idx)), compute);
         // Drain so the dependency edge this slot registers exists before the
         // next level is declared against it.
         _ = try self.ctx.settle();
     }
 
+    /// Same composed construction as `TsModel.addSignal`: memo plus a pulling
+    /// Effect.
+    fn addSignal(self: *AsyncModel, idx: usize, deps: []const usize, offset: V) !void {
+        try self.addComputed(idx, deps, offset);
+        defs[idx].kind = .signal;
+        const d = self.bindDesc(idx);
+        self.puller_ids[idx] = try self.ctx.effectAsyncClosure(@ptrCast(d), signalPuller, null, null);
+        _ = try self.ctx.settle();
+    }
+
+    fn disposeSignal(self: *AsyncModel, idx: usize) void {
+        if (self.puller_ids[idx]) |pid| {
+            self.ctx.disposeNode(pid);
+            self.puller_ids[idx] = null;
+        }
+    }
+
+    /// `AsyncContext` has no batch boundary of its own: it is queue-drained, so
+    /// its flush point *is* `settle`. Writing every value before a single settle
+    /// is therefore the batch — the invalidations coalesce in `pending` under
+    /// the `queued` flag exactly as a batch requires.
+    fn batch(self: *AsyncModel, writes: []const BatchWrite) !void {
+        for (writes) |w| {
+            defs[w.idx].initial = w.value;
+            try self.ctx.setCell(self.ids[w.idx], w.value);
+        }
+        _ = try self.ctx.settle();
+    }
+
     fn addEffect(self: *AsyncModel, idx: usize, dep: ?usize) !void {
-        defs[idx] = .{ .kind = .effect, .dep = dep };
+        defs[idx] = try Def.withDeps(.effect, if (dep) |dd| &[_]usize{dd} else &[_]usize{}, 0);
         const d = self.bindDesc(idx);
         self.ids[idx] = try self.ctx.effectAsyncClosure(@ptrCast(d), effectCompute, @ptrCast(d), effectCleanup);
         _ = try self.ctx.settle();
@@ -935,16 +1155,22 @@ fn Engine(comptime Model: type) type {
         fn create(self: *Self, op: json.Value, op_type: []const u8, id: []const u8) !void {
             const idx = try self.nodes.intern(id);
             const reads = if (field(op, "reads")) |r| try asArray(r) else &[_]json.Value{};
-            if (reads.len > 1) return error.MultiParentNodeUnsupported;
-            const dep: ?usize = if (reads.len == 1) try self.node(try asString(reads[0])) else null;
+            if (reads.len > MAX_DEPS) return error.TooManyReads;
+            var dep_buf: [MAX_DEPS]usize = undefined;
+            for (reads, 0..) |r, i| dep_buf[i] = try self.node(try asString(r));
+            const deps = dep_buf[0..reads.len];
             const offset: V = if (field(op, "offset")) |o| try asI64(o) else 0;
 
             if (std.mem.eql(u8, op_type, "cell")) {
                 try self.model.addCell(idx, try asI64(field(op, "value") orelse return error.MissingValue));
             } else if (std.mem.eql(u8, op_type, "computed")) {
-                try self.model.addComputed(idx, dep, offset);
+                try self.model.addComputed(idx, deps, offset);
+            } else if (std.mem.eql(u8, op_type, "signal")) {
+                try self.model.addSignal(idx, deps, offset);
             } else {
-                try self.model.addEffect(idx, dep);
+                // Effects read at most one node in this corpus.
+                if (deps.len > 1) return error.MultiParentNodeUnsupported;
+                try self.model.addEffect(idx, if (deps.len == 1) deps[0] else null);
             }
 
             if (field(op, "scope")) |s| {
@@ -958,6 +1184,7 @@ fn Engine(comptime Model: type) type {
 
             if (std.mem.eql(u8, op_type, "cell") or
                 std.mem.eql(u8, op_type, "computed") or
+                std.mem.eql(u8, op_type, "signal") or
                 std.mem.eql(u8, op_type, "effect"))
             {
                 try self.create(op, op_type, try asString(field(op, "id") orelse return error.MissingOpId));
@@ -968,6 +1195,21 @@ fn Engine(comptime Model: type) type {
             } else if (std.mem.eql(u8, op_type, "set_cell")) {
                 const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
                 try self.model.setCell(idx, try asI64(field(op, "value") orelse return error.MissingValue));
+            } else if (std.mem.eql(u8, op_type, "dispose_signal")) {
+                // Disposes the eager puller and nothing else — not a node
+                // teardown. The backing value stays live and lazy (clause 4).
+                self.model.disposeSignal(try self.node(try asString(field(op, "id") orelse return error.MissingOpId)));
+            } else if (std.mem.eql(u8, op_type, "batch")) {
+                const writes = try asArray(field(op, "writes") orelse return error.MissingWrites);
+                var buf: [MAX_NODES]BatchWrite = undefined;
+                if (writes.len > buf.len) return error.TooManyBatchWrites;
+                for (writes, 0..) |w, i| {
+                    buf[i] = .{
+                        .idx = try self.node(try asString(field(w, "id") orelse return error.MissingOpId)),
+                        .value = try asI64(field(w, "value") orelse return error.MissingValue),
+                    };
+                }
+                try self.model.batch(buf[0..writes.len]);
             } else if (std.mem.eql(u8, op_type, "dispose")) {
                 self.model.dispose(try self.node(try asString(field(op, "id") orelse return error.MissingOpId)));
             } else if (std.mem.eql(u8, op_type, "fanout")) {
@@ -1203,6 +1445,18 @@ fn Engine(comptime Model: type) type {
                         else
                             self.model.dependencyCount(idx);
                         self.check(sub, got, want);
+                    }
+                } else if (std.mem.eql(u8, key, "computes_of")) {
+                    // Cumulative from the start of the scenario, including the
+                    // invocation at creation, and never reset per step. Read
+                    // straight off the counter the synthesized compute bumps —
+                    // deriving it from the op stream would defeat the fixtures.
+                    const map = try asObject(raw);
+                    for (try sortedKeys(map)) |id| {
+                        const want = try asUsize(map.get(id).?);
+                        var k: [96]u8 = undefined;
+                        const sub = std.fmt.bufPrint(&k, "computes_of.{s}", .{id}) catch "computes_of";
+                        self.check(sub, compute_counts[try self.node(id)], want);
                     }
                 } else if (std.mem.eql(u8, key, "observed_by")) {
                     try self.checkIdList("observed_by", EffectLog.runs.items[runs_before..], try asArray(raw), false);
