@@ -57,7 +57,27 @@ pub const ThreadSafeContext = struct {
         ctx: *Self,
         slot_id: u64,
         pub fn readNode(self: *ComputeContext, comptime T: type, handle: TsHandle(T)) T {
-            self.ctx.addEdgeUnlocked(self.slot_id, handle.id) catch {};
+            self.ctx.addEdgeUnlocked(self.slot_id, handle.id) catch {
+                // Poison, do not swallow. `dependents` is the only list
+                // `invalidateDependentsUnlocked` walks, and `dirty` is the only
+                // flag `getUnlocked` consults — so a dropped edge means this
+                // slot is never marked dirty for `handle` again. And
+                // `Recompute.run` clears deps before every compute, so the
+                // recompute that would rebuild the edge is exactly the one
+                // that can no longer be triggered. Permanent silent staleness.
+                //
+                // `ComputeFn(T)` returns plain `T`, so unlike `AsyncContext`'s
+                // `anyerror!V` there is no error union to propagate through and
+                // no signature is changed here. Instead the slot's edge set is
+                // marked incomplete: `Recompute.run` then refuses to clear
+                // `dirty`, so `getUnlocked` recomputes on EVERY read. That is
+                // conservative over-recomputation in place of silent
+                // staleness, and it is self-healing — each read retries the
+                // registration, and the first one that succeeds lets `dirty`
+                // clear again.
+                if (self.ctx.nodes.getPtr(self.slot_id)) |n| n.edges_incomplete = true;
+                self.ctx.edge_drop_degradations += 1;
+            };
             return self.ctx.getUnlocked(T, handle.id);
         }
     };
@@ -74,6 +94,11 @@ pub const ThreadSafeContext = struct {
         /// for cells.
         recompute_fn: ?*const fn (*Self, u64) void = null,
         dirty: bool = false,
+        /// Set when a dependency edge could not be registered during the last
+        /// compute. While true, `Recompute.run` leaves `dirty` set so the slot
+        /// recomputes on every read rather than trusting an edge set that is
+        /// known to be missing entries. Cleared at the start of each compute.
+        edges_incomplete: bool = false,
         deps: std.ArrayList(u64), // nodes this reads
         dependents: std.ArrayList(u64), // nodes that read this
     };
@@ -83,6 +108,14 @@ pub const ThreadSafeContext = struct {
     next_id: u64,
     nodes: std.AutoHashMap(u64, Node),
     batch_depth: usize,
+    /// Count of dependency-edge registrations dropped for lack of memory. Each
+    /// one left its slot in the always-recompute degraded mode above. Non-zero
+    /// means the graph traded work for correctness at least once.
+    edge_drop_degradations: u64 = 0,
+    /// Count of invalidation cascades that could not snapshot a dependents list
+    /// and fell back to marking every computed node dirty. Non-zero means the
+    /// graph was conservatively over-invalidated. Mirrors `Context.cascade_oom_fallbacks`.
+    invalidate_oom_fallbacks: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -225,6 +258,9 @@ pub const ThreadSafeContext = struct {
                 var node = self.nodes.getPtr(id).?;
                 // Clear old dependency edges (re-discovered each compute).
                 self.clearDepsUnlocked(id);
+                // Reset the poison before re-registering: a compute that gets
+                // all of its edges back is healed and may clear `dirty` again.
+                self.nodes.getPtr(id).?.edges_incomplete = false;
                 const compute: ComputeFn(T) = @ptrCast(@alignCast(node.compute_erased.?));
                 var cc = ComputeContext{ .ctx = self, .slot_id = id };
                 const result = compute(node.compute_ptr.?, &cc);
@@ -232,7 +268,10 @@ pub const ThreadSafeContext = struct {
                 const old = readBox(T, node.box);
                 const p: *T = @ptrCast(@alignCast(node.box));
                 p.* = result;
-                node.dirty = false;
+                // Only clear `dirty` if every edge this compute asked for was
+                // actually registered. Otherwise the slot stays dirty and
+                // recomputes on every read — see `ComputeContext.readNode`.
+                node.dirty = node.edges_incomplete;
                 if (!std.meta.eql(old, result)) {
                     self.invalidateDependentsUnlocked(id);
                 }
@@ -242,14 +281,22 @@ pub const ThreadSafeContext = struct {
 
     // --- dependency graph plumbing (all unlocked; callers hold the mutex) ---
 
+    /// All-or-nothing. The old body appended the forward edge and only then
+    /// looked the dependency up, so both an absent `dep_id` and an OOM on the
+    /// reverse append left a one-sided edge: a dependency the slot believes it
+    /// has, that no `setCell` will ever fire on. Reserve both lists before
+    /// touching either.
     fn addEdgeUnlocked(self: *Self, slot_id: u64, dep_id: u64) !void {
+        if (slot_id == dep_id) return; // a self-read is not an edge
         const slot = self.nodes.getPtr(slot_id) orelse return;
         for (slot.deps.items) |d| {
             if (d == dep_id) return;
         }
-        try slot.deps.append(self.allocator, dep_id);
         const dep = self.nodes.getPtr(dep_id) orelse return;
-        try dep.dependents.append(self.allocator, slot_id);
+        try slot.deps.ensureUnusedCapacity(self.allocator, 1);
+        try dep.dependents.ensureUnusedCapacity(self.allocator, 1);
+        slot.deps.appendAssumeCapacity(dep_id);
+        dep.dependents.appendAssumeCapacity(slot_id);
     }
 
     fn clearDepsUnlocked(self: *Self, slot_id: u64) void {
@@ -270,7 +317,21 @@ pub const ThreadSafeContext = struct {
     fn invalidateDependentsUnlocked(self: *Self, id: u64) void {
         const node = self.nodes.getPtr(id) orelse return;
         // Snapshot: recursion may mutate the list.
-        const snapshot = self.allocator.dupe(u64, node.dependents.items) catch return;
+        const snapshot = self.allocator.dupe(u64, node.dependents.items) catch {
+            // The old `catch return` abandoned the entire cascade: every
+            // transitive dependent stayed `dirty == false`, and `getUnlocked`
+            // only recomputes when `dirty`, so they served stale boxes forever
+            // with nothing left to rebuild the state. Degrade conservatively
+            // instead — mark every computed node dirty. Over-invalidating and
+            // correct beats precise and silently wrong, matching
+            // `Context.cascadeFallbackMarkAllStaleUnlocked`.
+            self.invalidate_oom_fallbacks += 1;
+            var it = self.nodes.valueIterator();
+            while (it.next()) |n| {
+                if (n.recompute_fn != null) n.dirty = true;
+            }
+            return;
+        };
         defer self.allocator.free(snapshot);
         for (snapshot) |dep_slot| {
             const dep = self.nodes.getPtr(dep_slot) orelse continue;
@@ -369,4 +430,115 @@ test "lazily/thread_safe_context: shared across threads under the lock" {
     }
     for (threads) |t| t.join();
     for (0..N) |i| try testing.expectEqual(@as(u32, 100), ctx.getCell(u32, handles[i]));
+}
+
+// A dropped dependency edge on the thread-safe path is permanent, exactly as it
+// is on the async path, but for different machinery: invalidation here is a
+// lazy `dirty` pull, not a queue. `setCell` -> `invalidateDependentsUnlocked`
+// walks `dependents` and nothing else; `getUnlocked` recomputes iff `dirty`.
+// So a slot missing from a cell's `dependents` is never marked dirty, never
+// recomputes, and — since `Recompute.run` clears deps before every compute —
+// never gets the chance to re-register the edge. `ComputeFn(T)` returns plain
+// `T`, so there is no error union to ride; the slot is poisoned into
+// always-recompute instead.
+
+const TsEdgeOomState = struct {
+    var cell_a: TsHandle(u32) = .{ .id = 0 };
+    var cell_b: TsHandle(u32) = .{ .id = 0 };
+    var read_extra: bool = false;
+
+    fn compute(_: *anyopaque, cc: *ThreadSafeContext.ComputeContext) u32 {
+        var acc = cc.readNode(u32, cell_a);
+        // Pulled in only on the second run, so the edge lists genuinely have to
+        // grow: re-registering an existing edge reuses retained capacity and
+        // never reaches the allocator.
+        if (read_extra) acc += cc.readNode(u32, cell_b);
+        return acc;
+    }
+};
+
+test "lazily/thread_safe_context: a dropped edge must not leave the slot silently detached" {
+    const S = TsEdgeOomState;
+    const backing = testing.allocator;
+    var ctx = ThreadSafeContext.init(backing);
+    defer ctx.deinit();
+
+    S.read_extra = false;
+    S.cell_a = try ctx.cell(u32, 1);
+    S.cell_b = try ctx.cell(u32, 100);
+
+    var dummy: u8 = 0;
+    const slot = try ctx.computedClosure(u32, &dummy, S.compute);
+    try testing.expectEqual(@as(u32, 1), ctx.get(u32, slot));
+
+    // Dirty the slot while memory is available, so the failure under test is
+    // the edge registration and not the invalidation snapshot.
+    S.read_extra = true;
+    ctx.setCell(u32, S.cell_a, 2);
+
+    // `resize_fail_index` matters: an ArrayList grows by trying an in-place
+    // remap first, and a FailingAllocator that only fails fresh allocations
+    // lets that remap through, leaving the test vacuously green.
+    var failing = std.testing.FailingAllocator.init(backing, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    ctx.allocator = failing.allocator();
+    _ = ctx.get(u32, slot);
+    ctx.allocator = backing;
+    try testing.expect(failing.has_induced_failure);
+
+    // THE load-bearing assertion, and deliberately first: a write to the cell
+    // whose edge was dropped must still reach the slot. Under the old
+    // `catch {}` the slot was absent from `cell_b.dependents`, so it was never
+    // marked dirty, `getUnlocked` returned the stale box, and this read
+    // yielded 102 (the pre-write value) forever.
+    ctx.setCell(u32, S.cell_b, 500);
+    try testing.expectEqual(@as(u32, 502), ctx.get(u32, slot));
+
+    // The degradation is self-healing: with memory back, the recompute above
+    // re-registered both edges, so the slot has left always-recompute mode and
+    // tracks normally again.
+    try testing.expect(!ctx.nodes.getPtr(slot.id).?.edges_incomplete);
+    ctx.setCell(u32, S.cell_a, 3);
+    try testing.expectEqual(@as(u32, 503), ctx.get(u32, slot));
+
+    // Checked last: the counter cannot fail against the old code for a
+    // behavioural reason, since the field did not exist.
+    try testing.expectEqual(@as(u64, 1), ctx.edge_drop_degradations);
+}
+
+test "lazily/thread_safe_context: an unsnapshotable cascade over-invalidates rather than going silent" {
+    const backing = testing.allocator;
+    var ctx = ThreadSafeContext.init(backing);
+    defer ctx.deinit();
+
+    const src = try ctx.cell(u32, 1);
+    const Compute = struct {
+        var cell_id: TsHandle(u32) = .{ .id = 0 };
+        fn run(_: *anyopaque, cc: *ThreadSafeContext.ComputeContext) u32 {
+            return cc.readNode(u32, cell_id) * 10;
+        }
+    };
+    Compute.cell_id = src;
+    var dummy: u8 = 0;
+    const derived = try ctx.computedClosure(u32, &dummy, Compute.run);
+    try testing.expectEqual(@as(u32, 10), ctx.get(u32, derived));
+
+    // Starve the `dupe` that snapshots `src.dependents`.
+    var failing = std.testing.FailingAllocator.init(backing, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    ctx.allocator = failing.allocator();
+    ctx.setCell(u32, src, 9);
+    ctx.allocator = backing;
+    try testing.expect(failing.has_induced_failure);
+
+    // The assertion that fails against the old `catch return`: the write is
+    // still observable. The old code abandoned the cascade, leaving `derived`
+    // with `dirty == false` and `getUnlocked` serving the stale 10.
+    try testing.expectEqual(@as(u32, 90), ctx.get(u32, derived));
+
+    try testing.expectEqual(@as(u64, 1), ctx.invalidate_oom_fallbacks);
 }
