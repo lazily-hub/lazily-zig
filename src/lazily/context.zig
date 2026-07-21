@@ -196,6 +196,15 @@ pub const Context = struct {
     // Context. Backs the `pending_recompute` capacity reservation — see
     // `reserveEagerRecomputeSlot`.
     eager_nodes: u64 = 0,
+    /// Owner-keyed side table for driven formulas (`#lzcellkernel`, §9.3.3):
+    /// maps a driven `FormulaCell`'s `cache_key` to its backing `*Slot`. One
+    /// entry per **driven** formula, zero per lazy one — the `EdgeIndex`
+    /// precedent (per-node `driven` bit for the common case, a side table for
+    /// the rare "which puller drives me"). Cleared on `undrive`/dispose so a
+    /// recycled id never inherits a stale driver entry (the `recycled_id`
+    /// hazard, §9.3.3). Keyed by `cache_key`, the same node identity `handle()`
+    /// uses.
+    driven_by: std.AutoHashMapUnmanaged(usize, *Slot) = .{},
     // Count of destroy cascades (`Slot.destroySelf`) that could not reserve
     // worklist capacity for a node's subscriber batch and left those
     // dependents alive instead of destroying them. The survivors keep their
@@ -329,6 +338,9 @@ pub const Context = struct {
             self.allocator.free(arr);
         }
         self.pending_recompute.deinit(self.allocator);
+        // Driven-formula side table (`#lzcellkernel`): pointers are owned by the
+        // cache/arena above, so only the map's own storage is freed here.
+        self.driven_by.deinit(self.allocator);
 
         // Free orphaned slots (stale-removed from cache but kept alive because
         // reader threads may hold storage pointers into them). At deinit, all
@@ -396,6 +408,22 @@ pub const Context = struct {
             self.allocator,
             @intCast(self.eager_nodes),
         );
+    }
+
+    /// Record that `slot` backs a driven formula (`#lzcellkernel`). The
+    /// `driven` bit on the slot is the source of truth for idempotency; this
+    /// side-table entry only answers "which puller drives me" for teardown, so
+    /// an OOM here is non-fatal — leave the entry absent and let the bit drive
+    /// `undrive`. Keyed by `cache_key`.
+    pub fn recordDriven(self: *Context, slot: *Slot) void {
+        const key = slot.cache_key orelse return;
+        self.driven_by.put(self.allocator, key, slot) catch {};
+    }
+
+    /// Forget a driven formula's side-table entry — the `undrive`/dispose path.
+    pub fn forgetDriven(self: *Context, slot: *Slot) void {
+        const key = slot.cache_key orelse return;
+        _ = self.driven_by.remove(key);
     }
 
     /// Drain the pending-recompute queue. Called outside the graph mutex so that
@@ -1187,6 +1215,14 @@ pub const Slot = struct {
     /// `error.NodeDisposed` instead of silently minting a replacement — which
     /// is what `read_after_dispose_is_an_error.json` forbids.
     disposed: bool = false,
+    /// Driven-formula bit (`#lzcellkernel`). Set when this slot backs an eager
+    /// (`formula().drive()`) `FormulaCell` — the graph-state that replaces the
+    /// former standalone `Signal` node. Lands in the existing tail bool cluster
+    /// (`#lzzigslotpack`), so `@sizeOf(Slot)` is unchanged (asserted in
+    /// cell.zig). "Which puller drives me" lives off the node in
+    /// `Context.driven_by`, so a lazy slot pays nothing. Cleared on
+    /// `undrive`/dispose.
+    driven: bool = false,
     /// Intrusive teardown-cascade link (`#lzspecedgeindex`).
     ///
     /// The publish cascade uses `Context.cascade_scratch`, an `ArrayList` that

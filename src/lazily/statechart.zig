@@ -21,8 +21,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
-const cell = @import("cell.zig").cell;
-const Cell = @import("cell.zig").Cell;
+const cell = @import("cell.zig").source;
+// The state configuration is a plain source cell (`#lzcellkernel`).
+const Cell = @import("cell.zig").SourceCell;
 
 /// Cross-version empty initializer for `ArrayListUnmanaged`. Zig <0.16
 /// initializes with `.{}`; >=0.16 uses the declared `.empty` constant.

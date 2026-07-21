@@ -1,8 +1,25 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+// Cell kernel (`#lzcellkernel`) — the genus `Cell(T, K)` with `SourceCell` /
+// `FormulaCell`, and the `source` / `formula` / `.drive()` constructor surface.
+// See tasks/software/lazily-cell-kernel-design.md.
+pub const Cell = @import("./lazily/cell.zig").Cell;
+pub const SourceCell = @import("./lazily/cell.zig").SourceCell;
+pub const SourceCellWith = @import("./lazily/cell.zig").SourceCellWith;
+pub const FormulaCell = @import("./lazily/cell.zig").FormulaCell;
+pub const Source = @import("./lazily/cell.zig").Source;
+pub const Formula = @import("./lazily/cell.zig").Formula;
+pub const KeepLatest = @import("./lazily/cell.zig").KeepLatest;
+pub const SumPolicy = @import("./lazily/cell.zig").SumPolicy;
+pub const MaxPolicy = @import("./lazily/cell.zig").MaxPolicy;
+pub const source = @import("./lazily/cell.zig").source;
+pub const sourceWith = @import("./lazily/cell.zig").sourceWith;
+pub const sourceKeyed = @import("./lazily/cell.zig").sourceKeyed;
+pub const formula = @import("./lazily/cell.zig").formula;
+pub const formulaKeyed = @import("./lazily/cell.zig").formulaKeyed;
+// Deprecated aliases for the former reactive-value vocabulary.
 pub const cell = @import("./lazily/cell.zig").cell;
 pub const CellFn = @import("./lazily/cell.zig").CellFn;
-pub const Cell = @import("./lazily/cell.zig").Cell;
 pub const initCellFn = @import("./lazily/cell.zig").initCellFn;
 pub const Context = @import("./lazily/context.zig").Context;
 pub const ParkingMutex = @import("./lazily/parking_mutex.zig").ParkingMutex;

@@ -244,6 +244,27 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
     }.recompute;
 }
 
+/// Install the eager-recompute puller on `slot_ptr` — the mechanism behind a
+/// **driven** `FormulaCell` (`formula().drive()`), which retires the standalone
+/// `Signal`. Reserves the `pending_recompute` entry up front (so the hook can
+/// never fail to enqueue) and installs the same `on_invalidate` / `recompute`
+/// hooks `signal()` uses. The coalescing is provided by the batch-gated flush
+/// in `Cell.set` + `drainPendingRecompute`, so N writes in a batch materialize
+/// the formula once (the `#lzsignaleager` clause-3 property).
+pub fn installEagerHooks(comptime T: type, slot_ptr: *Slot) !void {
+    try slot_ptr.ctx.reserveEagerRecomputeSlot();
+    slot_ptr.on_invalidate = &on_invalidate_hook;
+    slot_ptr.recompute = makeRecomputeFn(T);
+}
+
+/// Remove the eager-recompute puller installed by `installEagerHooks` — the
+/// `undrive` transition. Reverts the node to lazy (recomputed on next read).
+pub fn removeEagerHooks(slot_ptr: *Slot) void {
+    naiveDisposeScan(slot_ptr);
+    slot_ptr.on_invalidate = null;
+    slot_ptr.recompute = null;
+}
+
 pub fn signal(
     comptime T: type,
     ctx: *Context,

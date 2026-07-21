@@ -21,7 +21,7 @@ notes and platform carve-outs lives in
 <!-- coverage-table:start -->
 | Feature | Rust | Python | Kotlin | JS | Dart | Zig | Go | C++ |
 | --------- | :----: | :------: | :------: | :--: | :----: | :---: | :--: | :---: |
-| Reactive graph — core `Cell` / `Slot` / `Effect` (+ derived `Signal` = `Slot.eager`) / memo / batch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Reactive graph — kernel `Cell<T, K>` (`SourceCell` / `FormulaCell` / `Effect`) + driven `FormulaCell` (`formula().drive()`) / guarded formulas / batch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Keyed-map materialization (`SlotMap`) — mint-on-access derived slots: transparency + deferral (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Thread-safe keyed map (`ThreadSafeSlotMap`) — `Send + Sync` + materialization confluence (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async keyed map (`AsyncSlotMap`) — eventual transparency (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -36,7 +36,7 @@ notes and platform carve-outs lives in
 | Reactive queue (`QueueCell` SPSC/MPSC + `QueueStorage` adapter) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Broadcast topic (`TopicCell`) — independent cursors + durable replay + safe GC (`#lztopiccell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Competing-consumer work queue (`WorkQueueCell`) — exclusive leases + ack/nack + redelivery + DLQ (`#lzworkqueue`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Merge algebra + `MergeCell` — associative `MergePolicy` (`KeepLatest`/`Sum`/`Max`/`SetUnion`/`RawFifo`), `Cell ≡ MergeCell<KeepLatest>`, `Reactive`/`Source` split (`#relaycell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Merge algebra + `SourceCell<T, M>` — associative `MergePolicy` (`KeepLatest`/`Sum`/`Max`/`SetUnion`/`RawFifo`), `Cell ≡ SourceCell<KeepLatest>`, read-genus/write-`Source<M>` split (`#relaycell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | RelayCell — conflating relay + `BackpressurePolicy` + `SpillStore` + `Transport` + Inbox/Outbox + Rate/Window/Expiry/Priority/keyed policies (`#relaycell`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Free-text character CRDT (`TextCrdt`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TextCrdt` delta sync (`version_vector` / `delta_since` / `apply_delta`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -82,7 +82,7 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/ipc.zig` | Shared lazily IPC wire types (`IpcMessage`, `Snapshot`, `Delta`, `DeltaOp`, `NodeSnapshot`, `NodeState`, `ShmBlobArena`, `ShmBlobRef` with the optional `backend` discriminator, `CapabilityHandshake`, `CrdtSync`). Round-trips the canonical fixtures using the same externally-tagged JSON shape as lazily-rs. |
 | `src/lazily/transport.zig` | Cross-process zero-copy transport (`#lzzcpy`): the `BlobBackend` adapter seam (vtable), `InProcessBackend` (wraps `ShmBlobArena`), `ArrowBackend` (Arrow IPC stream bytes), `ShmBackend` (genuine POSIX `shm_open`+`mmap` region, Linux — cross-process), `spillValue`/`spillState`/`spillMessage` policy + `resolveValue`, and the receiver-side `BlobRouter` (routes a descriptor to the backend of its `backend` kind). The backend-agnostic laws (`resolve_write` identity, `resolve_wrong_backend`, ABA generation safety, checksum rejection) are proven in `../lazily-formal/LazilyFormal/ZeroCopyTransport.lean` and replayed as in-source tests. |
 | `src/lazily/context.zig` | Reactive `Context` (lazy cache + mutex), `Slot`, `TrackingFrame`, `Context.batch(run)` boundary, and always-on `Instrumentation` counters (`node_allocations`, `slot_recomputes`, `dependency_edges_*`, `effect_queue_*`). |
-| `src/lazily/cell.zig` / `signal.zig` / `effect.zig` | `Cell` / `Signal` (eager, memo-guarded) / `Effect` (scheduled side effect) — the 4 reactive primitives. |
+| `src/lazily/cell.zig` / `signal.zig` / `effect.zig` | The Cell kernel (`#lzcellkernel`): the genus `Cell(T, K)` with `SourceCell(T, M)` (written from outside; `set`/`merge` under policy marker `M`) and `FormulaCell(T)` (computed from upstream; guarded + lazy, `.drive()` makes it eager). `set`/`merge` are comptime-guarded to the source kind, so `formula.set(…)` does not compile (§3/§4). `Effect` is the value-less sink outside the hierarchy. Constructors `source` / `formula` / `.drive()`; `cell`/`signal` retained as deprecated aliases (a driven `FormulaCell` replaces the former standalone `Signal`). |
 | `src/lazily/reactive_map.zig` | `ReactiveMap` — the ONE unified keyed reactive map (`#reactivemap`) over a comptime `EntryKind` (`cell` input / `slot` derived), with reactive membership + order, atomic move, `getOrInsertWith` mint-on-access, and three-signal (value/membership/order) independence. `CellMap` = `ReactiveMap(K,V,.cell)` (cell-only `set` + eager value-minting `entry`); `SlotMap` = `ReactiveMap(K,V,.slot)` (lazy `getOrInsertWith` + eager pre-mint `materializeAll`; no `set`). No eager/lazy mode flag — eager = pre-mint loop, lazy = mint-on-access. Observationally transparent eager vs lazy; deferral-not-deallocation present-set monotonicity; entry-kind orthogonal to strategy. Replays `../lazily-spec/conformance/materialization/*.json`. |
 | `src/lazily/thread_safe_context.zig` | `ThreadSafeContext` — a lock-backed, `Send`-shareable reactive context (distinct from the build-flag mutex on `Context`): id-keyed cells + computed slots in a standalone registry, all serialized by one `ParkingMutex`, reads returned by copy. Per-key runtime cells (type-erased storage + monomorphic recompute thunks) + closure-userdata computes are what let a keyed family ride a real context. |
 | `src/lazily/thread_safe_reactive_map.zig` | `ThreadSafeReactiveMap` (`ThreadSafeCellMap`/`ThreadSafeSlotMap`) — the `Send + Sync` flavor (`#reactivemap`): **rides on `ThreadSafeContext`** (every entry is a real reactive cell there), present-set behind a `ParkingMutex`. `getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager); cell-only `set`. Observational transparency + present-set monotonicity plus **materialization confluence** (`lazily-formal` `materialize_present_comm`/`materialize_observe_comm`). |
@@ -176,25 +176,46 @@ A Context is a container for Slots, providing a way to group related Slots toget
 const ctx = Context.init(allocator);
 ```
 
-### Slot
+### The Cell kernel — `Cell(T, K)`, `SourceCell`, `FormulaCell` (`#lzcellkernel`)
 
-A Slot is the basic building block of lazy evaluation. It stores a lazy function return value in the cache. Slots can have dependencies on other Slots. When a parent Slot changes, the child slots expire.
+The reactive-value vocabulary is a single genus `Cell(T, K)` over two kinds
+(see `tasks/software/lazily-cell-kernel-design.md`):
 
-`Slot.touch()` will expire the current Slot and child Slots. 
+- **`SourceCell(T, M)`** — a node written from outside, folding writes under
+  merge-policy marker `M` (`KeepLatest` default, `SumPolicy`, `MaxPolicy`, …).
+  `SourceCell(T) ≡ SourceCell(T, KeepLatest)`, whose `merge` is a replace; this
+  one kind subsumes the former plain `Cell` and `MergeCell`. Built with
+  `source(...)` / `sourceWith(...)`; read with `get`, written with `set`/`merge`.
+- **`FormulaCell(T)`** — a node computed from upstream, **guarded and lazy by
+  default**. Built with `formula(...)`; read with `get` (recompute-on-read).
+  `formula(...).drive()` makes it **eager** — a *driven* formula, which retires
+  the former standalone `Signal`. `.drive()` is idempotent and returns the same
+  handle; `undrive()` reverts to lazy. Drivenness is graph state — a `driven`
+  bit that lands in the storage `Slot`'s existing padding (so `@sizeOf(Slot)` is
+  unchanged) plus the `Context.driven_by` side table, cleared on
+  `undrive`/dispose.
 
-### Cell
+Writes are **kind-restricted at compile time** (§3/§4): `set`/`merge` exist only
+on the source kind, guarded by a comptime `@compileError`, so `formula.set(…)`
+does not compile — the same guarantee the Rust binding gets from an inherent
+impl on `Cell<T, Source<M>>`, realized here with Zig comptime. `Effect` is the
+value-less sink and stays outside the hierarchy.
 
-Cells are mutable containers stored in a Slot. Using `Cell.set()` expires child slots, which can include Child slots containing Cells.
+Deprecated aliases `cell(...)` / `signal(...)` and `Cell` (former 1-arg source)
+are retained where existing call sites use them; new code should use
+`source` / `formula` / `.drive()`.
 
-### Signal
+### Slot — the storage position (§5.0)
 
-A `Signal(T)` is an eager derived value backed by a memoized slot with deferred
-recompute. Unlike a lazy Slot (which recomputes on read), a Signal **eagerly**
-recomputes the instant any of its dependencies are invalidated. Recompute runs
-outside the graph mutex via `Context.drainPendingRecompute`, so user `valueFn`s
-may re-lock per-op without deadlock; a memo guard (`std.meta.eql`) suppresses
-downstream cascades when the recomputed value is unchanged. Mirrors
-`SignalHandle<T>` in lazily-rs and `Signal[T]` in lazily-py.
+`Slot` no longer names a reactive *value*; it names **the arena position that
+holds a node** of any kind (`SourceCell`, `FormulaCell`, or `Effect`). So
+`Slot`, `SlotId`, `SlotValue`, and the slab/arena vocabulary all stay and are
+now accurate rather than legacy — the wire is unchanged (no break, no
+dual-accept). A `Slot` stores a materialized value in the cache and tracks
+dependency edges; when a parent changes, dependent slots expire. `Slot.touch()`
+expires the current Slot and its children. The low-level `slot(...)` constructor
+returns the raw computed value pointer and remains the storage-level primitive
+under `FormulaCell` (`formula(...)` is the kernel handle over it).
 
 ### StateMachine
 

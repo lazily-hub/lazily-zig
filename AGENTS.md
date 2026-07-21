@@ -4,6 +4,20 @@ Zig port of the lazily reactive-signals family — lazy evaluation with context
 caching, reactive graphs, state machines, and the full lazily-spec wire
 protocol.
 
+## Reactive-value vocabulary — the Cell kernel (`#lzcellkernel`)
+
+The reactive values are one genus `Cell(T, K)` (in `src/lazily/cell.zig`) over
+two kinds: `SourceCell(T, M)` (written from outside; `set`/`merge` under policy
+marker `M` — subsumes the former plain `Cell` and `MergeCell`) and
+`FormulaCell(T)` (computed from upstream; guarded + lazy; `formula().drive()` is
+the eager form that retires the former `Signal`). `set`/`merge` are
+comptime-guarded to the source kind, so `formula.set(…)` does not compile
+(design §3/§4). `Effect` stays the value-less sink outside the hierarchy.
+Constructors: `source` / `sourceWith` / `formula` / `.drive()`; `cell` / `signal`
+survive as deprecated aliases. `Slot` keeps its **storage** meaning (the arena
+position that holds a node) — `SlotId`/`SlotValue`/wire types are unchanged. See
+`tasks/software/lazily-cell-kernel-design.md`.
+
 ## Commit & Push
 
 Commit and push completed work at the end of every turn that changed code,

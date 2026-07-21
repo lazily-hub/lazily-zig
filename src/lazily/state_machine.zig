@@ -1,8 +1,9 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const Context = @import("context.zig").Context;
-const Cell = @import("cell.zig").Cell;
-const cell = @import("cell.zig").cell;
+// The machine's state is a plain source cell (`#lzcellkernel`).
+const Cell = @import("cell.zig").SourceCell;
+const cell = @import("cell.zig").source;
 const ValueFn = @import("context.zig").ValueFn;
 
 /// A finite state machine backed by a reactive `Cell`.

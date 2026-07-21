@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Context = @import("context.zig").Context;
-const Cell = @import("cell.zig").Cell;
+const SourceCell = @import("cell.zig").SourceCell;
 const ValueFn = @import("context.zig").ValueFn;
 
 /// An associative merge ⊕ with its transport-selected property flags.
@@ -82,21 +82,21 @@ pub fn max(comptime T: type) MergePolicy(T) {
 /// `set`, so an idempotent policy's no-op merge fires no cascade (free dedup).
 pub fn MergeCell(comptime T: type) type {
     return struct {
-        cell: *Cell(T),
+        cell: *SourceCell(T),
         policy: MergePolicy(T),
 
         /// Init a MergeCell whose initial value is produced by `valueFn` (the
-        /// same comptime-value idiom as `Cell.init`).
+        /// same comptime-value idiom as `SourceCell.init`).
         pub fn init(
             ctx: *Context,
             comptime valueFn: *const ValueFn(T),
             policy: MergePolicy(T),
         ) !@This() {
-            return .{ .cell = try Cell(T).init(ctx, valueFn, null), .policy = policy };
+            return .{ .cell = try SourceCell(T).init(ctx, valueFn, null), .policy = policy };
         }
 
         /// The underlying reactive cell (for wiring derived readers).
-        pub fn underlying(self: *const @This()) *Cell(T) {
+        pub fn underlying(self: *const @This()) *SourceCell(T) {
             return self.cell;
         }
 
