@@ -77,6 +77,12 @@ const FIXTURES = [_][]const u8{
     "disposal_does_not_run_surviving_effects.json",
     "dispose_detaches_edges_both_directions.json",
     "dispose_signal_reverts_to_lazy.json",
+    "exact_fold_paths_stay_exact.json",
+    "feedback_drain_bound_reports_exhaustion.json",
+    "merge_cell_acquires_no_dependency_edge.json",
+    "merge_feed_through_a_formula_coalesces.json",
+    "merge_folds_synchronously_in_batch.json",
+    "merge_per_settled_cone_not_per_write.json",
     "read_after_dispose_is_an_error.json",
     "recycled_id_inherits_nothing.json",
     "scope_teardown_equals_fold_of_disposals.json",
@@ -113,13 +119,27 @@ const SUPPORTED_ASSERTIONS = [_][]const u8{
 };
 
 /// Fixtures that cannot run against `lazily-zig` today, with the first
-/// unsupported op each one needs. Asserted to match observation exactly: a
-/// fixture that starts passing, or a newly blocked one, fails the build.
+/// unsupported op or assertion each one needs. Asserted to match observation
+/// exactly: a fixture that starts passing, or a newly blocked one, fails the
+/// build. Every entry would be a **capability gap in the binding**, never a
+/// relaxed assertion — an accounted-for skip, not a faked pass.
 ///
-/// Empty since the disposal / teardown-scope / degree surface landed. Every
-/// entry would be a **capability gap in the binding**, never a relaxed
-/// assertion, and it must stay empty unless a real gap reappears.
-const EXPECTED_SKIPS = [_]struct { fixture: []const u8, op: []const u8 }{};
+/// The six `#lzmergefeed` fixtures landed on spec main (Step 3) exercise a
+/// merge-feed surface this runner does not model yet. Five construct a
+/// `merge_cell` node, an op kind with no counterpart here (the runner has no
+/// merge-feed node), and one asserts `drain_exhausted`, a feedback-drain
+/// observable this runner does not track. They are recorded skips rather than
+/// silent gaps, so a regression — a fixture that stops replaying, or one of
+/// these becoming replayable without its entry removed — is a loud ledger diff.
+/// Merge ops are deliberately not implemented here; that is tracked upstream.
+const EXPECTED_SKIPS = [_]struct { fixture: []const u8, op: []const u8 }{
+    .{ .fixture = "exact_fold_paths_stay_exact.json", .op = "merge_cell" },
+    .{ .fixture = "feedback_drain_bound_reports_exhaustion.json", .op = "drain_exhausted" },
+    .{ .fixture = "merge_cell_acquires_no_dependency_edge.json", .op = "merge_cell" },
+    .{ .fixture = "merge_feed_through_a_formula_coalesces.json", .op = "merge_cell" },
+    .{ .fixture = "merge_folds_synchronously_in_batch.json", .op = "merge_cell" },
+    .{ .fixture = "merge_per_settled_cone_not_per_write.json", .op = "merge_cell" },
+};
 
 /// Divergences this binding currently exhibits, keyed
 /// `<model>/<fixture><label>#<step>:<key>`. See the module doc: findings, never
