@@ -1,22 +1,19 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
-// Cell kernel (`#lzcellkernel`) — the genus `Cell(T, K)` with `SourceCell` /
-// `FormulaCell`, and the `source` / `formula` / `.drive()` constructor surface.
-// See tasks/software/lazily-cell-kernel-design.md.
-pub const Cell = @import("./lazily/cell.zig").Cell;
-pub const SourceCell = @import("./lazily/cell.zig").SourceCell;
-pub const SourceCellWith = @import("./lazily/cell.zig").SourceCellWith;
-pub const FormulaCell = @import("./lazily/cell.zig").FormulaCell;
+// Cell kernel (`#lzcellkernel`) — the two concrete handles `Source(T[, M])` /
+// `Computed(T)` (no `Cell(T, K)` genus), and the `source` / `computed` /
+// `.eager()` constructor surface. See tasks/software/lazily-cell-kernel-design.md.
 pub const Source = @import("./lazily/cell.zig").Source;
-pub const Formula = @import("./lazily/cell.zig").Formula;
+pub const SourceCellWith = @import("./lazily/cell.zig").SourceCellWith;
+pub const Computed = @import("./lazily/cell.zig").Computed;
 pub const KeepLatest = @import("./lazily/cell.zig").KeepLatest;
 pub const SumPolicy = @import("./lazily/cell.zig").SumPolicy;
 pub const MaxPolicy = @import("./lazily/cell.zig").MaxPolicy;
 pub const source = @import("./lazily/cell.zig").source;
 pub const sourceWith = @import("./lazily/cell.zig").sourceWith;
 pub const sourceKeyed = @import("./lazily/cell.zig").sourceKeyed;
-pub const formula = @import("./lazily/cell.zig").formula;
-pub const formulaKeyed = @import("./lazily/cell.zig").formulaKeyed;
+pub const computed = @import("./lazily/cell.zig").computed;
+pub const computedKeyed = @import("./lazily/cell.zig").computedKeyed;
 // Deprecated aliases for the former reactive-value vocabulary.
 pub const cell = @import("./lazily/cell.zig").cell;
 pub const CellFn = @import("./lazily/cell.zig").CellFn;

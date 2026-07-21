@@ -18,46 +18,61 @@ const slotEventLog = @import("test.zig").slotEventLog;
 const expectEventLog = @import("test.zig").expectEventLog;
 
 // ---------------------------------------------------------------------------
-// The Cell kernel (`#lzcellkernel`) — `SourceCell` / `FormulaCell` over a single
-// genus `Cell(T, K)`.
+// The Cell kernel (`#lzcellkernel`) — the two concrete handle structs
+// `Source(T[, M])` and `Computed(T)`.
 //
-// See `tasks/software/lazily-cell-kernel-design.md`. One genus with a **kind**
-// type parameter `K` replaces the former split of `Cell` (source) / `Slot` /
-// `Signal` (eager) reactive-*value* types:
+// See `tasks/software/lazily-cell-kernel-design.md`. **`Cell` is a conceptual
+// word, not a type**: a *cell* is a value-bearing reactive node, and the two
+// kinds of cell are named by the two handles a caller holds:
 //
-//   Cell(T, K)                    genus — a node with a readable value
-//   ├─ SourceCell(T, M)           written from outside; folds under policy M
-//   └─ FormulaCell(T)             computed from upstream (guarded; `.drive()` = eager)
+//   Source(T, M)                  handle to a source cell — written from
+//                                 outside; folds under merge policy M
+//   Computed(T)                   handle to a computed cell — computed from
+//                                 upstream (guarded; `.eager()` = eager)
 //
 //   Effect                        no value; sink — outside the hierarchy
 //
+// There is **no `Cell(T, K)` genus struct** and no `Source(M)` / `Formula`
+// *kind markers*: the former genus dissolves into these two concrete structs,
+// and `M` is now `Source`'s own policy parameter. A single private
+// comptime factory (`CellHandle`) still shares the read/dispose implementation
+// between them — an impl detail, not a public handle.
+//
 // `Slot` keeps its *storage* meaning (§5.0): it is the arena position that
 // holds a node of any kind, so `Slot`, `SlotId`, and the slab vocabulary stay.
-// Only the reactive-value sense of "slot" moves to `FormulaCell`.
+// The raw `slot()` primitive is the deliberately non-guarded storage escape for
+// non-equatable values; it is the storage sense, not a cell.
 //
 // ## Write protection via comptime (§3, §4)
 //
-// Reads live on every kind (`get`). `set`/`merge` are guarded by a comptime
-// `@compileError` keyed on the kind marker, so `formula.set(…)` does not
-// compile — the same guarantee the Rust binding gets from an inherent impl on
-// `Cell<T, Source<M>>`, realized here with Zig comptime. See the
-// `formula.set()` compile-fail note on `set` and the positive tests below.
+// Reads live on both handles (`get`). `set`/`merge` are guarded by a comptime
+// `@compileError` on the computed handle, so `computed.set(…)` does not
+// compile — the same guarantee the Rust binding gets from a missing method on
+// `Computed<T>`, realized here with Zig comptime. See the `computed.set()`
+// compile-fail note on `set` and the positive tests below.
+//
+// ## Guard (§3, final 2026-07-21)
+//
+// All cells are guarded, always. `Source` suppresses an equal *write* (the
+// `==` store-guard in `set`); `Computed` suppresses an equal *recompute* (the
+// storage-layer equality guard, matching TC39 `Signal.Computed`). There is no
+// unguarded mode and no separate `memo` — a guarded `computed` subsumes it.
 // ---------------------------------------------------------------------------
 
-/// Per-instantiation cleanup hook for a `SourceCell`'s stored value. Retained
-/// under the historical name; every non-null user is internal (all external
-/// call sites pass `null`).
+/// Per-instantiation cleanup hook for a `Source`'s stored value. Retained under
+/// the historical name; every non-null user is internal (all external call
+/// sites pass `null`).
 pub fn DeinitCellValueFn(comptime T: type) type {
-    return *const fn (*SourceCell(T)) void;
+    return *const fn (*Source(T)) void;
 }
 pub fn ChangeCallback(comptime T: type) type {
-    return *const fn (*SourceCell(T)) void;
+    return *const fn (*Source(T)) void;
 }
 
-// -- Kind markers -----------------------------------------------------------
+// -- Merge-policy markers ---------------------------------------------------
 
 /// Merge-policy marker for the last-writer-wins band — the policy behind a
-/// plain source cell (`SourceCell(T) ≡ SourceCell(T, KeepLatest)`).
+/// plain source cell (`Source(T) ≡ SourceCellWith(T, KeepLatest)`).
 pub const KeepLatest = struct {
     pub fn policy(comptime T: type) @import("merge.zig").MergePolicy(T) {
         return @import("merge.zig").keepLatest(T);
@@ -76,39 +91,21 @@ pub const MaxPolicy = struct {
     }
 };
 
-/// Kind marker for a **source** cell — a node written from outside, folding
-/// accumulated writes under merge policy marker `M`. `M` lives inside the kind,
-/// so `set`/`merge` (and the policy) exist exactly where writes exist. Reuses
-/// the name of the former `Source<T>` write concept.
-pub fn Source(comptime M: type) type {
-    return struct {
-        pub const is_source = true;
-        pub const Policy = M;
-    };
-}
+// -- The private shared factory ---------------------------------------------
 
-/// Kind marker for a **formula** cell — a node computed from upstream. A driven
-/// formula (`formula().drive()`) is still this kind; drivenness is graph state
-/// (a bit on the storage `Slot` + the `driven_by` side table), not a distinct
-/// type. This retires the former `Signal`.
-pub const Formula = struct {
-    pub const is_source = false;
-};
-
-// -- The genus --------------------------------------------------------------
-
-/// The kernel genus: a typed handle to a reactive node of kind `K`. `K` is one
-/// of `Source(M)` or `Formula`. Callers normally spell `SourceCell(T)` /
-/// `FormulaCell(T)`; generic code can take `Cell(T, K)`.
-pub fn Cell(comptime T: type, comptime K: type) type {
-    const is_source = @hasDecl(K, "is_source") and K.is_source;
+/// Private comptime factory shared by the two public handles. `is_source`
+/// selects the source arm (inline value + `set`/`merge`) or the computed arm
+/// (reads through the backing storage `Slot`); `M` is the source merge policy
+/// (ignored on the computed arm). NOT exported — callers spell `Source(T)` /
+/// `SourceCellWith(T, M)` / `Computed(T)`.
+fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type {
     return struct {
         const Self = @This();
 
         /// The value type this cell reads.
         pub const Value = T;
-        /// The kind marker (`Source(M)` or `Formula`).
-        pub const Kind = K;
+        /// The source merge policy (meaningful only on the source arm).
+        pub const Policy = M;
         /// Whether writes are permitted on this kind (comptime).
         pub const is_source_cell = is_source;
         /// Per-instantiation cleanup hook for this cell's stored value. Typed on
@@ -120,8 +117,8 @@ pub fn Cell(comptime T: type, comptime K: type) type {
         ctx: *Context,
         slot: *Slot,
         // Source cells embed their value inline (the synchronous input layer);
-        // formula cells read from their backing `Slot`, so carry no value here.
-        // `@sizeOf(SourceCell(i32)) == 32` is asserted below and must not grow.
+        // computed cells read from their backing `Slot`, so carry no value here.
+        // `@sizeOf(Source(i32)) == 32` is asserted below and must not grow.
         value: if (is_source) T else void,
         deinitCellValue: if (is_source) ?DeinitFn else void,
 
@@ -130,19 +127,19 @@ pub fn Cell(comptime T: type, comptime K: type) type {
         // ---- shared reads (every kind) ------------------------------------
 
         /// Read this cell's current value. Source cells return the inline value;
-        /// formula cells return their backing slot's materialized value
+        /// computed cells return their backing slot's materialized value
         /// (`Slot.Result(T)` — `T` for value types, `*T` for indirect).
         pub fn get(self: *const Self) if (is_source) T else Slot.Result(T) {
             if (comptime is_source) {
                 return self.value;
             } else {
                 // Re-materialize through the storage layer (`slotKeyed`) rather
-                // than reading `slot.storage` directly: a lazy formula whose
-                // upstream changed is `stale`, and `Slot.get` reads storage
+                // than reading `slot.storage` directly: a lazy computed cell
+                // whose upstream changed is `stale`, and `Slot.get` reads storage
                 // without consulting `stale` (see signal.zig). Routing through
                 // `slotKeyed` recomputes when stale, registers the dependency
-                // when read inside another reactive computation, and — for a
-                // driven formula (kept fresh in place) — returns the cached
+                // when read inside another reactive computation, and — for an
+                // eager computed cell (kept fresh in place) — returns the cached
                 // value unchanged.
                 return self.materialize();
             }
@@ -159,7 +156,7 @@ pub fn Cell(comptime T: type, comptime K: type) type {
             }
         }
 
-        /// Formula-only: recompute-on-read through the storage `Slot` keyed by
+        /// Computed-only: recompute-on-read through the storage `Slot` keyed by
         /// this handle's identity.
         fn materialize(self: *const Self) Slot.Result(T) {
             const vfn: *const ValueFn(T) = @ptrCast(@alignCast(self.slot.value_fn_ptr.?));
@@ -170,13 +167,13 @@ pub fn Cell(comptime T: type, comptime K: type) type {
             return .{ .key = self.slot.cache_key.? };
         }
 
-        /// Tear this node out of the graph. Kind-agnostic — a disposed driven
-        /// formula also tears down its puller (see `disposeNode` on the formula
-        /// arm below, which clears the driven bit + side table first).
+        /// Tear this node out of the graph. Kind-agnostic — a disposed eager
+        /// computed cell also tears down its puller (the computed arm clears the
+        /// eager bit + side table first).
         pub fn disposeNode(self: *Self) void {
             if (comptime !is_source) {
-                // Disposing a driven formula must not strand its puller.
-                if (self.slot.driven) self.undriveInternal();
+                // Disposing an eager computed cell must not strand its puller.
+                if (self.slot.eager) self.lazyInternal();
             }
             self.ctx.disposeNode(self.handle());
         }
@@ -188,7 +185,7 @@ pub fn Cell(comptime T: type, comptime K: type) type {
             comptime valueFn: *const ValueFn(T),
             comptime deinitCellValue: ?DeinitFn,
         ) !*Self {
-            if (comptime !is_source) @compileError("init is only available on a SourceCell; build a FormulaCell with `formula(...)`");
+            if (comptime !is_source) @compileError("init is only available on a Source; build a Computed with `computed(...)`");
             return initKeyed(ctx, valueFnCacheKey(valueFn), valueFn, deinitCellValue);
         }
 
@@ -202,7 +199,7 @@ pub fn Cell(comptime T: type, comptime K: type) type {
             comptime valueFn: *const ValueFn(T),
             comptime deinitCellValue: ?DeinitFn,
         ) !*Self {
-            if (comptime !is_source) @compileError("initKeyed is only available on a SourceCell");
+            if (comptime !is_source) @compileError("initKeyed is only available on a Source");
             const getCell = struct {
                 fn call(_ctx: *Context) anyerror!Self {
                     const initial_value = try valueFn(_ctx);
@@ -246,15 +243,15 @@ pub fn Cell(comptime T: type, comptime K: type) type {
         }
 
         /// Replace the value outright (the keep-latest write). **Source-only.**
-        /// `formula.set(…)` is a comptime error — the kernel's write protection
+        /// `computed.set(…)` is a comptime error — the kernel's write protection
         /// (§3/§4) realized with Zig comptime rather than a trait:
         ///
         /// ```zig
-        /// // const f = try formula(i32, ctx, computeFn, null);
-        /// // f.set(2);  // => error: `set` is only available on a SourceCell ...
+        /// // const f = try computed(i32, ctx, computeFn, null);
+        /// // f.set(2);  // => error: `set` is only available on a Source ...
         /// ```
         pub fn set(self: *Self, new_value: T) void {
-            if (comptime !is_source) @compileError("`set` is only available on a SourceCell; a FormulaCell is computed from upstream and cannot be written");
+            if (comptime !is_source) @compileError("`set` is only available on a Source; a Computed is computed from upstream and cannot be written");
             self.ctx.mutex.lock();
 
             // Only emit change if the value actually changed.
@@ -270,11 +267,11 @@ pub fn Cell(comptime T: type, comptime K: type) type {
             self.ctx.mutex.unlock();
 
             // While inside a `batch(run)` boundary, defer the eager-recompute
-            // flush so N `set` calls coalesce into one driven-formula/Effect
+            // flush so N `set` calls coalesce into one eager-computed/Effect
             // rerun at the outermost batch exit (`reactive-graph.md` § batch).
             //
             // Store-without-cascade: skip the drain entirely when nothing is
-            // pending — a `set` whose cone held no driven formula / Effect
+            // pending — a `set` whose cone held no eager computed cell / Effect
             // leaves `pending_recompute` empty (mirrors lazily-rs `set_cell`,
             // which only flushes when the cone actually contained an Effect).
             if (!self.ctx.isBatching() and self.ctx.pending_recompute.items.len > 0) {
@@ -282,102 +279,103 @@ pub fn Cell(comptime T: type, comptime K: type) type {
             }
         }
 
-        /// Fold `op` into the current value under the kind's policy marker `M`.
-        /// **Source-only.** `SourceCell(T) ≡ SourceCell(T, KeepLatest)`, whose
-        /// merge is a replace; `SourceCell(T, SumPolicy)` accumulates, etc.
+        /// Fold `op` into the current value under the source's policy `M`.
+        /// **Source-only.** `Source(T) ≡ SourceCellWith(T, KeepLatest)`, whose
+        /// merge is a replace; `SourceCellWith(T, SumPolicy)` accumulates, etc.
         /// Routes through the ==-guarded `set`, so an idempotent policy's no-op
         /// merge fires no cascade (free dedup).
         pub fn merge(self: *Self, op: T) void {
-            if (comptime !is_source) @compileError("`merge` is only available on a SourceCell");
-            const p = comptime K.Policy.policy(T);
+            if (comptime !is_source) @compileError("`merge` is only available on a Source");
+            const p = comptime M.policy(T);
             self.set(p.merge(self.value, op));
         }
 
-        // ---- formula-only lifecycle (drive/undrive) -----------------------
+        // ---- computed-only lifecycle (eager/lazy) -------------------------
 
-        /// **Drive** this formula: make it eager. Attaches the eager-recompute
-        /// puller so the value re-materializes after every invalidation (through
-        /// the batch-gated flush, so N writes coalesce into one recompute —
-        /// the `#lzsignaleager` clause-3 property). Idempotent — a second
-        /// `drive` is a no-op — and returns the **same** handle (mutated graph
-        /// state), so the caller keeps reading the formula it already holds.
-        /// This is the eager construction that retires the former `Signal`.
-        pub fn drive(self: *Self) *Self {
-            if (comptime is_source) @compileError("`drive` is only available on a FormulaCell; a SourceCell is already eager (its value is set from outside)");
-            if (!self.slot.driven) {
+        /// Transition this computed cell to **eager**. Attaches the
+        /// eager-recompute puller so the value re-materializes after every
+        /// invalidation (through the batch-gated flush, so N writes coalesce
+        /// into one recompute — the `#lzsignaleager` clause-3 property).
+        /// Idempotent — a second `eager` is a no-op — and returns the **same**
+        /// handle (mutated graph state), so the caller keeps reading the
+        /// computed cell it already holds. This is the eager construction that
+        /// retires the former `Signal`.
+        pub fn eager(self: *Self) *Self {
+            if (comptime is_source) @compileError("`eager` is only available on a Computed; a Source is already eager (its value is set from outside)");
+            if (!self.slot.eager) {
                 @import("signal.zig").installEagerHooks(T, self.slot) catch {
-                    // Reservation failed: leave the formula lazy rather than
-                    // installing a puller that could drop an enqueue. `drive`
-                    // stays a no-op; the value is still correct on read.
+                    // Reservation failed: leave the computed cell lazy rather
+                    // than installing a puller that could drop an enqueue.
+                    // `eager` stays a no-op; the value is still correct on read.
                     return self;
                 };
-                self.slot.driven = true;
-                self.ctx.recordDriven(self.slot);
+                self.slot.eager = true;
+                self.ctx.recordEager(self.slot);
             }
             return self;
         }
 
-        /// Reverse of `drive`: stop eager recomputation and remove the puller.
-        /// The value stays readable and reverts to lazy. No-op if not driven.
-        pub fn undrive(self: *Self) void {
-            if (comptime is_source) @compileError("`undrive` is only available on a FormulaCell");
-            self.undriveInternal();
+        /// Reverse of `eager`: stop eager recomputation and remove the puller.
+        /// The value stays readable and reverts to lazy. No-op if not eager.
+        pub fn lazy(self: *Self) void {
+            if (comptime is_source) @compileError("`lazy` is only available on a Computed");
+            self.lazyInternal();
         }
 
-        fn undriveInternal(self: *Self) void {
+        fn lazyInternal(self: *Self) void {
             if (comptime is_source) return;
-            if (!self.slot.driven) return;
+            if (!self.slot.eager) return;
             @import("signal.zig").removeEagerHooks(self.slot);
-            self.slot.driven = false;
-            self.ctx.forgetDriven(self.slot);
+            self.slot.eager = false;
+            self.ctx.forgetEager(self.slot);
         }
 
-        /// Whether this formula is currently driven (has an active puller).
-        pub fn isDriven(self: *const Self) bool {
+        /// Whether this computed cell is currently eager (has an active puller).
+        pub fn isEager(self: *const Self) bool {
             if (comptime is_source) return false;
-            return self.slot.driven;
+            return self.slot.eager;
         }
 
         // -- Retired-`Signal` compatibility shims ---------------------------
-        // A driven `FormulaCell` is what `Signal` used to be; these keep the
+        // An eager `Computed` is what `Signal` used to be; these keep the
         // former handle's surface (`is_active`, `dispose`) working.
 
-        /// Compat alias for the retired `Signal.is_active` — true while driven.
+        /// Compat alias for the retired `Signal.is_active` — true while eager.
         pub fn is_active(self: *const Self) bool {
-            return self.isDriven();
+            return self.isEager();
         }
 
-        /// Compat alias for the retired `Signal.dispose` — undrive + detach.
+        /// Compat alias for the retired `Signal.dispose` — revert to lazy + detach.
         pub fn dispose(self: *Self) void {
             self.disposeNode();
         }
     };
 }
 
-/// A cell written from outside, folding writes under policy marker `M`
-/// (default `KeepLatest`). `SourceCell(T)` is a plain input cell;
-/// `SourceCell(T, SumPolicy)` folds additively; etc. Subsumes the former plain
-/// `Cell` and `MergeCell`.
-pub fn SourceCell(comptime T: type) type {
-    return Cell(T, Source(KeepLatest));
+/// Handle to a **source cell** — written from outside, folding writes under
+/// merge policy `M` (default `KeepLatest`). `Source(T)` is a plain input cell;
+/// `SourceCellWith(T, SumPolicy)` folds additively; etc. Subsumes the former
+/// plain `Cell` and `MergeCell`.
+pub fn Source(comptime T: type) type {
+    return CellHandle(T, true, KeepLatest);
 }
 
-/// `SourceCell` with an explicit merge-policy marker (`KeepLatest` / `SumPolicy`
-/// / `MaxPolicy`). `SourceCellWith(T, KeepLatest) == SourceCell(T)`.
+/// `Source` with an explicit merge-policy marker (`KeepLatest` / `SumPolicy`
+/// / `MaxPolicy`). `SourceCellWith(T, KeepLatest) == Source(T)`.
 pub fn SourceCellWith(comptime T: type, comptime M: type) type {
-    return Cell(T, Source(M));
+    return CellHandle(T, true, M);
 }
 
-/// A cell computed from upstream. Lazy + guarded by default; `formula().drive()`
-/// makes it eager (a driven formula). Replaces the former `Slot`-as-value and
-/// `Signal`.
-pub fn FormulaCell(comptime T: type) type {
-    return Cell(T, Formula);
+/// Handle to a **computed cell** — computed from upstream. Lazy + guarded by
+/// default; `computed().eager()` makes it eager (an eager computed cell).
+/// Replaces the former `Slot`-as-value and `Signal`.
+pub fn Computed(comptime T: type) type {
+    return CellHandle(T, false, KeepLatest);
 }
 
 // -- Constructors (§9.3) ----------------------------------------------------
 
-/// Construct a `SourceCell(T)` (KeepLatest). The canonical source constructor;
+/// Construct a `Source(T)` (KeepLatest). The canonical source constructor;
 /// subsumes the former `cell`/`merge_cell`. Reads via `get`, writes via
 /// `set`/`merge`.
 pub fn source(
@@ -385,8 +383,8 @@ pub fn source(
     ctx: *Context,
     comptime valueFn: *const ValueFn(T),
     comptime deinitFn: ?DeinitCellValueFn(T),
-) !*SourceCell(T) {
-    return SourceCell(T).init(ctx, valueFn, deinitFn);
+) !*Source(T) {
+    return Source(T).init(ctx, valueFn, deinitFn);
 }
 
 /// `source` with an explicit policy marker `M` (subsumes the former
@@ -401,42 +399,44 @@ pub fn sourceWith(
     return SourceCellWith(T, M).init(ctx, valueFn, deinitFn);
 }
 
-/// `source` with a caller-supplied cache key. See `SourceCell(T).initKeyed`.
+/// `source` with a caller-supplied cache key. See `Source(T).initKeyed`.
 pub fn sourceKeyed(
     comptime T: type,
     ctx: *Context,
     cache_key: usize,
     comptime valueFn: *const ValueFn(T),
     comptime deinitFn: ?DeinitCellValueFn(T),
-) !*SourceCell(T) {
-    return SourceCell(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
+) !*Source(T) {
+    return Source(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
 }
 
-/// Construct a `FormulaCell(T)` — a guarded, lazy derived value. `.drive()` it
+/// Construct a `Computed(T)` — a guarded, lazy derived value. `.eager()` it
 /// for eager materialization. Built over the backing storage `Slot` (§5.0), the
-/// same node `slot()` returns as a raw value; `formula` is the handle form that
-/// carries the kernel surface (`get`/`drive`/`undrive`/`dispose`).
-pub fn formula(
+/// same node `slot()` returns as a raw value; `computed` is the handle form that
+/// carries the kernel surface (`get`/`eager`/`lazy`/`dispose`). Guarded by
+/// default: an equal recompute suppresses the downstream cascade (the
+/// storage-layer equality guard), matching TC39 `Signal.Computed`.
+pub fn computed(
     comptime T: type,
     ctx: *Context,
     comptime valueFn: *const ValueFn(T),
     comptime deinitPayload: ?DeinitPayloadFn,
-) !*FormulaCell(T) {
-    return formulaKeyed(T, ctx, valueFnCacheKey(valueFn), valueFn, deinitPayload);
+) !*Computed(T) {
+    return computedKeyed(T, ctx, valueFnCacheKey(valueFn), valueFn, deinitPayload);
 }
 
-/// `formula` with a caller-supplied cache key, mirroring `slotKeyed`.
-pub fn formulaKeyed(
+/// `computed` with a caller-supplied cache key, mirroring `slotKeyed`.
+pub fn computedKeyed(
     comptime T: type,
     ctx: *Context,
     cache_key: usize,
     valueFn: *const ValueFn(T),
     deinitPayload: ?DeinitPayloadFn,
-) !*FormulaCell(T) {
-    // Establish the backing slot (initial dependency edges + memo cache).
+) !*Computed(T) {
+    // Establish the backing slot (initial dependency edges + guard cache).
     _ = try slotKeyed(T, ctx, cache_key, valueFn, deinitPayload);
     const slot_ptr = ctx.cacheLookup(cache_key) orelse return error.SlotNotFound;
-    const self = try ctx.allocator.create(FormulaCell(T));
+    const self = try ctx.allocator.create(Computed(T));
     self.* = .{
         .ctx = ctx,
         .slot = slot_ptr,
@@ -455,8 +455,8 @@ pub fn cell(
     ctx: *Context,
     comptime valueFn: *const ValueFn(T),
     comptime deinitFn: ?DeinitCellValueFn(T),
-) !*SourceCell(T) {
-    return SourceCell(T).init(ctx, valueFn, deinitFn);
+) !*Source(T) {
+    return Source(T).init(ctx, valueFn, deinitFn);
 }
 
 /// Deprecated alias for `sourceKeyed`.
@@ -466,8 +466,8 @@ pub fn cellKeyed(
     cache_key: usize,
     comptime valueFn: *const ValueFn(T),
     comptime deinitFn: ?DeinitCellValueFn(T),
-) !*SourceCell(T) {
-    return SourceCell(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
+) !*Source(T) {
+    return Source(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
 }
 
 test "lazily/cell.cell: returns Cell(T) with initial value and caches computation" {
@@ -497,7 +497,7 @@ test "lazily/cell.cell: returns Cell(T) with initial value and caches computatio
 }
 
 pub fn CellFn(comptime T: type) type {
-    return fn (*Context) anyerror!*SourceCell(T);
+    return fn (*Context) anyerror!*Source(T);
 }
 
 pub fn initCellFn(
@@ -506,7 +506,7 @@ pub fn initCellFn(
     comptime deinitCellValue: ?DeinitCellValueFn(T),
 ) *const CellFn(T) {
     return struct {
-        fn call(ctx: *Context) anyerror!*SourceCell(T) {
+        fn call(ctx: *Context) anyerror!*Source(T) {
             return source(T, ctx, valueFn, deinitCellValue);
         }
     }.call;
@@ -767,7 +767,7 @@ test "lazily/cell.thread_safe Cell updates" {
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    const counter = try SourceCell(i32).init(ctx, struct {
+    const counter = try Source(i32).init(ctx, struct {
         fn call(_: *Context) anyerror!i32 {
             return 0;
         }
@@ -779,7 +779,7 @@ test "lazily/cell.thread_safe Cell updates" {
 
     for (0..num_threads) |i| {
         threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(_cell: *SourceCell(i32), count: usize) void {
+            fn run(_cell: *Source(i32), count: usize) void {
                 for (0..count) |_| {
                     // This tests the thread-safety of cell.set()
                     // and the resulting graph invalidation.
@@ -924,29 +924,29 @@ test "lazily/cell: OOM seeding an invalidation must not leave the slot fresh-but
 // Cell kernel tests (`#lzcellkernel`)
 // ---------------------------------------------------------------------------
 
-test "lazily/cell kernel: SourceCell handle stays 32 bytes; driven bit is free" {
+test "lazily/cell kernel: Source handle stays 32 bytes; eager bit is free" {
     // The earlier observer removal got the source-cell handle to 32B; the
-    // kernel migration must not regrow it. The driven bit lives on the storage
+    // kernel migration must not regrow it. The eager bit lives on the storage
     // `Slot` (in its existing tail padding, `@sizeOf(Slot)` unchanged), not on
-    // this handle, so a FormulaCell carries no inline value and is leaner still.
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(SourceCell(i32)));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(FormulaCell(i32)));
+    // this handle, so a Computed carries no inline value and is leaner still.
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Source(i32)));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Computed(i32)));
     // Kind is compile-time; sanity-check the markers.
-    try std.testing.expect(SourceCell(i32).is_source_cell);
-    try std.testing.expect(!FormulaCell(i32).is_source_cell);
+    try std.testing.expect(Source(i32).is_source_cell);
+    try std.testing.expect(!Computed(i32).is_source_cell);
 }
 
-// A FormulaCell has no `set`/`merge`/`init` — those are guarded by comptime
+// A Computed has no `set`/`merge`/`init` — those are guarded by comptime
 // `@compileError` on the source kind (§3/§4). Zig's `zig build test` has no
 // built-in compile-fail harness, so the guarantee is documented here and the
 // guard verified manually: uncommenting either line below fails to compile with
-// "`set` is only available on a SourceCell ...":
+// "`set` is only available on a Source ...":
 //
-//     const f = try formula(i32, ctx, computeFn, null);
-//     f.set(2);          // error: `set` is only available on a SourceCell ...
-//     _ = source(i32, ...).drive();   // error: `drive` is only available on a FormulaCell ...
+//     const f = try computed(i32, ctx, computeFn, null);
+//     f.set(2);          // error: `set` is only available on a Source ...
+//     _ = source(i32, ...).eager();   // error: `eager` is only available on a Computed ...
 //
-// The positive side (writes work on SourceCell, drive works on FormulaCell) is
+// The positive side (writes work on Source, eager works on Computed) is
 // exercised by the tests below and across the suite.
 
 const KernelChain = struct {
@@ -960,7 +960,7 @@ const KernelChain = struct {
     }
 };
 
-test "lazily/cell kernel: source/formula/get — the genus reads uniformly" {
+test "lazily/cell kernel: source/computed/get — both handles read uniformly" {
     const allocator = std.testing.allocator;
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
@@ -969,20 +969,20 @@ test "lazily/cell kernel: source/formula/get — the genus reads uniformly" {
     const n = try source(i32, ctx, KernelChain.getBase, null);
     try std.testing.expectEqual(@as(i32, 3), n.get());
 
-    // A formula computed from the source — read with the same `get`. For a
-    // value type `get` returns `Slot.Result(T)` (`*T` here), matching the
+    // A computed cell computed from the source — read with the same `get`. For
+    // a value type `get` returns `Slot.Result(T)` (`*T` here), matching the
     // former `Signal.get`; deref for the value.
-    const doubled = try formula(i32, ctx, KernelChain.getDoubled, null);
+    const doubled = try computed(i32, ctx, KernelChain.getDoubled, null);
     defer ctx.allocator.destroy(doubled);
     try std.testing.expectEqual(@as(i32, 6), doubled.get().*);
-    try std.testing.expect(!doubled.isDriven());
+    try std.testing.expect(!doubled.isEager());
 
     // set flows through to dependents (pulled lazily).
     n.set(5);
     try std.testing.expectEqual(@as(i32, 10), doubled.get().*);
 }
 
-test "lazily/cell kernel: SourceCell(T, SumPolicy) folds; merge subsumes MergeCell" {
+test "lazily/cell kernel: Source(T, SumPolicy) folds; merge subsumes MergeCell" {
     const allocator = std.testing.allocator;
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
@@ -1005,9 +1005,9 @@ test "lazily/cell kernel: SourceCell(T, SumPolicy) folds; merge subsumes MergeCe
     try std.testing.expectEqual(@as(i32, 7), kl.get());
 }
 
-// Clause-3 eager coalescing (`#lzsignaleager`): a **driven** formula
+// Clause-3 eager coalescing (`#lzsignaleager`): an **eager** computed cell
 // materializes once per batch, not once per write. This is the property a
-// binding shipped a per-write puller against; `formula().drive()` reuses the
+// binding shipped a per-write puller against; `computed().eager()` reuses the
 // batch-gated flush so it holds structurally.
 const DrivenBatch = struct {
     var runs = std.atomic.Value(usize).init(0);
@@ -1036,33 +1036,33 @@ const DrivenBatch = struct {
     }
 };
 
-test "lazily/cell kernel: driven formula materializes once per batch (clause 3)" {
+test "lazily/cell kernel: eager computed materializes once per batch (clause 3)" {
     const allocator = std.testing.allocator;
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
     DrivenBatch.runs.store(0, .seq_cst);
-    const f = try formula(u32, ctx, DrivenBatch.getDerived, null);
+    const f = try computed(u32, ctx, DrivenBatch.getDerived, null);
     defer ctx.allocator.destroy(f);
 
     // Not eager yet — one compute at construction.
     try std.testing.expectEqual(@as(usize, 1), DrivenBatch.runs.load(.seq_cst));
-    try std.testing.expect(!f.isDriven());
+    try std.testing.expect(!f.isEager());
 
-    // drive() is idempotent and returns the same handle (mutated graph state).
-    const g = f.drive();
+    // eager() is idempotent and returns the same handle (mutated graph state).
+    const g = f.eager();
     try std.testing.expect(g == f);
-    try std.testing.expect(f.isDriven());
-    _ = f.drive(); // no-op; still one driver
-    try std.testing.expect(f.slot.driven);
+    try std.testing.expect(f.isEager());
+    _ = f.eager(); // no-op; still one puller
+    try std.testing.expect(f.slot.eager);
 
     // 3 writes inside one batch → exactly one eager recompute at flush.
     ctx.batch(DrivenBatch.runBatch);
     try std.testing.expectEqual(@as(usize, 2), DrivenBatch.runs.load(.seq_cst));
 
-    // undrive reverts to lazy and clears the bit + side table entry.
-    f.undrive();
-    try std.testing.expect(!f.isDriven());
-    try std.testing.expect(!f.slot.driven);
-    try std.testing.expect(ctx.driven_by.count() == 0);
+    // lazy() reverts to lazy and clears the bit + side table entry.
+    f.lazy();
+    try std.testing.expect(!f.isEager());
+    try std.testing.expect(!f.slot.eager);
+    try std.testing.expect(ctx.eager_by.count() == 0);
 }

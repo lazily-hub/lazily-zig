@@ -54,7 +54,6 @@ pub fn AsyncContext(comptime V: type) type {
         /// owning reactive family + this entry's key); pure computes pass an
         /// unused pointer via [`computedAsync`].
         pub const ComputeFn = *const fn (ptr: *anyopaque, cc: *ComputeContext) anyerror!V;
-        pub const EqualsFn = *const fn (V, V) bool;
 
         /// The compute context passed to a slot's compute fn. Dependency edges
         /// register immediately through this context (NOT a thread-local —
@@ -110,7 +109,6 @@ pub fn AsyncContext(comptime V: type) type {
             revision: u64 = 0,
             compute_ptr: *anyopaque = undefined,
             compute_fn: ?ComputeFn = null,
-            equals: ?EqualsFn = null,
             dependencies: std.ArrayList(u64),
             dependents: std.ArrayList(u64),
             /// True when a compute is queued for this slot (waiting for settle()).
@@ -303,19 +301,6 @@ pub fn AsyncContext(comptime V: type) type {
             return self.computedAsyncClosure(@constCast(@ptrCast(compute)), Wrap.call);
         }
 
-        /// Memo variant: a compute whose result is equality-guarded so a
-        /// recomputation that yields an equal value does NOT cascade to
-        /// dependents.
-        pub fn memoAsync(
-            self: *Self,
-            compute: *const fn (*ComputeContext) anyerror!V,
-            equals: EqualsFn,
-        ) !u64 {
-            const id = try self.computedAsync(compute);
-            self.slots.getPtr(id).?.equals = equals;
-            return id;
-        }
-
         /// Synchronous fast-path read. Returns the value iff state == Resolved.
         pub fn get(self: *Self, id: u64) ?V {
             if (self.slots.get(id)) |node| {
@@ -407,16 +392,10 @@ pub fn AsyncContext(comptime V: type) type {
             // Stale-completion discard: only publish if still current.
             if (!n.isCurrentRevision(at_revision)) return true;
 
-            // Memo guard: an equal recompute suppresses the cascade.
-            if (n.equals) |eq| {
-                if (n.value) |old| {
-                    if (eq(old, result)) {
-                        n.state = .resolved;
-                        return true;
-                    }
-                }
-            }
-
+            // Guard: all computed cells are guarded (`#lzcellkernel`, final
+            // 2026-07-21). An equal recompute publishes the (equal) value but
+            // suppresses the downstream cascade via the `std.meta.eql` check on
+            // `changed` below — the same guard that subsumed the former `memo`.
             const old_value = n.value;
             n.value = result;
             n.state = .resolved;
@@ -748,7 +727,9 @@ test "lazily/async_context: awaitResolved blocks via settle until resolved" {
     try std.testing.expectEqual(@as(u32, 42), v);
 }
 
-test "lazily/async_context: memo guard suppresses cascade when value unchanged" {
+test "lazily/async_context: guarded computed suppresses cascade when value unchanged" {
+    // `memo` is removed (`#lzcellkernel`); a plain `computedAsync` is guarded by
+    // default — an equal recompute publishes but suppresses the cascade.
     const allocator = std.testing.allocator;
     var ctx = ACtx.init(allocator);
     defer ctx.deinit();
@@ -756,11 +737,6 @@ test "lazily/async_context: memo guard suppresses cascade when value unchanged" 
     AsyncTestState.compute_runs = 0;
     AsyncTestState.cell_a = try ctx.cell(1);
 
-    const eq = struct {
-        fn eq(a: u32, b: u32) bool {
-            return a == b;
-        }
-    }.eq;
     const constantCompute = struct {
         fn call(cc: *CC) anyerror!u32 {
             try cc.readCell(AsyncTestState.cell_a);
@@ -768,13 +744,13 @@ test "lazily/async_context: memo guard suppresses cascade when value unchanged" 
         }
     }.call;
 
-    const memo = try ctx.memoAsync(constantCompute, eq);
+    const derived = try ctx.computedAsync(constantCompute);
     _ = try ctx.settle();
-    try std.testing.expectEqual(@as(u32, 100), ctx.get(memo).?);
+    try std.testing.expectEqual(@as(u32, 100), ctx.get(derived).?);
 
     try ctx.setCell(AsyncTestState.cell_a, 2);
     const ran = try ctx.settle();
-    try std.testing.expectEqual(@as(u32, 100), ctx.get(memo).?);
+    try std.testing.expectEqual(@as(u32, 100), ctx.get(derived).?);
     try std.testing.expect(ran > 0);
 }
 

@@ -15,7 +15,8 @@ const SignalMod = @import("signal.zig");
 /// dependency invalidates. It is the 4th reactive primitive
 /// (`Cell / Slot / Signal / Effect`) per `lazily-spec/docs/reactive-graph.md`.
 ///
-/// Mirrors lazily-rs `EffectHandle` and the spec contract:
+/// Mirrors lazily-rs `Effect` (the bare handle, sibling to `Source`/`Computed`)
+/// and the spec contract:
 /// - Scheduled, not inline: rerun fires after the invalidating `set_cell`/`batch`
 ///   flush, not during.
 /// - Cleanup ordering: the previous run's cleanup completes before the next body.

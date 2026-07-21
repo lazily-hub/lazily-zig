@@ -6,16 +6,21 @@ protocol.
 
 ## Reactive-value vocabulary — the Cell kernel (`#lzcellkernel`)
 
-The reactive values are one genus `Cell(T, K)` (in `src/lazily/cell.zig`) over
-two kinds: `SourceCell(T, M)` (written from outside; `set`/`merge` under policy
-marker `M` — subsumes the former plain `Cell` and `MergeCell`) and
-`FormulaCell(T)` (computed from upstream; guarded + lazy; `formula().drive()` is
-the eager form that retires the former `Signal`). `set`/`merge` are
-comptime-guarded to the source kind, so `formula.set(…)` does not compile
-(design §3/§4). `Effect` stays the value-less sink outside the hierarchy.
-Constructors: `source` / `sourceWith` / `formula` / `.drive()`; `cell` / `signal`
-survive as deprecated aliases. `Slot` keeps its **storage** meaning (the arena
-position that holds a node) — `SlotId`/`SlotValue`/wire types are unchanged. See
+The reactive values are two concrete handles (in `src/lazily/cell.zig`) — there
+is no `Cell(T, K)` genus (`Cell` is the value-node *concept* only):
+`Source(T[, M])` (written from outside; `set`/`merge` under merge policy `M`, or
+`SourceCellWith(T, M)` for an explicit policy — subsumes the former plain `Cell`
+and `MergeCell`) and `Computed(T)` (computed from upstream; guarded + lazy;
+`computed().eager()` is the eager form that retires the former `Signal`). All
+cells are guarded — `Source` suppresses an equal write, `Computed` suppresses an
+equal recompute (matching TC39 `Signal.Computed`); there is no separate `memo`.
+`set`/`merge` are comptime-guarded to the source handle, so `computed.set(…)`
+does not compile (design §3/§4). `Effect` stays the value-less sink outside the
+hierarchy. Constructors: `source` / `sourceWith` / `computed` / `.eager()` /
+`.lazy()`; `cell` / `signal` survive as deprecated aliases. `slot()` remains the
+deliberately non-guarded storage-value primitive (returns `*T`, for
+non-equatable values). `Slot` keeps its **storage** meaning (the arena position
+that holds a node) — `SlotId`/`SlotValue`/wire types are unchanged. See
 `tasks/software/lazily-cell-kernel-design.md`.
 
 ## Commit & Push

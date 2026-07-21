@@ -2,7 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const Context = @import("context.zig").Context;
 // The machine's state is a plain source cell (`#lzcellkernel`).
-const Cell = @import("cell.zig").SourceCell;
+const Cell = @import("cell.zig").Source;
 const cell = @import("cell.zig").source;
 const ValueFn = @import("context.zig").ValueFn;
 
