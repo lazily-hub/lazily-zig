@@ -336,16 +336,9 @@ fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type
             return self.slot.eager;
         }
 
-        // -- Retired-`Signal` compatibility shims ---------------------------
-        // An eager `Computed` is what `Signal` used to be; these keep the
-        // former handle's surface (`is_active`, `dispose`) working.
-
-        /// Compat alias for the retired `Signal.is_active` — true while eager.
-        pub fn is_active(self: *const Self) bool {
-            return self.isEager();
-        }
-
-        /// Compat alias for the retired `Signal.dispose` — revert to lazy + detach.
+        /// Tear this node out of the graph. Alias for `disposeNode`, matching
+        /// the Rust binding's `Computed::dispose`/`Source::dispose`. To merely
+        /// stop eager recomputation without removing the node, use `lazy`.
         pub fn dispose(self: *Self) void {
             self.disposeNode();
         }

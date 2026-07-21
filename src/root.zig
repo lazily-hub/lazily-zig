@@ -70,7 +70,10 @@ pub const expectEventLog = @import("./lazily/test.zig").expectEventLog;
 pub const StateMachine = @import("./lazily/state_machine.zig").StateMachine;
 pub const StateChart = @import("./lazily/statechart.zig").StateChart;
 pub const ChartDef = @import("./lazily/statechart.zig").ChartDef;
-pub const Signal = @import("./lazily/signal.zig").Signal;
+// The standalone `Signal` handle type is retired (`#lzcellkernel`); eager
+// construction is now `computed(...).eager()`. `signal`/`signalKeyed` survive as
+// deprecated convenience constructors returning an eager `*Computed(T)`
+// (mirroring lazily-rs `Context::signal -> Computed<T>`).
 pub const signal = @import("./lazily/signal.zig").signal;
 /// Compile-time build flags (see build.zig). Exposed so audit harnesses can
 /// report which arm they were compiled as (`#lzspecedgeindex`).

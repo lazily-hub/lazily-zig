@@ -16,42 +16,15 @@ const deinitSlotValue = @import("slot.zig").deinitSlotValue;
 const DeinitPayloadFn = Slot.DeinitPayloadFn;
 const Mode = Slot.Mode;
 const Storage = Slot.Storage;
+const CellMod = @import("cell.zig");
 
-/// An eager derived value backed by a memoized slot with deferred recompute.
-///
-/// Mirrors lazily-rs `SignalHandle<T>` and lazily-py `Signal[T]`.
-/// Unlike a lazy Slot (which recomputes on read), a Signal **eagerly**
-/// recomputes the instant any of its dependencies are invalidated — via
-/// the `on_invalidate`/`recompute` hooks installed in Phase 1.
-///
-/// The recompute happens outside the graph mutex (via `Context.drainPendingRecompute`),
-/// so user `valueFn`s can re-lock per-op without deadlock. A memo guard
-/// (`std.meta.eql`) suppresses downstream cascades when the recomputed
-/// value is unchanged.
-pub fn Signal(comptime T: type) type {
-    return struct {
-        ctx: *Context,
-        slot: *Slot,
-        active: bool,
-
-        const Self = @This();
-
-        pub fn get(self: *const Self) Slot.Result(T) {
-            return self.slot.get(T) catch unreachable;
-        }
-
-        pub fn dispose(self: *Self) void {
-            naiveDisposeScan(self.slot);
-            self.slot.on_invalidate = null;
-            self.slot.recompute = null;
-            self.active = false;
-        }
-
-        pub fn is_active(self: *const Self) bool {
-            return self.active;
-        }
-    };
-}
+// The standalone `Signal(T)` handle type is **retired** under the Cell kernel
+// (`#lzcellkernel`, value-vocab hard-delete). Eager construction is now an
+// eager `Computed` — `computed(...).eager()` — so this module keeps only the
+// shared eager-recompute machinery (`installEagerHooks`/`removeEagerHooks`/
+// `on_invalidate_hook`/`makeRecomputeFn`) that `cell.zig` drives, plus the
+// deprecated `signal`/`signalKeyed` convenience constructors that now return a
+// `*Computed(T)` (mirroring lazily-rs `Context::signal -> Computed<T>`).
 
 /// AUDIT ONLY (`#lzspecedgeindex`, `build_options.naive_pending_scan`).
 ///
@@ -265,60 +238,36 @@ pub fn removeEagerHooks(slot_ptr: *Slot) void {
     slot_ptr.recompute = null;
 }
 
+/// Deprecated convenience for an **eager** `Computed` — `computed(...).eager()`.
+/// The standalone `Signal` handle is retired (`#lzcellkernel`); this returns a
+/// `*Computed(T)` already made eager, matching lazily-rs `Context::signal ->
+/// Computed<T>`. `.eager()` reserves the `pending_recompute` entry and installs
+/// the same `on_invalidate_hook`/`makeRecomputeFn` puller this module owns.
+/// Prefer `computed(...).eager()` directly.
 pub fn signal(
     comptime T: type,
     ctx: *Context,
     comptime valueFn: *const ValueFn(T),
     comptime deinitPayload: ?DeinitPayloadFn,
-) !*Signal(T) {
-    // Create the backing slot (establishes initial dependency edges + memo cache)
-    _ = try slot(T, ctx, valueFn, deinitPayload);
-
-    // Get the slot pointer from cache
-    const slot_ptr = ctx.getSlot(valueFn) orelse return error.SlotNotFound;
-
-    // Reserve this Signal's `pending_recompute` entry up front so
-    // `on_invalidate_hook` never has to allocate. See
-    // `Context.reserveEagerRecomputeSlot` — a dropped enqueue leaves
-    // `Signal.get` serving the pre-invalidation value permanently, because the
-    // cascade has already dropped the edge that would deliver the next one.
-    try ctx.reserveEagerRecomputeSlot();
-
-    // Install eager-Signal hooks
-    slot_ptr.on_invalidate = &on_invalidate_hook;
-    slot_ptr.recompute = makeRecomputeFn(T);
-
-    const self = try ctx.allocator.create(Signal(T));
-    self.* = .{
-        .ctx = ctx,
-        .slot = slot_ptr,
-        .active = true,
-    };
-    return self;
+) !*CellMod.Computed(T) {
+    const c = try CellMod.computed(T, ctx, valueFn, deinitPayload);
+    return c.eager();
 }
 
-/// Runtime-keyed `signal`, mirroring `slotKeyed` vs `slot`. `signal` keys the
-/// backing slot by its comptime `valueFn` pointer, so a single body can only
-/// ever back one Signal. This variant takes the cache key explicitly, so N
-/// distinct eager nodes can share one body — required to vary fan-out width
-/// with node count held fixed (`#lzspecedgeindex`, src/benches/pending_audit.zig).
-/// Hooks are the same `on_invalidate_hook` / `makeRecomputeFn` `signal` installs.
+/// Runtime-keyed `signal`, mirroring `slotKeyed` vs `slot`: the cache key is
+/// supplied explicitly so N distinct eager nodes can share one comptime body —
+/// required to vary fan-out width with node count held fixed
+/// (`#lzspecedgeindex`, src/benches/pending_audit.zig). Deprecated convenience
+/// returning a `*Computed(T)` made eager (`computedKeyed(...).eager()`).
 pub fn signalKeyed(
     comptime T: type,
     ctx: *Context,
     cache_key: usize,
     valueFn: *const ValueFn(T),
     deinitPayload: ?DeinitPayloadFn,
-) !*Signal(T) {
-    _ = try slotKeyed(T, ctx, cache_key, valueFn, deinitPayload);
-
-    const slot_ptr = ctx.cacheLookup(cache_key) orelse return error.SlotNotFound;
-    slot_ptr.on_invalidate = &on_invalidate_hook;
-    slot_ptr.recompute = makeRecomputeFn(T);
-
-    const self = try ctx.allocator.create(Signal(T));
-    self.* = .{ .ctx = ctx, .slot = slot_ptr, .active = true };
-    return self;
+) !*CellMod.Computed(T) {
+    const c = try CellMod.computedKeyed(T, ctx, cache_key, valueFn, deinitPayload);
+    return c.eager();
 }
 
 const KeyedTestState = struct {
@@ -367,8 +316,8 @@ test "lazily/signal: signalKeyed gives distinct eager nodes from one body" {
     try std.testing.expectEqual(@as(i64, 10), a.get().*);
     try std.testing.expectEqual(@as(i64, 10), b.get().*);
 
-    a.dispose();
-    try std.testing.expect(!a.is_active());
+    a.lazy();
+    try std.testing.expect(!a.isEager());
 }
 
 const SignalTestState = struct {
@@ -380,8 +329,6 @@ const getSourceU32 = struct {
         return 0;
     }
 }.call;
-
-const CellMod = @import("cell.zig");
 
 test "lazily/signal: eager recompute on dependency change" {
     const allocator = std.testing.allocator;
@@ -456,8 +403,8 @@ test "lazily/signal: dispose reverts to lazy semantics" {
     try std.testing.expectEqual(@as(u32, 1), sig.get().*);
     try std.testing.expectEqual(@as(u32, 1), SignalTestState.counter);
 
-    sig.dispose();
-    try std.testing.expect(!sig.is_active());
+    sig.lazy();
+    try std.testing.expect(!sig.isEager());
 
     source.set(20);
     try std.testing.expectEqual(@as(u32, 1), SignalTestState.counter);

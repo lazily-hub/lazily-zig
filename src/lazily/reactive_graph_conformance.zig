@@ -554,7 +554,7 @@ const SyncModel = struct {
     /// can both be reached. Indexed by node index.
     effects: [MAX_NODES]?*EffectMod.Effect(SyncCleanup) = @splat(null),
     /// Eager-signal handles (`#lzsignaleager`), also allocator-owned.
-    signals: [MAX_NODES]?*SignalMod.Signal(V) = @splat(null),
+    signals: [MAX_NODES]?*CellMod.Computed(V) = @splat(null),
 
     fn create(allocator: std.mem.Allocator) !SyncModel {
         return .{ .ctx = try Context.init(allocator) };
@@ -598,17 +598,20 @@ const SyncModel = struct {
     fn addSignal(self: *SyncModel, idx: usize, deps: []const usize, offset: V) !void {
         gens[idx] += 1;
         defs[idx] = try Def.withDeps(.signal, deps, offset);
-        // `signalKeyed` does not reserve the eager-recompute queue entry that
-        // `signal` does, and `on_invalidate_hook`'s append has no recovery
-        // available — a dropped enqueue leaves the node serving its
-        // pre-invalidation value for the life of the Context. Reserve here and
-        // propagate OOM rather than discovering it as silent staleness.
+        // `signalKeyed` is now `computedKeyed(...).eager()`, and `.eager()`
+        // reserves the eager-recompute queue entry itself (via
+        // `installEagerHooks`), so `on_invalidate_hook`'s append can never fail
+        // for want of capacity. The extra reserve here is redundant but cheap;
+        // keep it so an OOM surfaces at construction rather than as silent
+        // staleness.
         try self.ctx.reserveEagerRecomputeSlot();
         self.signals[idx] = try SignalMod.signalKeyed(V, self.ctx, syncKey(idx), sync_compute_fns[idx], null);
     }
 
     fn disposeSignal(self: *SyncModel, idx: usize) void {
-        if (self.signals[idx]) |s| s.dispose();
+        // Revert the eager `Computed` to lazy (remove the puller) without
+        // tearing the node out — the `dispose_signal_reverts_to_lazy` contract.
+        if (self.signals[idx]) |s| s.lazy();
     }
 
     fn batch(self: *SyncModel, writes: []const BatchWrite) !void {

@@ -31,7 +31,7 @@ const Context = lazily.Context;
 const Slot = lazily.Slot;
 const slotKeyed = lazily.slotKeyed;
 const signalKeyed = lazily.signalKeyed;
-const Signal = lazily.Signal;
+const Computed = lazily.Computed;
 
 const linux = std.os.linux;
 
@@ -107,10 +107,11 @@ const Rung = struct {
 /// was empty throughout and forced-naive came back at 1.2x. That reads exactly
 /// like a clean negative and was measuring nothing. A low forced-naive margin
 /// means suspect the harness first.
-/// `destroy_saturated` is the arm for `Slot.destroy` rather than
-/// `Signal.dispose`. The two are different code paths: `dispose` only nulls the
-/// hooks, while `destroy` tears the node down and returns its arena memory to
-/// the reuse free-list — and it is `destroy`, not `dispose`, that has to
+/// `destroy_saturated` is the arm for `Slot.destroy` rather than reverting an
+/// eager `Computed` to lazy (`Computed.lazy`). The two are different code
+/// paths: `lazy` only nulls the eager hooks, while `destroy` tears the node
+/// down and returns its arena memory to the reuse free-list — and it is
+/// `destroy`, not `lazy`, that has to
 /// reconcile with a queue entry the slot may already own. It runs against a
 /// saturated queue for the same reason `saturated` exists: a drained queue
 /// gives a remove-by-scan nothing to walk.
@@ -129,7 +130,7 @@ fn runRung(total: usize, width: usize, dispose_mode: DisposeMode) !Rung {
     try ctx.initDense(2 * total + 2 * sources + 4);
 
     const pa = std.heap.page_allocator;
-    const sigs = try pa.alloc(*Signal(i64), total);
+    const sigs = try pa.alloc(*Computed(i64), total);
     defer pa.free(sigs);
 
     g.source_value = 1;
@@ -176,7 +177,7 @@ fn runRung(total: usize, width: usize, dispose_mode: DisposeMode) !Rung {
             if (ctx.pending_recompute.items.len != 0) return error.QueueNotDrained;
 
             t = nowNs();
-            for (sigs) |sig| sig.dispose();
+            for (sigs) |sig| sig.lazy();
             dispose_ns = nowNs() - t;
         },
         .saturated => {
@@ -203,7 +204,7 @@ fn runRung(total: usize, width: usize, dispose_mode: DisposeMode) !Rung {
                 if (ctx.pending_recompute.items.len != width) return error.QueueNotSaturated;
 
                 t = nowNs();
-                for (sigs[s * width ..][0..width]) |sig| sig.dispose();
+                for (sigs[s * width ..][0..width]) |sig| sig.lazy();
                 dispose_ns += nowNs() - t;
 
                 t = nowNs();
