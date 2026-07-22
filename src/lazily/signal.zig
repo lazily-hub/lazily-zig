@@ -149,9 +149,25 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
                     .indirect => @as(*T, @ptrCast(@alignCast(old_storage.payload.single_ptr))).*,
                 };
 
-                if (std.meta.eql(old_value, new_value)) return; // memo guard
-
-                changed = true;
+                // Propagate guard (`#lzcellkernel`). A plain guarded computed
+                // suppresses an *equal* recompute: keep the old storage and skip
+                // the cascade. A `computedRippleWhen` node instead installs a
+                // custom PURE change predicate on the slot — it ALWAYS publishes
+                // the freshly computed value (propagate guard, not a compute/
+                // store guard) and gates only the downstream cascade on
+                // `changed(old, new)`. `computed(f)` == the `!=` predicate;
+                // `slot(f)` (always-true) is the pass-through.
+                if (s.ripple_when) |predicate| {
+                    changed = predicate(
+                        @as(*const anyopaque, @ptrCast(&old_value)),
+                        @as(*const anyopaque, @ptrCast(&new_value)),
+                    );
+                    // Fall through and publish `new_value` regardless of
+                    // `changed`; only the step-4 emitChange is gated.
+                } else {
+                    if (std.meta.eql(old_value, new_value)) return; // memo guard
+                    changed = true;
+                }
 
                 // Deinit old payload value.
                 //

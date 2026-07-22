@@ -439,6 +439,71 @@ pub fn computedKeyed(
     return self;
 }
 
+/// Construct a **guarded computed cell** with an explicit change predicate
+/// (`#lzcellkernel`) — the propagate-guard escape hatch.
+///
+/// Like [`computed`], but the downstream cascade is gated by `changed(old, new)`
+/// instead of the value's natural `std.meta.eql`: `changed` returns `true` to
+/// **propagate** the recompute to dependents and `false` to **suppress** it
+/// (treat it as "no meaningful change"). So:
+///
+///   - `computed(f)` == `computedRippleWhen(f, |o, n| o.* != n.*)` (natural
+///     equality), and
+///   - the unguarded `slot(f)` == `computedRippleWhen(f, |_, _| true)` (always
+///     propagate — the pass-through).
+///
+/// Use it for a **custom significance policy**: dedup a large value by a
+/// version/hash field, epsilon float compare, hysteresis, a monotonic gate, or
+/// "propagate every N" when the counter lives in the value.
+///
+/// The value is **always computed and published** (the predicate needs `new`);
+/// `changed` gates only the downstream cascade, never the computation or the
+/// stored value. Returned **eager**: the propagate guard runs on the eager
+/// recompute path (`makeRecomputeFn`), which is where the storage-layer guard
+/// lives — a purely lazy node has no cascade to suppress.
+///
+/// `changed` MUST be a **pure** function of `(old, new)`. Reading value-carried
+/// state (a version/counter/sequence embedded in `T`) is fine and stays
+/// deterministic; capturing external mutable state is not — it would key off
+/// recompute/read frequency under laziness and break determinism.
+pub fn computedRippleWhen(
+    comptime T: type,
+    ctx: *Context,
+    comptime valueFn: *const ValueFn(T),
+    comptime changed: *const fn (old: *const T, new: *const T) bool,
+    comptime deinitPayload: ?DeinitPayloadFn,
+) !*Computed(T) {
+    return computedRippleWhenKeyed(T, ctx, valueFnCacheKey(valueFn), valueFn, changed, deinitPayload);
+}
+
+/// `computedRippleWhen` with a caller-supplied cache key, mirroring
+/// `computedKeyed` vs `computed`.
+pub fn computedRippleWhenKeyed(
+    comptime T: type,
+    ctx: *Context,
+    cache_key: usize,
+    comptime valueFn: *const ValueFn(T),
+    comptime changed: *const fn (old: *const T, new: *const T) bool,
+    comptime deinitPayload: ?DeinitPayloadFn,
+) !*Computed(T) {
+    const c = try computedKeyed(T, ctx, cache_key, valueFn, deinitPayload);
+    // Comptime trampoline: restore `*const T` from the type-erased slot field
+    // and call the caller's pure predicate. The slot is not generic over `T`.
+    const erased = struct {
+        fn call(old: *const anyopaque, new: *const anyopaque) bool {
+            return changed(
+                @as(*const T, @ptrCast(@alignCast(old))),
+                @as(*const T, @ptrCast(@alignCast(new))),
+            );
+        }
+    }.call;
+    c.slot.ripple_when = &erased;
+    // The propagate guard only runs on the eager recompute path, so a
+    // ripple-when node is eager (it always computes; the guard gates the
+    // cascade). `.eager()` returns the same handle.
+    return c.eager();
+}
+
 // -- Backward-compatible aliases (former vocabulary) ------------------------
 
 /// Deprecated alias for `source` — the plain source constructor. Prefer
@@ -1058,4 +1123,250 @@ test "lazily/cell kernel: eager computed materializes once per batch (clause 3)"
     try std.testing.expect(!f.isEager());
     try std.testing.expect(!f.slot.eager);
     try std.testing.expect(ctx.eager_by.count() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// `computedRippleWhen` (`#lzcellkernel`) — a guarded computed with an explicit,
+// PURE change predicate (`true` = propagate). Mirrors lazily-rs
+// `tests/computed_ripple_when.rs`. The propagate guard runs on the eager
+// recompute path (`makeRecomputeFn`), which is where the storage-layer equality
+// guard lives, so a ripple-when node is eager and the observers below read it
+// through the eager cascade rather than the coarse lazy staleness sweep.
+// ---------------------------------------------------------------------------
+
+// (1) Custom significance: the derived value carries a `bucket` proxy; propagate
+// only when the bucket changes, ignoring the raw payload.
+const RippleBucket = struct {
+    const Pair = struct { payload: u64, bucket: u64 };
+    var derived: ?*Computed(Pair) = null;
+    var observer_recomputes: u32 = 0;
+
+    fn inputInit(_: *Context) anyerror!u64 {
+        return 0;
+    }
+    fn derivedFn(c: *Context) anyerror!Pair {
+        const in = try source(u64, c, inputInit, null);
+        const v = in.get();
+        return .{ .payload = v, .bucket = v / 10 };
+    }
+    fn changedByBucket(old: *const Pair, new: *const Pair) bool {
+        return old.bucket != new.bucket; // propagate when the bucket changed
+    }
+    fn observerFn(c: *Context) anyerror!u64 {
+        _ = c;
+        observer_recomputes += 1;
+        return derived.?.get().payload;
+    }
+};
+
+test "lazily/cell computedRippleWhen: custom significance propagates on proxy change" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    RippleBucket.derived = null;
+    RippleBucket.observer_recomputes = 0;
+
+    const input = try source(u64, ctx, RippleBucket.inputInit, null);
+    const derived = try computedRippleWhen(RippleBucket.Pair, ctx, RippleBucket.derivedFn, RippleBucket.changedByBucket, null);
+    defer ctx.allocator.destroy(derived);
+    RippleBucket.derived = derived;
+
+    const observer = try computed(u64, ctx, RippleBucket.observerFn, null);
+    defer ctx.allocator.destroy(observer);
+
+    try std.testing.expectEqual(@as(u64, 0), observer.get().*);
+    const base = RippleBucket.observer_recomputes;
+
+    // Same bucket (0..9): dependent stays cached, no recompute.
+    input.set(3);
+    try std.testing.expectEqual(@as(u64, 0), observer.get().*); // suppressed: bucket unchanged
+    try std.testing.expectEqual(base, RippleBucket.observer_recomputes);
+
+    // Crossing a bucket boundary propagates.
+    input.set(12);
+    try std.testing.expectEqual(@as(u64, 12), observer.get().*); // propagated: bucket changed
+    try std.testing.expectEqual(base + 1, RippleBucket.observer_recomputes);
+}
+
+// (2) "Propagate every N": the evidence (the counter) is IN the value, so the
+// predicate is a pure function of (old, new) — propagate only when the count
+// crosses a size-3 window boundary.
+const RippleEveryN = struct {
+    var sampled: ?*Computed(u64) = null;
+    var observer_recomputes: u32 = 0;
+
+    fn inputInit(_: *Context) anyerror!u64 {
+        return 0;
+    }
+    fn sampledFn(c: *Context) anyerror!u64 {
+        const in = try source(u64, c, inputInit, null);
+        return in.get();
+    }
+    fn changedEvery3(old: *const u64, new: *const u64) bool {
+        return new.* / 3 != old.* / 3;
+    }
+    fn observerFn(c: *Context) anyerror!u64 {
+        _ = c;
+        observer_recomputes += 1;
+        return sampled.?.get().*;
+    }
+};
+
+test "lazily/cell computedRippleWhen: propagate every N via value-carried counter" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    RippleEveryN.sampled = null;
+    RippleEveryN.observer_recomputes = 0;
+
+    const input = try source(u64, ctx, RippleEveryN.inputInit, null);
+    const sampled = try computedRippleWhen(u64, ctx, RippleEveryN.sampledFn, RippleEveryN.changedEvery3, null);
+    defer ctx.allocator.destroy(sampled);
+    RippleEveryN.sampled = sampled;
+
+    const observer = try computed(u64, ctx, RippleEveryN.observerFn, null);
+    defer ctx.allocator.destroy(observer);
+
+    try std.testing.expectEqual(@as(u64, 0), observer.get().*);
+    const base = RippleEveryN.observer_recomputes;
+
+    // 0 -> 1 -> 2 stay in window [0,3): suppressed.
+    input.set(1);
+    input.set(2);
+    try std.testing.expectEqual(@as(u64, 0), observer.get().*);
+    try std.testing.expectEqual(base, RippleEveryN.observer_recomputes);
+
+    // 3 crosses into [3,6): propagate.
+    input.set(3);
+    try std.testing.expectEqual(@as(u64, 3), observer.get().*);
+    try std.testing.expectEqual(base + 1, RippleEveryN.observer_recomputes);
+}
+
+// (3) `computed(f).eager()` behaves as `computedRippleWhen(f, |o, n| o.* != n.*)`
+// — both guard on natural equality on the eager recompute path.
+const RippleEqIdentity = struct {
+    var via_computed: ?*Computed(i64) = null;
+    var via_when: ?*Computed(i64) = null;
+    var a_recomputes: u32 = 0;
+    var b_recomputes: u32 = 0;
+
+    fn inputInit(_: *Context) anyerror!i64 {
+        return 0;
+    }
+    fn clampFnA(c: *Context) anyerror!i64 {
+        const in = try source(i64, c, inputInit, null);
+        return @min(in.get(), 1);
+    }
+    // Distinct comptime body so it gets its own cache key / node.
+    fn clampFnB(c: *Context) anyerror!i64 {
+        const in = try source(i64, c, inputInit, null);
+        return @min(in.get(), 1);
+    }
+    fn notEqual(old: *const i64, new: *const i64) bool {
+        return old.* != new.*;
+    }
+    fn obsAFn(c: *Context) anyerror!i64 {
+        _ = c;
+        a_recomputes += 1;
+        return via_computed.?.get().*;
+    }
+    fn obsBFn(c: *Context) anyerror!i64 {
+        _ = c;
+        b_recomputes += 1;
+        return via_when.?.get().*;
+    }
+};
+
+test "lazily/cell computedRippleWhen: computed(eager) matches ripple-when(!=)" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    RippleEqIdentity.via_computed = null;
+    RippleEqIdentity.via_when = null;
+    RippleEqIdentity.a_recomputes = 0;
+    RippleEqIdentity.b_recomputes = 0;
+
+    const input = try source(i64, ctx, RippleEqIdentity.inputInit, null);
+
+    const via_computed = (try computed(i64, ctx, RippleEqIdentity.clampFnA, null)).eager();
+    defer ctx.allocator.destroy(via_computed);
+    const via_when = try computedRippleWhen(i64, ctx, RippleEqIdentity.clampFnB, RippleEqIdentity.notEqual, null);
+    defer ctx.allocator.destroy(via_when);
+    RippleEqIdentity.via_computed = via_computed;
+    RippleEqIdentity.via_when = via_when;
+
+    const obs_a = try computed(i64, ctx, RippleEqIdentity.obsAFn, null);
+    defer ctx.allocator.destroy(obs_a);
+    const obs_b = try computed(i64, ctx, RippleEqIdentity.obsBFn, null);
+    defer ctx.allocator.destroy(obs_b);
+
+    try std.testing.expectEqual(@as(i64, 0), obs_a.get().*);
+    try std.testing.expectEqual(@as(i64, 0), obs_b.get().*);
+    const base_a = RippleEqIdentity.a_recomputes;
+    const base_b = RippleEqIdentity.b_recomputes;
+
+    // 0 -> 5 both clamp to 1: both propagate identically.
+    input.set(5);
+    try std.testing.expectEqual(@as(i64, 1), obs_a.get().*);
+    try std.testing.expectEqual(@as(i64, 1), obs_b.get().*);
+    try std.testing.expectEqual(base_a + 1, RippleEqIdentity.a_recomputes);
+    try std.testing.expectEqual(base_b + 1, RippleEqIdentity.b_recomputes);
+
+    // 5 -> 9 both stay 1: both suppress the dependent identically.
+    input.set(9);
+    try std.testing.expectEqual(@as(i64, 1), obs_a.get().*);
+    try std.testing.expectEqual(@as(i64, 1), obs_b.get().*);
+    try std.testing.expectEqual(base_a + 1, RippleEqIdentity.a_recomputes); // computed suppressed equal recompute
+    try std.testing.expectEqual(base_b + 1, RippleEqIdentity.b_recomputes); // ripple-when(!=) matches computed
+}
+
+// (4) Pass-through: an always-true predicate propagates even when the value is
+// unchanged — the `slot(f)` identity on the eager surface.
+const RipplePassThrough = struct {
+    var passthrough: ?*Computed(u64) = null;
+    var observer_recomputes: u32 = 0;
+
+    fn inputInit(_: *Context) anyerror!u64 {
+        return 0;
+    }
+    fn constFn(c: *Context) anyerror!u64 {
+        _ = (try source(u64, c, inputInit, null)).get(); // depend on input, always yield 0
+        return 0;
+    }
+    fn alwaysPropagate(_: *const u64, _: *const u64) bool {
+        return true;
+    }
+    fn observerFn(c: *Context) anyerror!u64 {
+        _ = c;
+        observer_recomputes += 1;
+        return passthrough.?.get().*;
+    }
+};
+
+test "lazily/cell computedRippleWhen: pass-through (always true) always propagates" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    RipplePassThrough.passthrough = null;
+    RipplePassThrough.observer_recomputes = 0;
+
+    const input = try source(u64, ctx, RipplePassThrough.inputInit, null);
+    const passthrough = try computedRippleWhen(u64, ctx, RipplePassThrough.constFn, RipplePassThrough.alwaysPropagate, null);
+    defer ctx.allocator.destroy(passthrough);
+    RipplePassThrough.passthrough = passthrough;
+
+    const observer = try computed(u64, ctx, RipplePassThrough.observerFn, null);
+    defer ctx.allocator.destroy(observer);
+
+    try std.testing.expectEqual(@as(u64, 0), observer.get().*);
+    const base = RipplePassThrough.observer_recomputes;
+
+    // Value stays 0, but the always-true guard propagates, so the dependent re-fires.
+    input.set(5);
+    try std.testing.expectEqual(@as(u64, 0), observer.get().*);
+    try std.testing.expect(RipplePassThrough.observer_recomputes > base);
 }

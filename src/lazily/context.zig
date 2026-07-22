@@ -1178,6 +1178,17 @@ pub const Slot = struct {
     // recompute: type-erased re-materialize (re-run valueFn, memo guard, swap, emitChange).
     on_invalidate: ?*const fn (*Slot) void = null,
     recompute: ?*const fn (*Slot) void = null,
+    // Custom propagate guard installed by `computedRippleWhen` (`#lzcellkernel`).
+    // Null on every other node (a plain `computed` keeps the default
+    // `std.meta.eql` memo guard). When set, the eager recompute path
+    // (`makeRecomputeFn`) publishes the freshly computed value *unconditionally*
+    // — this is a propagate guard, not a compute/store guard — and calls this
+    // PURE predicate with `(*old, *new)` to decide whether to ripple downstream:
+    // `true` => emitChange (propagate), `false` => suppress the cascade. Type-
+    // erased (`*const anyopaque`) because `Slot` is not generic over `T`;
+    // `computedRippleWhen` supplies a comptime trampoline that restores
+    // `*const T` before invoking the caller's predicate.
+    ripple_when: ?RippleWhenFn = null,
     // Small fields grouped at the tail (`#lzzigslotpack`): the 1-byte enums and
     // bools are clustered so the struct carries no inter-field padding between
     // them. `storage`/`inline_buf` keep their types and the `#lzinplace`
@@ -2170,6 +2181,12 @@ pub const Slot = struct {
         return *const fn (*Context, *const ValueFn(T), T) void;
     }
     pub const DeinitPayloadFn = *const fn (*Slot) void;
+    /// Type-erased propagate predicate for `ripple_when` (`#lzcellkernel`).
+    /// `old`/`new` are `*const T` reinterpreted as opaque (the slot is not
+    /// generic over `T`); returns `true` to ripple downstream, `false` to
+    /// suppress. `computedRippleWhen` builds the comptime trampoline that casts
+    /// back to `*const T` and calls the caller's pure predicate.
+    pub const RippleWhenFn = *const fn (old: *const anyopaque, new: *const anyopaque) bool;
 };
 
 pub fn ValueFn(comptime T: type) type {

@@ -14,6 +14,8 @@ pub const sourceWith = @import("./lazily/cell.zig").sourceWith;
 pub const sourceKeyed = @import("./lazily/cell.zig").sourceKeyed;
 pub const computed = @import("./lazily/cell.zig").computed;
 pub const computedKeyed = @import("./lazily/cell.zig").computedKeyed;
+pub const computedRippleWhen = @import("./lazily/cell.zig").computedRippleWhen;
+pub const computedRippleWhenKeyed = @import("./lazily/cell.zig").computedRippleWhenKeyed;
 // Deprecated aliases for the former reactive-value vocabulary.
 pub const cell = @import("./lazily/cell.zig").cell;
 pub const CellFn = @import("./lazily/cell.zig").CellFn;
