@@ -4,7 +4,10 @@ const Context = @import("context.zig").Context;
 const deinitSlotValue = @import("slot.zig").deinitSlotValue;
 const initSlotFn = @import("slot.zig").initSlotFn;
 const ValueFn = @import("context.zig").ValueFn;
+const normalizeValueFn = @import("context.zig").normalizeValueFn;
+const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const slot = @import("slot.zig").slot;
+const slotKeyed = @import("slot.zig").slotKeyed;
 
 test "0.16:lazily/cell.thread_safe: slot contention" {
     if (!build_options.thread_safe) return error.SkipZigTest;
@@ -76,11 +79,14 @@ test "0.16:lazily/cell.thread_safe: slot contention" {
     // Spawn multiple threads all trying to get the same slot at once
     for (0..num_threads) |i| {
         threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(c: *Context, f: *const fn (*Context) anyerror!i32) void {
-                const val = slot(i32, c, f, null) catch unreachable;
+            fn run(c: *Context, f: *const ValueFn(i32)) void {
+                // `f` is already the value-threaded `*Compute` closure; dispatch
+                // at runtime through `slotKeyed` (all threads share one key so
+                // this races the same slot).
+                const val = slotKeyed(i32, c, valueFnCacheKey(f), f, null) catch unreachable;
                 std.testing.expectEqual(@as(i32, 42), val.*) catch @panic("Value mismatch");
             }
-        }.run, .{ ctx, valueFn.call });
+        }.run, .{ ctx, comptime normalizeValueFn(i32, valueFn.call) });
     }
 
     for (threads) |t| t.join();

@@ -2,6 +2,7 @@ const std = @import("std");
 const lazily = @import("lazily");
 
 const Context = lazily.Context;
+const Compute = lazily.Compute;
 const deinitSlotValue = lazily.deinitSlotValue;
 const expectEventLog = lazily.expectEventLog;
 const initCellFn = lazily.initCellFn;
@@ -30,12 +31,13 @@ pub const name = initCellFn(
     null,
 );
 
-fn getGreeting(ctx: *Context) !OwnedString {
+fn getGreeting(c: *Compute) !OwnedString {
+    const ctx = c.untracked();
     try (try slotEventLog(ctx)).append("greeting|");
     return OwnedString.managed(std.fmt.allocPrint(
         ctx.allocator,
         "{s} {s}!",
-        .{ (try hello(ctx)).get(), (try name(ctx)).get() },
+        .{ c.get(try hello(ctx)), c.get(try name(ctx)) },
     ) catch unreachable);
 }
 pub const greeting = initSlotFn(
@@ -54,13 +56,16 @@ pub const response = initCellFn(
     null,
 );
 
-fn getGreetingAndResponse(_ctx: *Context) !OwnedString {
+fn getGreetingAndResponse(c: *Compute) !OwnedString {
+    const _ctx = c.untracked();
     try (try slotEventLog(_ctx)).append("greetingAndResponse|");
+    const g = (try greeting(_ctx)).value;
+    if (_ctx.getSlot(getGreeting)) |s| c.trackSlot(s);
     return OwnedString.managed(
         std.fmt.allocPrint(
             _ctx.allocator,
             "{s} {s}",
-            .{ (try greeting(_ctx)).value, (try response(_ctx)).get() },
+            .{ g, c.get(try response(_ctx)) },
         ) catch unreachable,
     );
 }

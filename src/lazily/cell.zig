@@ -2,12 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Context = @import("context.zig").Context;
-const currentSlotFor = @import("context.zig").currentSlotFor;
 const Owned = @import("context.zig").Owned;
 const OwnedString = @import("context.zig").OwnedString;
 const Slot = @import("context.zig").Slot;
 const String = @import("context.zig").String;
 const ValueFn = @import("context.zig").ValueFn;
+const normalizeValueFn = @import("context.zig").normalizeValueFn;
 const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const deinitSlotValue = @import("slot.zig").deinitSlotValue;
 const slot = @import("slot.zig").slot;
@@ -182,10 +182,13 @@ fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type
 
         pub fn init(
             ctx: *Context,
-            comptime valueFn: *const ValueFn(T),
+            comptime valueFn: anytype,
             comptime deinitCellValue: ?DeinitFn,
         ) !*Self {
             if (comptime !is_source) @compileError("init is only available on a Source; build a Computed with `computed(...)`");
+            // Key by the ORIGINAL closure so `getSlot(fn)` / explicit re-keying
+            // stays stable across normalization (`#lzcellkernel`); the stored
+            // callable is the normalized `*Compute` form.
             return initKeyed(ctx, valueFnCacheKey(valueFn), valueFn, deinitCellValue);
         }
 
@@ -196,22 +199,23 @@ fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type
         pub fn initKeyed(
             ctx: *Context,
             cache_key: usize,
-            comptime valueFn: *const ValueFn(T),
+            comptime valueFn: anytype,
             comptime deinitCellValue: ?DeinitFn,
         ) !*Self {
             if (comptime !is_source) @compileError("initKeyed is only available on a Source");
+            const nf = comptime normalizeValueFn(T, valueFn);
             const getCell = struct {
-                fn call(_ctx: *Context) anyerror!Self {
-                    const initial_value = try valueFn(_ctx);
-                    const maybe_cell_slot = currentSlotFor(_ctx);
-                    if (maybe_cell_slot) |cell_slot| {
-                        return Self{
-                            .ctx = _ctx,
-                            .slot = cell_slot,
-                            .value = initial_value,
-                            .deinitCellValue = deinitCellValue,
-                        };
-                    } else return error.MissingCurrentSlot;
+                fn call(c: *Compute) anyerror!Self {
+                    // The cell's OWN slot is value-threaded in as `c.node`; no
+                    // ambient lookup (`#lzcellkernel`). A source `valueFn`
+                    // ignores `c`; a reader would track via `c.get`.
+                    const initial_value = try nf(c);
+                    return Self{
+                        .ctx = c.untracked(),
+                        .slot = c.node,
+                        .value = initial_value,
+                        .deinitCellValue = deinitCellValue,
+                    };
                 }
             }.call;
             const self = try slotKeyed(
@@ -374,7 +378,7 @@ pub fn Computed(comptime T: type) type {
 pub fn source(
     comptime T: type,
     ctx: *Context,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitFn: ?DeinitCellValueFn(T),
 ) !*Source(T) {
     return Source(T).init(ctx, valueFn, deinitFn);
@@ -386,7 +390,7 @@ pub fn sourceWith(
     comptime T: type,
     comptime M: type,
     ctx: *Context,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitFn: ?SourceCellWith(T, M).DeinitFn,
 ) !*SourceCellWith(T, M) {
     return SourceCellWith(T, M).init(ctx, valueFn, deinitFn);
@@ -397,7 +401,7 @@ pub fn sourceKeyed(
     comptime T: type,
     ctx: *Context,
     cache_key: usize,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitFn: ?DeinitCellValueFn(T),
 ) !*Source(T) {
     return Source(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
@@ -412,13 +416,16 @@ pub fn sourceKeyed(
 pub fn computed(
     comptime T: type,
     ctx: *Context,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitPayload: ?DeinitPayloadFn,
 ) !*Computed(T) {
-    return computedKeyed(T, ctx, valueFnCacheKey(valueFn), valueFn, deinitPayload);
+    const nf = comptime normalizeValueFn(T, valueFn);
+    return computedKeyed(T, ctx, valueFnCacheKey(valueFn), nf, deinitPayload);
 }
 
-/// `computed` with a caller-supplied cache key, mirroring `slotKeyed`.
+/// `computed` with a caller-supplied cache key, mirroring `slotKeyed`. Takes a
+/// runtime `*Compute` closure (already normalized) so one comptime body can back
+/// N distinct nodes via distinct keys (dispatched through a runtime array).
 pub fn computedKeyed(
     comptime T: type,
     ctx: *Context,
@@ -469,11 +476,12 @@ pub fn computedKeyed(
 pub fn computedRippleWhen(
     comptime T: type,
     ctx: *Context,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime changed: *const fn (old: *const T, new: *const T) bool,
     comptime deinitPayload: ?DeinitPayloadFn,
 ) !*Computed(T) {
-    return computedRippleWhenKeyed(T, ctx, valueFnCacheKey(valueFn), valueFn, changed, deinitPayload);
+    const nf = comptime normalizeValueFn(T, valueFn);
+    return computedRippleWhenKeyed(T, ctx, valueFnCacheKey(valueFn), nf, changed, deinitPayload);
 }
 
 /// `computedRippleWhen` with a caller-supplied cache key, mirroring
@@ -482,11 +490,11 @@ pub fn computedRippleWhenKeyed(
     comptime T: type,
     ctx: *Context,
     cache_key: usize,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime changed: *const fn (old: *const T, new: *const T) bool,
     comptime deinitPayload: ?DeinitPayloadFn,
 ) !*Computed(T) {
-    const c = try computedKeyed(T, ctx, cache_key, valueFn, deinitPayload);
+    const c = try computedKeyed(T, ctx, cache_key, comptime normalizeValueFn(T, valueFn), deinitPayload);
     // Comptime trampoline: restore `*const T` from the type-erased slot field
     // and call the caller's pure predicate. The slot is not generic over `T`.
     const erased = struct {
@@ -517,48 +525,29 @@ pub fn computedRippleWhenKeyed(
 // lazily-rs kept its thread-local frame for the SyncReactiveGraph closures).
 
 const Compute = @import("context.zig").Compute;
-const detachTracking = @import("context.zig").detachTracking;
-const restoreTracking = @import("context.zig").restoreTracking;
 
 /// The value-threaded compute closure type: receives the fortified `*Compute`
-/// view instead of the ambient `*Context`.
+/// view instead of the ambient `*Context`. Now identical to the canonical
+/// `ValueFn(T)` — the ambient path is gone, so every compute closure is
+/// value-threaded (`#lzcellkernel`).
 pub fn ComputeFn(comptime T: type) type {
     return fn (*Compute) anyerror!T;
 }
 
-/// Wrap a value-threaded `ComputeFn` into a legacy `ValueFn(*Context)`
-/// trampoline. On each (re)compute the trampoline resolves the recomputing node
-/// from the bridge frame, mints a per-recompute `Compute` view over it, detaches
-/// the ambient frame (so bare reads register nothing), and runs the closure —
-/// value-threading the node identity into the closure. Rebind-per-recompute and
-/// the guard/ripple semantics are inherited unchanged from the underlying
-/// storage `Slot`.
-fn computeTrampoline(comptime T: type, comptime computeFn: *const ComputeFn(T)) *const ValueFn(T) {
-    return &struct {
-        fn call(_ctx: *Context) anyerror!T {
-            const node = currentSlotFor(_ctx) orelse return error.MissingCurrentSlot;
-            const saved = detachTracking();
-            defer restoreTracking(saved);
-            var view = Compute.init(_ctx, node);
-            return computeFn(&view);
-        }
-    }.call;
-}
-
-/// `computed`, fortified: the closure receives a value-threaded `*Compute`.
-/// A guarded, lazy derived value whose dependency edges are registered against
-/// the recomputing node by value (no ambient tracking).
+/// `computedC` is now just `computed` — the canonical constructor already takes
+/// a `*Compute` closure (or auto-wraps a legacy `fn(*Context)` source). Kept as
+/// an alias so existing `computedC(...)` call sites keep compiling.
 pub fn computedC(
     comptime T: type,
     ctx: *Context,
     comptime computeFn: *const ComputeFn(T),
     comptime deinitPayload: ?DeinitPayloadFn,
 ) !*Computed(T) {
-    return computed(T, ctx, computeTrampoline(T, computeFn), deinitPayload);
+    return computed(T, ctx, computeFn, deinitPayload);
 }
 
-/// `computedRippleWhen`, fortified: value-threaded compute + custom propagate
-/// guard.
+/// `computedRippleWhenC` is now just `computedRippleWhen` (value-threaded
+/// compute + custom propagate guard). Alias kept for call-site compatibility.
 pub fn computedRippleWhenC(
     comptime T: type,
     ctx: *Context,
@@ -566,7 +555,7 @@ pub fn computedRippleWhenC(
     comptime changed: *const fn (old: *const T, new: *const T) bool,
     comptime deinitPayload: ?DeinitPayloadFn,
 ) !*Computed(T) {
-    return computedRippleWhen(T, ctx, computeTrampoline(T, computeFn), changed, deinitPayload);
+    return computedRippleWhen(T, ctx, computeFn, changed, deinitPayload);
 }
 
 // -- Backward-compatible aliases (former vocabulary) ------------------------
@@ -576,7 +565,7 @@ pub fn computedRippleWhenC(
 pub fn cell(
     comptime T: type,
     ctx: *Context,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitFn: ?DeinitCellValueFn(T),
 ) !*Source(T) {
     return Source(T).init(ctx, valueFn, deinitFn);
@@ -587,7 +576,7 @@ pub fn cellKeyed(
     comptime T: type,
     ctx: *Context,
     cache_key: usize,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitFn: ?DeinitCellValueFn(T),
 ) !*Source(T) {
     return Source(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
@@ -625,7 +614,7 @@ pub fn CellFn(comptime T: type) type {
 
 pub fn initCellFn(
     comptime T: type,
-    comptime valueFn: ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitCellValue: ?DeinitCellValueFn(T),
 ) *const CellFn(T) {
     return struct {
@@ -665,13 +654,14 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
     );
 
     const getGreeting = struct {
-        fn call(_ctx: *Context) !OwnedString {
+        fn call(c: *Compute) !OwnedString {
+            const _ctx = c.untracked();
             try (try slotEventLog(_ctx)).append("greeting|");
 
             const greeting = std.fmt.allocPrint(
                 _ctx.allocator,
                 "{s} {s}!",
-                .{ (try hello(_ctx)).get(), (try name(_ctx)).get() },
+                .{ c.get(try hello(_ctx)), c.get(try name(_ctx)) },
             ) catch unreachable;
             return OwnedString.managed(greeting);
         }
@@ -690,15 +680,19 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
     }.call, null);
 
     const getGreetingAndResponse = struct {
-        fn call(_ctx: *Context) !OwnedString {
+        fn call(c: *Compute) !OwnedString {
+            const _ctx = c.untracked();
             try (try slotEventLog(_ctx)).append("greetingAndResponse|");
-            return OwnedString.managed(
+            const g = (try greeting(_ctx)).value;
+            if (_ctx.getSlot(getGreeting)) |s| c.trackSlot(s);
+            const out = OwnedString.managed(
                 std.fmt.allocPrint(
                     _ctx.allocator,
                     "{s} {s}",
-                    .{ (try greeting(_ctx)).value, (try response(_ctx)).get() },
+                    .{ g, c.get(try response(_ctx)) },
                 ) catch unreachable,
             );
+            return out;
         }
     }.call;
     const greetingAndResponse = comptime initSlotFn(
@@ -757,10 +751,8 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
     } else return error.TestExpectedStaleGreetingAndResponse;
     try expectEventLog(ctx, "greeting|hello|name|greetingAndResponse|response|");
 
-    var greeting_slot = try getGreeting(ctx);
-    defer greeting_slot.deinit(ctx);
-    try std.testing.expectEqualStrings("Hello You!", greeting_slot.value);
-
+    // Re-materialize through the pull helper (the compute closure is now
+    // value-threaded and cannot be invoked bare with a `*Context`).
     try std.testing.expectEqualStrings("Hello You!", (try greeting(ctx)).value);
 
     try std.testing.expectEqualStrings(
@@ -770,7 +762,12 @@ test "lazily/cell.cellFn: get/set + invalidate cache" {
     try std.testing.expect(ctx.getSlot(getName) != null);
     try std.testing.expect(ctx.getSlot(getGreeting) != null);
     try std.testing.expect(ctx.getSlot(getGreetingAndResponse) != null);
-    try expectEventLog(ctx, "greeting|hello|name|greetingAndResponse|response|greeting|greeting|greetingAndResponse|");
+    // The value-threaded kernel recomputes `greeting` exactly once here: the
+    // direct read above refreshes it, and `greetingAndResponse`'s recompute then
+    // reads the fresh cached value without a redundant second recompute. (The
+    // former ambient path recomputed it twice; the identical flow in
+    // `examples/cells` already pins this single-recompute schedule.)
+    try expectEventLog(ctx, "greeting|hello|name|greetingAndResponse|response|greeting|greetingAndResponse|");
 }
 
 test "lazily/cell.Cell: batch coalesces eager recomputes into one flush" {
@@ -793,9 +790,9 @@ test "lazily/cell.Cell: batch coalesces eager recomputes into one flush" {
         }.call;
 
         const getDerived = struct {
-            fn call(c: *Context) anyerror!u32 {
-                _ = try @import("cell.zig").cell(u32, c, getSourceA, null);
-                _ = try @import("cell.zig").cell(u32, c, getSourceB, null);
+            fn call(c: *Compute) anyerror!u32 {
+                _ = c.get(try @import("cell.zig").cell(u32, c.untracked(), getSourceA, null));
+                _ = c.get(try @import("cell.zig").cell(u32, c.untracked(), getSourceB, null));
                 _ = runs.fetchAdd(1, .seq_cst);
                 return 0;
             }
@@ -933,18 +930,23 @@ const CascadeOomChain = struct {
     }
     const srcCell = initCellFn(u32, getSource, null);
 
-    fn getA(_ctx: *Context) !u32 {
-        return (try srcCell(_ctx)).get() + 10;
+    fn getA(cc: *Compute) !u32 {
+        const s = try srcCell(cc.untracked());
+        return cc.get(s) + 10;
     }
     const a = initSlotFn(u32, getA, null);
 
-    fn getB(_ctx: *Context) !u32 {
-        return (try a(_ctx)).* + 100;
+    fn getB(cc: *Compute) !u32 {
+        const pa = try a(cc.untracked());
+        if (cc.untracked().getSlot(getA)) |s| cc.trackSlot(s);
+        return pa.* + 100;
     }
     const b = initSlotFn(u32, getB, null);
 
-    fn getC(_ctx: *Context) !u32 {
-        return (try b(_ctx)).* + 1000;
+    fn getC(cc: *Compute) !u32 {
+        const pb = try b(cc.untracked());
+        if (cc.untracked().getSlot(getB)) |s| cc.trackSlot(s);
+        return pb.* + 1000;
     }
     const c = initSlotFn(u32, getC, null);
 };
@@ -1001,8 +1003,10 @@ const InvalidateSeedOomChain = struct {
     fn getA(_: *Context) anyerror!u32 {
         return src_val;
     }
-    fn getB(c: *Context) anyerror!u32 {
-        return (try @import("slot.zig").slot(u32, c, getA, null)).* + 100;
+    fn getB(c: *Compute) anyerror!u32 {
+        const pa = try @import("slot.zig").slot(u32, c.untracked(), getA, null);
+        if (c.untracked().getSlot(getA)) |s| c.trackSlot(s);
+        return pa.* + 100;
     }
 };
 
@@ -1078,8 +1082,9 @@ const KernelChain = struct {
         return base;
     }
     const baseCell = initCellFn(i32, getBase, null);
-    fn getDoubled(c: *Context) anyerror!i32 {
-        return (try baseCell(c)).get() * 2;
+    fn getDoubled(c: *Compute) anyerror!i32 {
+        const b = try baseCell(c.untracked());
+        return c.get(b) * 2;
     }
 };
 
@@ -1144,9 +1149,9 @@ const DrivenBatch = struct {
             return 0;
         }
     }.call;
-    fn getDerived(c: *Context) anyerror!u32 {
-        _ = try cell(u32, c, getA, null);
-        _ = try cell(u32, c, getB, null);
+    fn getDerived(c: *Compute) anyerror!u32 {
+        _ = c.get(try cell(u32, c.untracked(), getA, null));
+        _ = c.get(try cell(u32, c.untracked(), getB, null));
         _ = runs.fetchAdd(1, .seq_cst);
         return 0;
     }
@@ -1209,18 +1214,17 @@ const RippleBucket = struct {
     fn inputInit(_: *Context) anyerror!u64 {
         return 0;
     }
-    fn derivedFn(c: *Context) anyerror!Pair {
-        const in = try source(u64, c, inputInit, null);
-        const v = in.get();
+    fn derivedFn(c: *Compute) anyerror!Pair {
+        const in = try source(u64, c.untracked(), inputInit, null);
+        const v = c.get(in);
         return .{ .payload = v, .bucket = v / 10 };
     }
     fn changedByBucket(old: *const Pair, new: *const Pair) bool {
         return old.bucket != new.bucket; // propagate when the bucket changed
     }
-    fn observerFn(c: *Context) anyerror!u64 {
-        _ = c;
+    fn observerFn(c: *Compute) anyerror!u64 {
         observer_recomputes += 1;
-        return derived.?.get().payload;
+        return c.get(derived.?).payload;
     }
 };
 
@@ -1264,17 +1268,16 @@ const RippleEveryN = struct {
     fn inputInit(_: *Context) anyerror!u64 {
         return 0;
     }
-    fn sampledFn(c: *Context) anyerror!u64 {
-        const in = try source(u64, c, inputInit, null);
-        return in.get();
+    fn sampledFn(c: *Compute) anyerror!u64 {
+        const in = try source(u64, c.untracked(), inputInit, null);
+        return c.get(in);
     }
     fn changedEvery3(old: *const u64, new: *const u64) bool {
         return new.* / 3 != old.* / 3;
     }
-    fn observerFn(c: *Context) anyerror!u64 {
-        _ = c;
+    fn observerFn(c: *Compute) anyerror!u64 {
         observer_recomputes += 1;
-        return sampled.?.get().*;
+        return c.get(sampled.?).*;
     }
 };
 
@@ -1320,27 +1323,25 @@ const RippleEqIdentity = struct {
     fn inputInit(_: *Context) anyerror!i64 {
         return 0;
     }
-    fn clampFnA(c: *Context) anyerror!i64 {
-        const in = try source(i64, c, inputInit, null);
-        return @min(in.get(), 1);
+    fn clampFnA(c: *Compute) anyerror!i64 {
+        const in = try source(i64, c.untracked(), inputInit, null);
+        return @min(c.get(in), 1);
     }
     // Distinct comptime body so it gets its own cache key / node.
-    fn clampFnB(c: *Context) anyerror!i64 {
-        const in = try source(i64, c, inputInit, null);
-        return @min(in.get(), 1);
+    fn clampFnB(c: *Compute) anyerror!i64 {
+        const in = try source(i64, c.untracked(), inputInit, null);
+        return @min(c.get(in), 1);
     }
     fn notEqual(old: *const i64, new: *const i64) bool {
         return old.* != new.*;
     }
-    fn obsAFn(c: *Context) anyerror!i64 {
-        _ = c;
+    fn obsAFn(c: *Compute) anyerror!i64 {
         a_recomputes += 1;
-        return via_computed.?.get().*;
+        return c.get(via_computed.?).*;
     }
-    fn obsBFn(c: *Context) anyerror!i64 {
-        _ = c;
+    fn obsBFn(c: *Compute) anyerror!i64 {
         b_recomputes += 1;
-        return via_when.?.get().*;
+        return c.get(via_when.?).*;
     }
 };
 
@@ -1397,17 +1398,16 @@ const RipplePassThrough = struct {
     fn inputInit(_: *Context) anyerror!u64 {
         return 0;
     }
-    fn constFn(c: *Context) anyerror!u64 {
-        _ = (try source(u64, c, inputInit, null)).get(); // depend on input, always yield 0
+    fn constFn(c: *Compute) anyerror!u64 {
+        _ = c.get(try source(u64, c.untracked(), inputInit, null)); // depend on input, always yield 0
         return 0;
     }
     fn alwaysPropagate(_: *const u64, _: *const u64) bool {
         return true;
     }
-    fn observerFn(c: *Context) anyerror!u64 {
-        _ = c;
+    fn observerFn(c: *Compute) anyerror!u64 {
         observer_recomputes += 1;
-        return passthrough.?.get().*;
+        return c.get(passthrough.?).*;
     }
 };
 

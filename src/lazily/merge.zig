@@ -89,7 +89,7 @@ pub fn MergeCell(comptime T: type) type {
         /// same comptime-value idiom as `Source.init`).
         pub fn init(
             ctx: *Context,
-            comptime valueFn: *const ValueFn(T),
+            comptime valueFn: anytype,
             policy: MergePolicy(T),
         ) !@This() {
             return .{ .cell = try Source(T).init(ctx, valueFn, null), .policy = policy };

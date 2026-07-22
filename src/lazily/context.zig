@@ -1328,18 +1328,12 @@ pub const Slot = struct {
             .free = if (mode == .indirect) free else null,
         };
 
-        const current_slot: ?*Slot = currentSlotFor(ctx);
-        if (current_slot) |child_slot| {
-            try self.subscribeChangeUnlocked(child_slot);
-        }
-
-        var frame = TrackingFrame{
-            .prev = null,
-            .ctx = ctx,
-            .slot = self,
-        };
-        pushTracking(&frame);
-        defer popTracking(&frame);
+        // The reader→self dependency edge (an outer compute reading this node
+        // as it is born) is registered by the OUTER `Compute.get` once this
+        // returns — not by an ambient frame. Here we only mint the per-recompute
+        // `Compute` view over `self` and value-thread it into the closure, so
+        // nested reads via `view.get(dep)` register `dep -> self` by value.
+        var view = Compute.init(ctx, self);
 
         // A `valueFn` that errors leaves a node that never became a graph
         // member, and until now it was simply abandoned: still holding an arena
@@ -1357,7 +1351,7 @@ pub const Slot = struct {
         // `destroySelf` is not the tool here. `recurse == false` leaves the
         // reverse edges dangling, and `recurse == true` would tear down the very
         // dependent that is mid-read waiting on this value.
-        const value = valueFn(ctx) catch |err| {
+        const value = valueFn(&view) catch |err| {
             self.abortInitUnlocked();
             return err;
         };
@@ -2189,8 +2183,45 @@ pub const Slot = struct {
     pub const RippleWhenFn = *const fn (old: *const anyopaque, new: *const anyopaque) bool;
 };
 
+/// The canonical value-threaded compute closure (`#lzcellkernel`). Receives the
+/// fortified `*Compute` view carrying the recomputing node by value — NOT the
+/// ambient `*Context`. Tracked dependency edges are registered ONLY through
+/// `Compute.get`; there is no thread-local tracking surface anymore.
 pub fn ValueFn(comptime T: type) type {
-    return fn (*Context) anyerror!T;
+    return fn (*Compute) anyerror!T;
+}
+
+/// Normalize a compute closure to the canonical `*const fn(*Compute) anyerror!Ret`
+/// storage type (`#lzcellkernel`). Idempotent: a closure that already takes
+/// `*Compute` passes through unchanged; a legacy `fn(*Context)` closure is
+/// wrapped so it runs against the view's untracked `*Context` — correct for
+/// source/construction closures that never form reactive edges. Any closure that
+/// READS a dependency reactively must take `*Compute` and use `Compute.get`; the
+/// untracked wrapper would silently drop its edges.
+pub fn normalizeCompute(comptime Ret: type, comptime f: anytype) *const fn (*Compute) anyerror!Ret {
+    const FT = @TypeOf(f);
+    const FnType = switch (@typeInfo(FT)) {
+        .pointer => |p| p.child,
+        .@"fn" => FT,
+        else => @compileError("normalizeCompute expects a function or function pointer, got " ++ @typeName(FT)),
+    };
+    const P0 = @typeInfo(FnType).@"fn".param_types[0].?;
+    if (P0 == *Compute) {
+        return @as(*const fn (*Compute) anyerror!Ret, f);
+    } else if (P0 == *Context) {
+        return &struct {
+            fn call(view: *Compute) anyerror!Ret {
+                return f(view.untracked());
+            }
+        }.call;
+    } else {
+        @compileError("compute closure first param must be *Compute or *Context, got " ++ @typeName(P0));
+    }
+}
+
+/// `normalizeCompute` specialized to a `ValueFn(T)` (return type `T`).
+pub fn normalizeValueFn(comptime T: type, comptime f: anytype) *const ValueFn(T) {
+    return normalizeCompute(T, f);
 }
 
 pub const SubscriberKey = struct {
@@ -2209,62 +2240,13 @@ pub const SubscriberSet = std.AutoHashMap(SubscriberKey, void);
 
 const SlotCallback = *const fn (ctx: *Context, slot: *Slot) void;
 
-pub const TrackingFrame = struct {
-    prev: ?*TrackingFrame,
-    ctx: *Context,
-    slot: *Slot,
-};
-
-/// The top of the stack for the CURRENT thread.
-/// This stack may contain frames from different Contexts if they are interleaved.
-threadlocal var tracking_top: ?*TrackingFrame = null;
-
-pub fn pushTracking(frame: *TrackingFrame) void {
-    frame.prev = tracking_top;
-    tracking_top = frame;
-}
-
-pub fn popTracking(frame: *TrackingFrame) void {
-    // Basic safety check
-    if (tracking_top == frame) {
-        tracking_top = frame.prev;
-    }
-}
-
-/// Finds the most recent slot being computed for the given context ON THIS THREAD.
-///
-/// Fast path (`#lztrackfast`): the overwhelmingly common case is a single
-/// tracking frame whose `ctx` matches, so we check the stack top first and
-/// return in O(1) without walking the linked list. This mirrors lazily-rs
-/// `current_tracking_frame`, which reads only the stack top (O(1)). The walk
-/// is retained as the fallback for the rare interleaved-multi-context case.
-pub fn currentSlotFor(ctx: *Context) ?*Slot {
-    const top = tracking_top orelse return null;
-    if (top.ctx == ctx) return top.slot;
-    var it = top.prev;
-    while (it) |f| : (it = f.prev) {
-        if (f.ctx == ctx) return f.slot;
-    }
-    return null;
-}
-
-/// Detach the ambient tracking stack for this thread and return the previous
-/// top (`#lzcellkernel`). The value-threaded compute path
-/// (`Compute` / `computedC` / `effectC`) uses this to suppress ambient
-/// self-registration for the duration of a compute closure: with the frame
-/// detached, a bare `handle.get()` inside the closure registers **no** edge
-/// (`currentSlotFor` returns null), so the ONLY tracking surface is the
-/// value-threaded `Compute.get`. Pair with `restoreTracking`.
-pub fn detachTracking() ?*TrackingFrame {
-    const saved = tracking_top;
-    tracking_top = null;
-    return saved;
-}
-
-/// Restore a tracking stack previously detached with `detachTracking`.
-pub fn restoreTracking(saved: ?*TrackingFrame) void {
-    tracking_top = saved;
-}
+// The ambient thread-local tracking surface (`tracking_top` / `TrackingFrame` /
+// `pushTracking` / `popTracking` / `currentSlotFor` / `detachTracking` /
+// `restoreTracking`) is GONE (`#lzcellkernel`). The recomputing node is now
+// value-threaded through the `Compute` view minted by each recompute driver
+// (`Slot.initKeyed`, `signal.makeRecomputeFn`, `effect.makeEffectRecomputeFn`),
+// and `Compute.get` is the LITERAL sole tracking surface. A bare `handle.get()`
+// never registers an edge.
 
 /// The fortified, value-threaded compute view (`#lzcellkernel`).
 ///
@@ -2289,9 +2271,9 @@ pub fn restoreTracking(saved: ?*TrackingFrame) void {
 ///
 /// Fortification, as Zig allows:
 /// - **Sole tracking surface** — only `get` registers an edge. `getUntracked`
-///   and reads reached via `untracked()` never do. On the value-threaded path
-///   the ambient frame is detached, so even a bare `handle.get()` inside the
-///   closure registers nothing; `Compute.get` is the only thing that tracks.
+///   and reads reached via `untracked()` never do. There is no ambient frame at
+///   all anymore, so a bare `handle.get()` inside the closure registers nothing;
+///   `Compute.get` is the LITERAL only thing that tracks.
 /// - **Non-escapable by convention** — Zig has no lifetime brands or `!Send`, so
 ///   the view is passed by pointer into the closure and MUST NOT be stored past
 ///   the recompute. The generation stamp turns a stored-and-replayed view into a
@@ -2338,8 +2320,8 @@ pub const Compute = struct {
     /// live; otherwise returns `error.StaleCompute` without touching the graph.
     pub fn tryGet(self: *const Compute, handle: anytype) error{StaleCompute}!@TypeOf(handle.get()) {
         if (!self.alive()) return error.StaleCompute;
-        // Read first (untracked — the ambient frame is detached on this path),
-        // then register the edge explicitly against the value-threaded node.
+        // Read first (naturally untracked — there is no ambient tracking
+        // surface), then register the edge explicitly against the node by value.
         const value = handle.get();
         self.ctx.mutex.lock();
         defer self.ctx.mutex.unlock();
@@ -2347,6 +2329,19 @@ pub const Compute = struct {
         // (getOrPut dedupes), so a re-read within the same recompute is free.
         handle.slot.subscribeChangeUnlocked(self.node) catch {};
         return value;
+    }
+
+    /// Register a tracked dependency edge `dep -> node` for a RAW storage slot
+    /// read (`#lzcellkernel`). `Compute.get` is the handle-based tracked read;
+    /// `trackSlot` is its escape hatch for a dependency reached through the raw
+    /// `slot(...)`/`slotKeyed(...)` primitive, where there is no cell/computed
+    /// handle to pass. Read the value separately (untracked) and call this to
+    /// form the edge. No-op on a stale view.
+    pub fn trackSlot(self: *const Compute, dep: *Slot) void {
+        if (!self.alive()) return;
+        self.ctx.mutex.lock();
+        defer self.ctx.mutex.unlock();
+        dep.subscribeChangeUnlocked(self.node) catch {};
     }
 
     /// Untracked read through the view: reads `handle` and registers NO edge.
@@ -2529,9 +2524,9 @@ test "lazily/context: instrumentation counters track allocations, edges, and rec
     const before = ctx.instrumentationSnapshot();
     // A signal that reads the cell establishes a dependency edge.
     const getDerived = struct {
-        fn call(c: *Context) anyerror!u32 {
-            const src = try CellMod.cell(u32, c, getSource, null);
-            return src.get() + 1;
+        fn call(c: *Compute) anyerror!u32 {
+            const src = try CellMod.cell(u32, c.untracked(), getSource, null);
+            return c.get(src) + 1;
         }
     }.call;
     const sig = try sig_mod.signal(u32, ctx, getDerived, null);

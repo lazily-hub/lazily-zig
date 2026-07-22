@@ -2,13 +2,11 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 const Context = @import("./context.zig").Context;
-const currentSlotFor = @import("./context.zig").currentSlotFor;
-const popTracking = @import("./context.zig").popTracking;
-const pushTracking = @import("./context.zig").pushTracking;
 const Slot = @import("./context.zig").Slot;
 const String = @import("./context.zig").String;
-const TrackingFrame = @import("./context.zig").TrackingFrame;
 const ValueFn = @import("./context.zig").ValueFn;
+const Compute = @import("./context.zig").Compute;
+const normalizeValueFn = @import("./context.zig").normalizeValueFn;
 const valueFnCacheKey = @import("./context.zig").valueFnCacheKey;
 const DeinitPayloadFn = Slot.DeinitPayloadFn;
 const DeinitValueFn = Slot.DeinitValueFn;
@@ -22,29 +20,36 @@ const expectEventLog = @import("test.zig").expectEventLog;
 
 pub fn initSlotFn(
     comptime T: type,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitPayload: ?DeinitPayloadFn,
 ) *const fn (*Context) anyerror!Slot.Result(T) {
     return struct {
         fn call(ctx: *Context) !Slot.Result(T) {
+            // Pass the ORIGINAL closure so `slot()` keys the cache by it
+            // (`getSlot(valueFn)` must match); `slot()` normalizes internally.
             return try slot(T, ctx, valueFn, deinitPayload);
         }
     }.call;
 }
 
 /// Accepts a separate value getter function and optional `deinit` function.
-/// See `slotFn` for alternative api.
+/// See `slotFn` for alternative api. `valueFn` is normalized to the canonical
+/// `*Compute` compute closure (`#lzcellkernel`): a legacy `fn(*Context)` source
+/// closure is accepted and wrapped.
 pub fn slot(
     comptime T: type,
     ctx: *Context,
-    valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     deinitPayload: ?DeinitPayloadFn,
 ) !Slot.Result(T) {
+    const nf = comptime normalizeValueFn(T, valueFn);
+    // Key by the ORIGINAL closure so `getSlot(fn)` stays stable across
+    // normalization (`#lzcellkernel`); store the normalized `*Compute` callable.
     return slotKeyed(
         T,
         ctx,
         valueFnCacheKey(valueFn),
-        valueFn,
+        nf,
         deinitPayload,
     );
 }
@@ -79,19 +84,11 @@ pub fn slotKeyed(
             // reader rather than the reader serving its pre-disposal cache.
             if (cached_slot.disposed) return error.NodeDisposed;
             if (cached_slot.storage != null and !cached_slot.stale) {
-                // Fresh cached value — return it.
-                const current_slot: ?*Slot = currentSlotFor(ctx);
-                if (current_slot) |child_slot| {
-                    // `#lzzigcontainsfast`: cached reads re-pull repeatedly
-                    // (the steady-state hit on a hot value); re-subscribing an
-                    // edge that's already tracked costs a `getOrPut` worth of
-                    // bookkeeping per read. Probe membership first — the
-                    // already-tracked case is the dominant one on cached reads
-                    // with an active tracking frame, so this halves the work.
-                    if (!cached_slot.change_subscribers.contains(child_slot)) {
-                        try cached_slot.subscribeChangeUnlocked(child_slot);
-                    }
-                }
+                // Fresh cached value — return it. No ambient edge registration:
+                // the dependency edge is formed only when this value is read
+                // *through a `Compute`* (`Compute.get` subscribes by value); a
+                // bare `handle.get()` on a cached hit is untracked
+                // (`#lzcellkernel`).
                 return cached_slot.get(T);
             }
             // Stale slot in cache — remove + orphan it so initKeyed creates
@@ -261,9 +258,11 @@ test "lazily/slot.Slot.emitChange" {
     );
 
     const getBar = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("bar|");
-            return (try foo(_ctx)).* * 10;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("bar|");
+            const pf = try foo(cc.untracked());
+            if (cc.untracked().getSlot(getFoo)) |s| cc.trackSlot(s);
+            return pf.* * 10;
         }
     }.call;
     const bar = comptime initSlotFn(
@@ -273,9 +272,11 @@ test "lazily/slot.Slot.emitChange" {
     );
 
     const getBaz = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("baz|");
-            return (try bar(_ctx)).* + 1;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("baz|");
+            const pb = try bar(cc.untracked());
+            if (cc.untracked().getSlot(getBar)) |s| cc.trackSlot(s);
+            return pb.* + 1;
         }
     }.call;
     const baz = comptime initSlotFn(
@@ -332,9 +333,11 @@ test "lazily/slot.Slot.touch" {
     );
 
     const getBar = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("bar|");
-            return (try foo(_ctx)).* * 10;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("bar|");
+            const pf = try foo(cc.untracked());
+            if (cc.untracked().getSlot(getFoo)) |s| cc.trackSlot(s);
+            return pf.* * 10;
         }
     }.call;
     const bar = comptime initSlotFn(
@@ -344,9 +347,11 @@ test "lazily/slot.Slot.touch" {
     );
 
     const getBaz = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("baz|");
-            return (try bar(_ctx)).* + 1;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("baz|");
+            const pb = try bar(cc.untracked());
+            if (cc.untracked().getSlot(getBar)) |s| cc.trackSlot(s);
+            return pb.* + 1;
         }
     }.call;
     const baz = comptime initSlotFn(
@@ -405,25 +410,33 @@ test "lazily/slot.Slot destroy/unsubscribe soak — diamond DAG" {
     const src = comptime initSlotFn(u8, getSrc, null);
 
     const getLeft = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("left|");
-            return (try src(_ctx)).* + 1;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("left|");
+            const ps = try src(cc.untracked());
+            if (cc.untracked().getSlot(getSrc)) |s| cc.trackSlot(s);
+            return ps.* + 1;
         }
     }.call;
     const left = comptime initSlotFn(u8, getLeft, null);
 
     const getRight = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("right|");
-            return (try src(_ctx)).* + 2;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("right|");
+            const ps = try src(cc.untracked());
+            if (cc.untracked().getSlot(getSrc)) |s| cc.trackSlot(s);
+            return ps.* + 2;
         }
     }.call;
     const right = comptime initSlotFn(u8, getRight, null);
 
     const getSink = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("sink|");
-            return (try left(_ctx)).* + (try right(_ctx)).*;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("sink|");
+            const pl = try left(cc.untracked());
+            if (cc.untracked().getSlot(getLeft)) |s| cc.trackSlot(s);
+            const pr = try right(cc.untracked());
+            if (cc.untracked().getSlot(getRight)) |s| cc.trackSlot(s);
+            return pl.* + pr.*;
         }
     }.call;
     const sink = comptime initSlotFn(u8, getSink, null);
@@ -468,33 +481,45 @@ test "lazily/slot.Slot.emitChange soak — multi-subscriber invalidation" {
     const src = comptime initSlotFn(u8, getSrc, null);
 
     const getA = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("a|");
-            return (try src(_ctx)).* + 1;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("a|");
+            const ps = try src(cc.untracked());
+            if (cc.untracked().getSlot(getSrc)) |s| cc.trackSlot(s);
+            return ps.* + 1;
         }
     }.call;
     const a = comptime initSlotFn(u8, getA, null);
 
     const getB = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("b|");
-            return (try src(_ctx)).* + 2;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("b|");
+            const ps = try src(cc.untracked());
+            if (cc.untracked().getSlot(getSrc)) |s| cc.trackSlot(s);
+            return ps.* + 2;
         }
     }.call;
     const b = comptime initSlotFn(u8, getB, null);
 
     const getC = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("c|");
-            return (try src(_ctx)).* + 3;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("c|");
+            const ps = try src(cc.untracked());
+            if (cc.untracked().getSlot(getSrc)) |s| cc.trackSlot(s);
+            return ps.* + 3;
         }
     }.call;
     const c = comptime initSlotFn(u8, getC, null);
 
     const getAgg = struct {
-        fn call(_ctx: *Context) !u8 {
-            try (try slotEventLog(_ctx)).append("agg|");
-            return (try a(_ctx)).* + (try b(_ctx)).* + (try c(_ctx)).*;
+        fn call(cc: *Compute) !u8 {
+            try (try slotEventLog(cc.untracked())).append("agg|");
+            const pa = try a(cc.untracked());
+            if (cc.untracked().getSlot(getA)) |s| cc.trackSlot(s);
+            const pb = try b(cc.untracked());
+            if (cc.untracked().getSlot(getB)) |s| cc.trackSlot(s);
+            const pc = try c(cc.untracked());
+            if (cc.untracked().getSlot(getC)) |s| cc.trackSlot(s);
+            return pa.* + pb.* + pc.*;
         }
     }.call;
     const agg = comptime initSlotFn(u8, getAgg, null);
@@ -597,10 +622,10 @@ fn getSourceU32(_: *Context) anyerror!u32 {
     return 0;
 }
 
-fn getDerivedU32(c: *Context) anyerror!u32 {
+fn getDerivedU32(c: *Compute) anyerror!u32 {
     const CellMod = @import("cell.zig");
-    const s = try CellMod.cell(u32, c, getSourceU32, null);
-    return s.get() +% 1;
+    const s = try CellMod.cell(u32, c.untracked(), getSourceU32, null);
+    return c.get(s) +% 1;
 }
 
 const SetGetArgs = struct {
@@ -700,7 +725,7 @@ const ReentrantPayloadDestroyState = struct {
 
     var payload_deinits: usize = 0;
 
-    fn bigFn(_: *Context) anyerror!Big {
+    fn bigFn(_: *Compute) anyerror!Big {
         return .{ .words = .{ 1, 2, 3, 4 } };
     }
 
@@ -752,22 +777,25 @@ const NestedCascadeState = struct {
     var bystander: ?*Slot = null;
     var payload_deinits: usize = 0;
 
-    fn bystanderSourceFn(_: *Context) anyerror!u64 {
+    fn bystanderSourceFn(_: *Compute) anyerror!u64 {
         return source;
     }
-    fn bystanderLeafFn(c: *Context) anyerror!u64 {
-        return (try slot(u64, c, bystanderSourceFn, null)).* + 1;
+    fn bystanderLeafFn(c: *Compute) anyerror!u64 {
+        const p = try slot(u64, c.untracked(), bystanderSourceFn, null);
+        if (c.untracked().cacheLookup(valueFnCacheKey(bystanderSourceFn))) |s| c.trackSlot(s);
+        return p.* + 1;
     }
 
-    fn bigFn(_: *Context) anyerror!Big {
+    fn bigFn(_: *Compute) anyerror!Big {
         return .{ .words = .{ 9, 9, 9, 9 } };
     }
 
     /// Reads the victim, so the victim gains a dependent and the outer cascade
     /// has that dependent sitting on the worklist at the moment the victim's
     /// payload destructor fires.
-    fn victimDependentFn(c: *Context) anyerror!u64 {
-        _ = try slotKeyed(Big, c, victim_key, bigFn, deinitBig);
+    fn victimDependentFn(c: *Compute) anyerror!u64 {
+        _ = try slotKeyed(Big, c.untracked(), victim_key, bigFn, deinitBig);
+        if (c.untracked().cacheLookup(victim_key)) |s| c.trackSlot(s);
         return 1;
     }
 
@@ -824,14 +852,22 @@ const DiamondCascadeState = struct {
     fn aFn(_: *Context) anyerror!u64 {
         return source;
     }
-    fn bFn(c: *Context) anyerror!u64 {
-        return (try slot(u64, c, aFn, null)).* + 1;
+    fn bFn(c: *Compute) anyerror!u64 {
+        const pa = try slot(u64, c.untracked(), aFn, null);
+        if (c.untracked().getSlot(aFn)) |s| c.trackSlot(s);
+        return pa.* + 1;
     }
-    fn cFn(c: *Context) anyerror!u64 {
-        return (try slot(u64, c, aFn, null)).* + 2;
+    fn cFn(c: *Compute) anyerror!u64 {
+        const pa = try slot(u64, c.untracked(), aFn, null);
+        if (c.untracked().getSlot(aFn)) |s| c.trackSlot(s);
+        return pa.* + 2;
     }
-    fn dFn(c: *Context) anyerror!u64 {
-        return (try slot(u64, c, bFn, null)).* + (try slot(u64, c, cFn, null)).*;
+    fn dFn(c: *Compute) anyerror!u64 {
+        const pb = try slot(u64, c.untracked(), bFn, null);
+        if (c.untracked().getSlot(bFn)) |s| c.trackSlot(s);
+        const pc = try slot(u64, c.untracked(), cFn, null);
+        if (c.untracked().getSlot(cFn)) |s| c.trackSlot(s);
+        return pb.* + pc.*;
     }
 };
 
@@ -865,11 +901,15 @@ const DestroyOomState = struct {
     fn victimFn(_: *Context) anyerror!u64 {
         return source;
     }
-    fn dependentFn(c: *Context) anyerror!u64 {
-        return (try slot(u64, c, victimFn, null)).* + 1;
+    fn dependentFn(c: *Compute) anyerror!u64 {
+        const pv = try slot(u64, c.untracked(), victimFn, null);
+        if (c.untracked().getSlot(victimFn)) |s| c.trackSlot(s);
+        return pv.* + 1;
     }
-    fn dependent2Fn(c: *Context) anyerror!u64 {
-        return (try slot(u64, c, victimFn, null)).* + 2;
+    fn dependent2Fn(c: *Compute) anyerror!u64 {
+        const pv = try slot(u64, c.untracked(), victimFn, null);
+        if (c.untracked().getSlot(victimFn)) |s| c.trackSlot(s);
+        return pv.* + 2;
     }
 };
 

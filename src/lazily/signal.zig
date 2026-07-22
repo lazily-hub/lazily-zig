@@ -4,10 +4,8 @@ const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 const Slot = @import("context.zig").Slot;
 const ValueFn = @import("context.zig").ValueFn;
-const TrackingFrame = @import("context.zig").TrackingFrame;
-const pushTracking = @import("context.zig").pushTracking;
-const popTracking = @import("context.zig").popTracking;
-const currentSlotFor = @import("context.zig").currentSlotFor;
+const normalizeValueFn = @import("context.zig").normalizeValueFn;
+const Compute = @import("context.zig").Compute;
 const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const slot = @import("slot.zig").slot;
 const slotKeyed = @import("slot.zig").slotKeyed;
@@ -124,13 +122,12 @@ fn makeRecomputeFn(comptime T: type) *const fn (*Slot) void {
             }
             ctx.mutex.unlock();
 
-            // Step 2: Re-run valueFn with tracking frame (outside lock)
-            var frame = TrackingFrame{ .prev = null, .ctx = ctx, .slot = s };
-            pushTracking(&frame);
-            defer popTracking(&frame);
-
+            // Step 2: Re-run valueFn with a per-recompute `Compute` view minted
+            // over `s` (value-threaded node; no ambient frame). `Compute.get`
+            // inside the closure re-registers dependency edges against `s`.
+            var view = Compute.init(ctx, s);
             const value_fn: *const ValueFn(T) = @ptrCast(@alignCast(s.value_fn_ptr orelse return));
-            const new_value = value_fn(ctx) catch return;
+            const new_value = value_fn(&view) catch return;
 
             // Step 3: Compare + swap (under lock)
             ctx.mutex.lock();
@@ -263,7 +260,7 @@ pub fn removeEagerHooks(slot_ptr: *Slot) void {
 pub fn signal(
     comptime T: type,
     ctx: *Context,
-    comptime valueFn: *const ValueFn(T),
+    comptime valueFn: anytype,
     comptime deinitPayload: ?DeinitPayloadFn,
 ) !*CellMod.Computed(T) {
     const c = try CellMod.computed(T, ctx, valueFn, deinitPayload);
@@ -282,6 +279,9 @@ pub fn signalKeyed(
     valueFn: *const ValueFn(T),
     deinitPayload: ?DeinitPayloadFn,
 ) !*CellMod.Computed(T) {
+    // Runtime `valueFn` (value-threaded `*Compute` closure) so one comptime body
+    // can back N distinct eager nodes via distinct keys (the conformance runner
+    // and pending-audit bench dispatch through a runtime array).
     const c = try CellMod.computedKeyed(T, ctx, cache_key, valueFn, deinitPayload);
     return c.eager();
 }
@@ -290,12 +290,13 @@ const KeyedTestState = struct {
     var source_value: i64 = 0;
 };
 
-fn keyedSourceFn(_: *Context) anyerror!i64 {
+fn keyedSourceFn(_: *Compute) anyerror!i64 {
     return KeyedTestState.source_value;
 }
 
-fn keyedDerivedFn(ctx: *Context) anyerror!i64 {
-    const p = try slotKeyed(i64, ctx, 100, keyedSourceFn, null);
+fn keyedDerivedFn(c: *Compute) anyerror!i64 {
+    const p = try slotKeyed(i64, c.untracked(), 100, keyedSourceFn, null);
+    if (c.untracked().cacheLookup(100)) |s| c.trackSlot(s);
     return p.* * 2;
 }
 
@@ -305,7 +306,7 @@ test "lazily/signal: signalKeyed gives distinct eager nodes from one body" {
     defer ctx.deinit();
 
     KeyedTestState.source_value = 1;
-    _ = try slotKeyed(i64, ctx, 100, keyedSourceFn, null);
+    _ = try slotKeyed(i64, ctx, 100, comptime normalizeValueFn(i64, keyedSourceFn), null);
 
     // Two Signals over the SAME body fn — impossible with `signal`, which keys
     // the backing slot by the body pointer.
@@ -355,10 +356,10 @@ test "lazily/signal: eager recompute on dependency change" {
     const source = try CellMod.cell(u32, ctx, getSourceU32, null);
 
     const getDerived = struct {
-        fn call(c: *Context) anyerror!u32 {
+        fn call(c: *Compute) anyerror!u32 {
             SignalTestState.counter += 1;
-            const src = try CellMod.cell(u32, c, getSourceU32, null);
-            return src.get() * 10;
+            const src = try CellMod.cell(u32, c.untracked(), getSourceU32, null);
+            return c.get(src) * 10;
         }
     }.call;
     const sig = try signal(u32, ctx, getDerived, null);
@@ -381,9 +382,9 @@ test "lazily/signal: memo guard suppresses equal recompute cascade" {
     const source = try CellMod.cell(u32, ctx, getSourceU32, null);
 
     const getConstant = struct {
-        fn call(c: *Context) anyerror!u32 {
+        fn call(c: *Compute) anyerror!u32 {
             SignalTestState.counter += 1;
-            _ = try CellMod.cell(u32, c, getSourceU32, null);
+            _ = c.get(try CellMod.cell(u32, c.untracked(), getSourceU32, null));
             return 42;
         }
     }.call;
@@ -407,10 +408,10 @@ test "lazily/signal: dispose reverts to lazy semantics" {
     const source = try CellMod.cell(u32, ctx, getSourceU32, null);
 
     const getDerived = struct {
-        fn call(c: *Context) anyerror!u32 {
+        fn call(c: *Compute) anyerror!u32 {
             SignalTestState.counter += 1;
-            const src = try CellMod.cell(u32, c, getSourceU32, null);
-            return src.get() + 1;
+            const src = try CellMod.cell(u32, c.untracked(), getSourceU32, null);
+            return c.get(src) + 1;
         }
     }.call;
     const sig = try signal(u32, ctx, getDerived, null);
@@ -453,14 +454,14 @@ const DestroyWhileQueuedState = struct {
     /// destroyed. The batch exit drains, so it has to be read before then.
     var depth_after_destroy: usize = 0;
 
-    fn sourceFn(_: *Context) anyerror!u32 {
+    fn sourceFn(_: *Compute) anyerror!u32 {
         return source;
     }
 
-    fn derivedFn(c: *Context) anyerror!u32 {
-        const src = try CellMod.cell(u32, c, sourceFn, null);
+    fn derivedFn(c: *Compute) anyerror!u32 {
+        const src = try CellMod.cell(u32, c.untracked(), sourceFn, null);
         runs += 1;
-        return src.get() + 1;
+        return c.get(src) + 1;
     }
 
     fn runBatch(c: *Context) void {
@@ -515,20 +516,20 @@ const RecycleAfterDestroyState = struct {
     var victim: ?*Slot = null;
     var recycled_same_address = false;
 
-    fn sourceFn(_: *Context) anyerror!u32 {
+    fn sourceFn(_: *Compute) anyerror!u32 {
         return a_source;
     }
 
-    fn victimFn(c: *Context) anyerror!u32 {
-        const src = try CellMod.cell(u32, c, sourceFn, null);
+    fn victimFn(c: *Compute) anyerror!u32 {
+        const src = try CellMod.cell(u32, c.untracked(), sourceFn, null);
         victim_runs += 1;
-        return src.get() + 1;
+        return c.get(src) + 1;
     }
 
-    fn survivorFn(c: *Context) anyerror!u32 {
-        const src = try CellMod.cell(u32, c, sourceFn, null);
+    fn survivorFn(c: *Compute) anyerror!u32 {
+        const src = try CellMod.cell(u32, c.untracked(), sourceFn, null);
         survivor_runs += 1;
-        return src.get() + 2;
+        return c.get(src) + 2;
     }
 
     fn runBatch(c: *Context) void {
@@ -583,18 +584,18 @@ const ReentrantDestroyState = struct {
     var did_destroy = false;
     var neighbor_was_queued = false;
 
-    fn sourceFn(_: *Context) anyerror!u32 {
+    fn sourceFn(_: *Compute) anyerror!u32 {
         return source;
     }
 
-    fn neighborFn(c: *Context) anyerror!u32 {
-        const src = try CellMod.cell(u32, c, sourceFn, null);
+    fn neighborFn(c: *Compute) anyerror!u32 {
+        const src = try CellMod.cell(u32, c.untracked(), sourceFn, null);
         neighbor_runs += 1;
-        return src.get() + 1;
+        return c.get(src) + 1;
     }
 
-    fn destroyerFn(c: *Context) anyerror!u32 {
-        const src = try CellMod.cell(u32, c, sourceFn, null);
+    fn destroyerFn(c: *Compute) anyerror!u32 {
+        const src = try CellMod.cell(u32, c.untracked(), sourceFn, null);
         destroyer_runs += 1;
         // Runs from inside `drainPendingRecompute`, while the neighbor is
         // still sitting in the queue below us.
@@ -609,7 +610,7 @@ const ReentrantDestroyState = struct {
                 n.destroy(false);
             }
         }
-        return src.get() + 5;
+        return c.get(src) + 5;
     }
 
     fn runBatch(c: *Context) void {
@@ -677,13 +678,13 @@ const RecomputeReentrantDestroyState = struct {
     var source: u64 = 0;
     var payload_deinits: usize = 0;
 
-    fn sourceFn(_: *Context) anyerror!u64 {
+    fn sourceFn(_: *Compute) anyerror!u64 {
         return source;
     }
 
-    fn derivedFn(c: *Context) anyerror!Big {
-        const src = try CellMod.cell(u64, c, sourceFn, null);
-        return .{ .words = .{ src.get(), 0, 0, 0 } };
+    fn derivedFn(c: *Compute) anyerror!Big {
+        const src = try CellMod.cell(u64, c.untracked(), sourceFn, null);
+        return .{ .words = .{ c.get(src), 0, 0, 0 } };
     }
 
     fn deinitBig(s: *Slot) void {
@@ -734,9 +735,9 @@ const OomSignalState = struct {
         return source_value;
     }
 
-    fn getDerived(c: *Context) anyerror!u32 {
-        const src = try CellMod.cell(u32, c, getSource, null);
-        return src.get() * 10;
+    fn getDerived(c: *Compute) anyerror!u32 {
+        const src = try CellMod.cell(u32, c.untracked(), getSource, null);
+        return c.get(src) * 10;
     }
 };
 

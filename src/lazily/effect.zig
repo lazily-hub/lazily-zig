@@ -1,13 +1,8 @@
 const std = @import("std");
 const Context = @import("context.zig").Context;
 const Slot = @import("context.zig").Slot;
-const TrackingFrame = @import("context.zig").TrackingFrame;
-const pushTracking = @import("context.zig").pushTracking;
-const popTracking = @import("context.zig").popTracking;
-const currentSlotFor = @import("context.zig").currentSlotFor;
-const detachTracking = @import("context.zig").detachTracking;
-const restoreTracking = @import("context.zig").restoreTracking;
 const Compute = @import("context.zig").Compute;
+const normalizeCompute = @import("context.zig").normalizeCompute;
 const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const slotKeyed = @import("slot.zig").slotKeyed;
 const ValueFn = @import("context.zig").ValueFn;
@@ -23,8 +18,8 @@ const SignalMod = @import("signal.zig");
 /// - Scheduled, not inline: rerun fires after the invalidating `set_cell`/`batch`
 ///   flush, not during.
 /// - Cleanup ordering: the previous run's cleanup completes before the next body.
-/// - Auto-tracking: the body receives the Context and tracks dependencies through
-///   `cell()`/`slot()` reads inside a TrackingFrame.
+/// - Tracking: the body receives a value-threaded `*Compute` view and tracks
+///   dependencies through `Compute.get` reads (no ambient frame).
 /// - Disposal: removes pending reruns, runs the current cleanup, unsubscribes edges.
 ///
 /// The Effect reuses the same eager-recompute machinery (`on_invalidate`/`recompute`
@@ -82,7 +77,7 @@ pub fn Effect(comptime Cleanup: type) type {
 /// The body function returns an optional cleanup value. When non-null, the
 /// cleanup is run before the next body invocation and on dispose.
 pub fn EffectBodyFn(comptime Cleanup: type) type {
-    return *const fn (*Context) anyerror!?Cleanup;
+    return *const fn (*Compute) anyerror!?Cleanup;
 }
 
 /// Create an effect whose body auto-tracks dependencies and reruns on
@@ -96,9 +91,10 @@ pub fn EffectBodyFn(comptime Cleanup: type) type {
 pub fn effect(
     comptime Cleanup: type,
     ctx: *Context,
-    comptime bodyFn: EffectBodyFn(Cleanup),
+    comptime bodyFn: anytype,
 ) !*Effect(Cleanup) {
-    return effectKeyed(Cleanup, ctx, valueFnCacheKey(bodyFn), bodyFn);
+    const nb = comptime normalizeCompute(?Cleanup, bodyFn);
+    return effectKeyed(Cleanup, ctx, valueFnCacheKey(nb), nb);
 }
 
 /// Store the cleanup a body run just produced on the slot, replacing any
@@ -143,24 +139,26 @@ pub fn effectKeyed(
     comptime Cleanup: type,
     ctx: *Context,
     cache_key: usize,
-    comptime bodyFn: EffectBodyFn(Cleanup),
+    comptime bodyFn: anytype,
 ) !*Effect(Cleanup) {
     const T = u8; // The slot stores a dummy u8; the real work is the side effect.
+    const nb = comptime normalizeCompute(?Cleanup, bodyFn);
 
-    // Build the valueFn that runs the effect body inside a tracking frame.
+    // Build the valueFn that runs the effect body value-threaded over the
+    // effect's own slot (`c.node`); no ambient frame (`#lzcellkernel`).
     const getEffectValue = struct {
-        fn call(_ctx: *Context) anyerror!u8 {
+        fn call(c: *Compute) anyerror!u8 {
             // A failing effect body genuinely has nowhere to report: the body
             // runs from an invalidation cascade, not from a caller, so the
             // swallow is intentional and stays. But it was undiagnosable —
             // an Effect whose body errored every run was indistinguishable
             // from one that ran clean. Count it so the failure is at least
             // observable, without changing behaviour or any signature.
-            const produced = bodyFn(_ctx) catch blk: {
-                _ctx.effect_body_errors += 1;
+            const produced = nb(c) catch blk: {
+                c.untracked().effect_body_errors += 1;
                 break :blk null;
             };
-            if (currentSlotFor(_ctx)) |s| storeCleanup(Cleanup, s, produced);
+            storeCleanup(Cleanup, c.node, produced);
             return 0; // dummy value
         }
     }.call;
@@ -186,7 +184,7 @@ pub fn effectKeyed(
 
     // Install eager-recompute hooks (same machinery as Signal)
     slot_ptr.on_invalidate = &on_invalidate_hook;
-    slot_ptr.recompute = makeEffectRecomputeFn(Cleanup, bodyFn);
+    slot_ptr.recompute = makeEffectRecomputeFn(Cleanup, nb);
     // Re-arm a node whose key was disposed and then re-created. `slotKeyed`
     // refuses to resurrect a tombstone, so reaching here means this is a fresh
     // node on a fresh key; the assignment is defensive and free.
@@ -204,11 +202,13 @@ pub fn effectKeyed(
 /// A no-cleanup effect variant for observers that don't need tear-down.
 pub fn effectNoCleanup(
     ctx: *Context,
-    comptime bodyFn: *const fn (*Context) anyerror!void,
+    comptime bodyFn: anytype,
 ) !*Effect(void) {
+    // Normalize to a `*Compute` void body (auto-wraps a legacy `fn(*Context)`).
+    const nb = comptime normalizeCompute(void, bodyFn);
     const Wrapper = struct {
-        fn call(_ctx: *Context) anyerror!?void {
-            try bodyFn(_ctx);
+        fn call(c: *Compute) anyerror!?void {
+            try nb(c);
             return null;
         }
     };
@@ -217,10 +217,10 @@ pub fn effectNoCleanup(
 
 // -- Value-threaded (fortified) effect (`#lzcellkernel`) --------------------
 //
-// The primary fortified effect surface: the body receives a `*Compute` (the
-// value-threaded view carrying the recomputing node id), so tracked reads via
-// `Compute.get` register against that node by value with the ambient frame
-// detached — mirroring lazily-rs `Context::effect` taking `Fn(&Compute)`.
+// The effect body is ALWAYS value-threaded now — `effect`/`effectKeyed` take a
+// `*Compute` body (or auto-wrap a legacy `fn(*Context)` body that forms no
+// edges). `effectC`/`effectNoCleanupC` are thin aliases kept for call-site
+// compatibility.
 
 /// A value-threaded effect body: receives the fortified `*Compute` view and may
 /// return a cleanup value.
@@ -228,36 +228,21 @@ pub fn ComputeBodyFn(comptime Cleanup: type) type {
     return *const fn (*Compute) anyerror!?Cleanup;
 }
 
-/// `effect`, fortified: the body receives a value-threaded `*Compute`.
+/// Alias for `effect` — the primary constructor already takes a `*Compute` body.
 pub fn effectC(
     comptime Cleanup: type,
     ctx: *Context,
     comptime bodyFn: ComputeBodyFn(Cleanup),
 ) !*Effect(Cleanup) {
-    const bridge = struct {
-        fn call(_ctx: *Context) anyerror!?Cleanup {
-            const node = currentSlotFor(_ctx) orelse return error.MissingCurrentSlot;
-            const saved = detachTracking();
-            defer restoreTracking(saved);
-            var view = Compute.init(_ctx, node);
-            return bodyFn(&view);
-        }
-    }.call;
-    return effect(Cleanup, ctx, bridge);
+    return effect(Cleanup, ctx, bodyFn);
 }
 
-/// `effectNoCleanup`, fortified: value-threaded body with no teardown.
+/// Alias for `effectNoCleanup` — value-threaded body with no teardown.
 pub fn effectNoCleanupC(
     ctx: *Context,
     comptime bodyFn: *const fn (*Compute) anyerror!void,
 ) !*Effect(void) {
-    const Wrapper = struct {
-        fn call(c: *Compute) anyerror!?void {
-            try bodyFn(c);
-            return null;
-        }
-    };
-    return effectC(void, ctx, Wrapper.call);
+    return effectNoCleanup(ctx, bodyFn);
 }
 
 fn on_invalidate_hook(s: *Slot) void {
@@ -318,15 +303,14 @@ fn makeEffectRecomputeFn(comptime Cleanup: type, comptime bodyFn: EffectBodyFn(C
             }
             ctx.mutex.unlock();
 
-            // Step 2: Re-run body with tracking frame (outside lock)
-            var frame = TrackingFrame{ .prev = null, .ctx = ctx, .slot = s };
-            pushTracking(&frame);
-            defer popTracking(&frame);
+            // Step 2: Re-run body with a per-recompute `Compute` view minted
+            // over `s` (value-threaded node; no ambient frame). Tracked reads
+            // via `Compute.get` re-register dependency edges against `s`.
+            var view = Compute.init(ctx, s);
 
             // The rerun path's copy of the same intentional swallow (see
             // `effect()`); nothing follows but comments, so the `return` is
-            // equivalent to `catch {}` and `popTracking` still runs via defer.
-            // Counted for the same reason.
+            // equivalent to `catch {}`. Counted for the same reason.
             //
             // Worth knowing: Step 1 above has already dropped every parent
             // edge, and the body is what re-registers them. A body that errors
@@ -337,7 +321,7 @@ fn makeEffectRecomputeFn(comptime Cleanup: type, comptime bodyFn: EffectBodyFn(C
             // the graph lock because it is user code.
             runStoredCleanup(s);
 
-            const produced = bodyFn(ctx) catch blk: {
+            const produced = bodyFn(&view) catch blk: {
                 ctx.effect_body_errors += 1;
                 break :blk null;
             };
@@ -374,8 +358,8 @@ test "lazily/effect: reruns on dependency change" {
     const source = try CellMod.cell(u32, ctx, getSourceU32, null);
 
     const eff = try effectNoCleanup(ctx, struct {
-        fn call(c: *Context) anyerror!void {
-            _ = try CellMod.cell(u32, c, getSourceU32, null);
+        fn call(c: *Compute) anyerror!void {
+            _ = c.get(try CellMod.cell(u32, c.untracked(), getSourceU32, null));
             EffectTestState.counter += 1;
         }
     }.call);
@@ -401,8 +385,8 @@ test "lazily/effect: dispose stops reruns" {
     const source = try CellMod.cell(u32, ctx, getSourceU32, null);
 
     const eff = try effectNoCleanup(ctx, struct {
-        fn call(c: *Context) anyerror!void {
-            _ = try CellMod.cell(u32, c, getSourceU32, null);
+        fn call(c: *Compute) anyerror!void {
+            _ = c.get(try CellMod.cell(u32, c.untracked(), getSourceU32, null));
             EffectTestState.counter += 1;
         }
     }.call);
@@ -429,8 +413,8 @@ const OomEffectState = struct {
         return 0;
     }
 
-    fn body(c: *Context) anyerror!void {
-        _ = try CellMod.cell(u32, c, getSource, null);
+    fn body(c: *Compute) anyerror!void {
+        _ = c.get(try CellMod.cell(u32, c.untracked(), getSource, null));
         runs += 1;
     }
 };
@@ -541,8 +525,8 @@ const FailingBodyState = struct {
     }
     var source: u32 = 0;
 
-    fn body(c: *Context) anyerror!void {
-        _ = try CellMod.cell(u32, c, getSource, null);
+    fn body(c: *Compute) anyerror!void {
+        _ = c.get(try CellMod.cell(u32, c.untracked(), getSource, null));
         runs += 1;
         return error.EffectBodyFailed;
     }

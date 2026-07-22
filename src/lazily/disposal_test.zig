@@ -29,6 +29,7 @@ const testing = std.testing;
 
 const ContextMod = @import("context.zig");
 const Context = ContextMod.Context;
+const Compute = ContextMod.Compute;
 const CellMod = @import("cell.zig");
 const EffectMod = @import("effect.zig");
 const slotKeyed = @import("slot.zig").slotKeyed;
@@ -86,22 +87,31 @@ const Sem2 = struct {
     var src_v: i64 = 1;
     var other_v: i64 = 100;
 
-    fn srcInit(_: *Context) anyerror!i64 {
+    fn srcInit(_: *Compute) anyerror!i64 {
         return src_v;
     }
-    fn otherInit(_: *Context) anyerror!i64 {
+    fn otherInit(_: *Compute) anyerror!i64 {
         return other_v;
     }
-    fn mid(ctx: *Context) anyerror!i64 {
-        return (try (try CellMod.cell(i64, ctx, srcInit, null)).tryGet()) + 10;
+    fn mid(c: *Compute) anyerror!i64 {
+        // `cell(...)` errors if `src` is a disposal tombstone (read-after-
+        // dispose), and `c.get` registers the tracked edge `src -> mid`.
+        const src = try CellMod.cell(i64, c.untracked(), srcInit, null);
+        return c.get(src) + 10;
     }
-    fn watchBody(ctx: *Context) anyerror!?void {
+    fn watchBody(c: *Compute) anyerror!?void {
         Log.run('w');
-        _ = slotKeyed(i64, ctx, ContextMod.valueFnCacheKey(&mid), mid, null) catch {};
+        const mid_key = ContextMod.valueFnCacheKey(&mid);
+        // Track `mid`'s backing slot directly (no allocated handle) so the edge
+        // `mid -> watch` is registered without leaking a `Computed` handle.
+        _ = slotKeyed(i64, c.untracked(), mid_key, mid, null) catch return null;
+        if (c.untracked().cacheLookup(mid_key)) |s| c.trackSlot(s);
+        return null;
     }
-    fn keeperBody(ctx: *Context) anyerror!?void {
+    fn keeperBody(c: *Compute) anyerror!?void {
         Log.run('k');
-        _ = (CellMod.cell(i64, ctx, otherInit, null) catch return).tryGet() catch 0;
+        const other = CellMod.cell(i64, c.untracked(), otherInit, null) catch return;
+        _ = c.get(other);
     }
 };
 
@@ -253,7 +263,7 @@ test "disposal does not run an effect that survives in the disposed cone (AsyncC
 
 const Sem3 = struct {
     var v: i64 = 1;
-    fn srcInit(_: *Context) anyerror!i64 {
+    fn srcInit(_: *Compute) anyerror!i64 {
         return v;
     }
     const Cleanup = struct {
@@ -264,9 +274,9 @@ const Sem3 = struct {
     };
     fn body(comptime tag: u8) EffectMod.EffectBodyFn(Cleanup) {
         return struct {
-            fn call(ctx: *Context) anyerror!?Cleanup {
+            fn call(c: *Compute) anyerror!?Cleanup {
                 Log.run(tag);
-                _ = (try CellMod.cell(i64, ctx, srcInit, null)).tryGet() catch 0;
+                _ = (CellMod.cell(i64, c.untracked(), srcInit, null) catch return null).get();
                 return Cleanup{ .tag = tag };
             }
         }.call;

@@ -39,6 +39,7 @@ const json = std.json;
 
 const ContextMod = @import("context.zig");
 const Context = ContextMod.Context;
+const Compute = ContextMod.Compute;
 const CellMod = @import("cell.zig");
 const EffectMod = @import("effect.zig");
 const SignalMod = @import("signal.zig");
@@ -464,8 +465,18 @@ const SyncCleanup = struct {
     }
 };
 
+/// Untracked value read of node `idx` (external observation / materialization).
 fn syncReadIndex(ctx: *Context, idx: usize) anyerror!V {
     return sync_read_fns[idx](ctx);
+}
+
+/// Tracked read of node `idx` from inside a compute/effect (`#lzcellkernel`):
+/// reads the value untracked, then registers the edge `idx -> c.node` by value.
+/// Replaces what the ambient tracking frame did automatically.
+fn syncReadTracked(c: *Compute, idx: usize) anyerror!V {
+    const v = try sync_read_fns[idx](c.untracked());
+    if (c.untracked().cacheLookup(syncKey(idx))) |s| c.trackSlot(s);
+    return v;
 }
 
 fn SyncNodeFns(comptime i: usize) type {
@@ -474,20 +485,20 @@ fn SyncNodeFns(comptime i: usize) type {
             return defs[i].initial;
         }
 
-        fn compute(ctx: *Context) anyerror!V {
+        fn compute(c: *Compute) anyerror!V {
             compute_counts[i] += 1;
             const d = defs[i];
             var acc: V = d.offset;
-            for (d.depSlice()) |dep| acc += try syncReadIndex(ctx, dep);
+            for (d.depSlice()) |dep| acc += try syncReadTracked(c, dep);
             return acc;
         }
 
-        fn effectBody(ctx: *Context) anyerror!?SyncCleanup {
+        fn effectBody(c: *Compute) anyerror!?SyncCleanup {
             EffectLog.recordRun(i);
             if (defs[i].dep()) |dep| {
                 // A read that fails because a dependency is gone is the
                 // contract, not a test failure: the effect simply observes it.
-                _ = syncReadIndex(ctx, dep) catch {};
+                _ = syncReadTracked(c, dep) catch {};
             }
             return SyncCleanup{ .idx = i };
         }
@@ -521,8 +532,8 @@ const sync_read_fns: [MAX_NODES]*const fn (*Context) anyerror!V = blk: {
 /// The synthesized compute per node index, as a runtime pointer — `signalKeyed`
 /// takes its `valueFn` at runtime, unlike `signal`, which keys the slot cache by
 /// the comptime function pointer and so can only ever back one node.
-const sync_compute_fns: [MAX_NODES]*const fn (*Context) anyerror!V = blk: {
-    var a: [MAX_NODES]*const fn (*Context) anyerror!V = undefined;
+const sync_compute_fns: [MAX_NODES]*const fn (*Compute) anyerror!V = blk: {
+    var a: [MAX_NODES]*const fn (*Compute) anyerror!V = undefined;
     for (0..MAX_NODES) |i| a[i] = SyncNodeFns(i).compute;
     break :blk a;
 };
