@@ -504,6 +504,71 @@ pub fn computedRippleWhenKeyed(
     return c.eager();
 }
 
+// -- Value-threaded (fortified) constructors (`#lzcellkernel`) ---------------
+//
+// The primary fortified surface: the compute closure receives a `*Compute`
+// (the value-threaded view carrying the recomputing node id), NOT the ambient
+// `*Context`. Reads through `Compute.get` register a dependency edge against
+// that node by value; the ambient thread-local frame is DETACHED for the
+// duration of the closure, so it is the sole tracking surface. This mirrors
+// lazily-rs `Context::computed`/`effect` taking `Fn(&Compute)` (commits
+// 6209f1d + 47992d9). The legacy `computed`/`slot`/`effect` constructors that
+// take `fn(*Context)` remain on the retained thread-local bridge (exactly as
+// lazily-rs kept its thread-local frame for the SyncReactiveGraph closures).
+
+const Compute = @import("context.zig").Compute;
+const detachTracking = @import("context.zig").detachTracking;
+const restoreTracking = @import("context.zig").restoreTracking;
+
+/// The value-threaded compute closure type: receives the fortified `*Compute`
+/// view instead of the ambient `*Context`.
+pub fn ComputeFn(comptime T: type) type {
+    return fn (*Compute) anyerror!T;
+}
+
+/// Wrap a value-threaded `ComputeFn` into a legacy `ValueFn(*Context)`
+/// trampoline. On each (re)compute the trampoline resolves the recomputing node
+/// from the bridge frame, mints a per-recompute `Compute` view over it, detaches
+/// the ambient frame (so bare reads register nothing), and runs the closure —
+/// value-threading the node identity into the closure. Rebind-per-recompute and
+/// the guard/ripple semantics are inherited unchanged from the underlying
+/// storage `Slot`.
+fn computeTrampoline(comptime T: type, comptime computeFn: *const ComputeFn(T)) *const ValueFn(T) {
+    return &struct {
+        fn call(_ctx: *Context) anyerror!T {
+            const node = currentSlotFor(_ctx) orelse return error.MissingCurrentSlot;
+            const saved = detachTracking();
+            defer restoreTracking(saved);
+            var view = Compute.init(_ctx, node);
+            return computeFn(&view);
+        }
+    }.call;
+}
+
+/// `computed`, fortified: the closure receives a value-threaded `*Compute`.
+/// A guarded, lazy derived value whose dependency edges are registered against
+/// the recomputing node by value (no ambient tracking).
+pub fn computedC(
+    comptime T: type,
+    ctx: *Context,
+    comptime computeFn: *const ComputeFn(T),
+    comptime deinitPayload: ?DeinitPayloadFn,
+) !*Computed(T) {
+    return computed(T, ctx, computeTrampoline(T, computeFn), deinitPayload);
+}
+
+/// `computedRippleWhen`, fortified: value-threaded compute + custom propagate
+/// guard.
+pub fn computedRippleWhenC(
+    comptime T: type,
+    ctx: *Context,
+    comptime computeFn: *const ComputeFn(T),
+    comptime changed: *const fn (old: *const T, new: *const T) bool,
+    comptime deinitPayload: ?DeinitPayloadFn,
+) !*Computed(T) {
+    return computedRippleWhen(T, ctx, computeTrampoline(T, computeFn), changed, deinitPayload);
+}
+
 // -- Backward-compatible aliases (former vocabulary) ------------------------
 
 /// Deprecated alias for `source` — the plain source constructor. Prefer

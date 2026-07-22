@@ -16,6 +16,13 @@ pub const computed = @import("./lazily/cell.zig").computed;
 pub const computedKeyed = @import("./lazily/cell.zig").computedKeyed;
 pub const computedRippleWhen = @import("./lazily/cell.zig").computedRippleWhen;
 pub const computedRippleWhenKeyed = @import("./lazily/cell.zig").computedRippleWhenKeyed;
+// Fortified, value-threaded compute view (`#lzcellkernel`).
+pub const Compute = @import("./lazily/context.zig").Compute;
+pub const ComputeFn = @import("./lazily/cell.zig").ComputeFn;
+pub const computedC = @import("./lazily/cell.zig").computedC;
+pub const computedRippleWhenC = @import("./lazily/cell.zig").computedRippleWhenC;
+pub const effectC = @import("./lazily/effect.zig").effectC;
+pub const effectNoCleanupC = @import("./lazily/effect.zig").effectNoCleanupC;
 // Deprecated aliases for the former reactive-value vocabulary.
 pub const cell = @import("./lazily/cell.zig").cell;
 pub const CellFn = @import("./lazily/cell.zig").CellFn;
@@ -91,6 +98,8 @@ pub const NodeHandle = @import("./lazily/context.zig").Context.NodeHandle;
 // Disposal semantics 2 and 3, asserted directly so they hold in a bare clone
 // without the lazily-spec sibling checkout (`#lzspecedgeindex`).
 pub const disposal_test = @import("./lazily/disposal_test.zig");
+// Fortification contract for the value-threaded `Compute` view (`#lzcellkernel`).
+pub const compute_fortification_test = @import("./lazily/compute_fortification.zig");
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;

@@ -2248,6 +2248,123 @@ pub fn currentSlotFor(ctx: *Context) ?*Slot {
     return null;
 }
 
+/// Detach the ambient tracking stack for this thread and return the previous
+/// top (`#lzcellkernel`). The value-threaded compute path
+/// (`Compute` / `computedC` / `effectC`) uses this to suppress ambient
+/// self-registration for the duration of a compute closure: with the frame
+/// detached, a bare `handle.get()` inside the closure registers **no** edge
+/// (`currentSlotFor` returns null), so the ONLY tracking surface is the
+/// value-threaded `Compute.get`. Pair with `restoreTracking`.
+pub fn detachTracking() ?*TrackingFrame {
+    const saved = tracking_top;
+    tracking_top = null;
+    return saved;
+}
+
+/// Restore a tracking stack previously detached with `detachTracking`.
+pub fn restoreTracking(saved: ?*TrackingFrame) void {
+    tracking_top = saved;
+}
+
+/// The fortified, value-threaded compute view (`#lzcellkernel`).
+///
+/// Mirrors lazily-rs `Compute` (commits 6209f1d + 47992d9) and the normative
+/// cell-model spec §"Dependency tracking (the fortified compute view)". A
+/// `Compute` is a **per-recompute view** that carries the recomputing node id
+/// **as a value** (`node`), not through the ambient thread-local frame. It is
+/// the SOLE tracking-read surface handed to a value-threaded compute/effect
+/// closure: a read through `Compute.get` registers a dependency edge against
+/// `node`; the owning `Context` (reached via `untracked()`) is the untracked
+/// read surface. Because the node is a value parameter of the view, the
+/// edge-attribution invariant ("every edge registered during the recompute of
+/// `n` has `n` as its dependent") holds by construction — the identity survives
+/// suspension (a captured value, not executor-global ambient state).
+///
+/// `Compute` is also one of the two carriers of the `ComputeOps` surface — the
+/// compute-time operations subset (`get`/`getRc`/`getUntracked`/`source`/
+/// `computed`/`slot`/`effect`/`batch`/`set`/`dispose`/`untracked`). The other
+/// carrier is `Context` itself (ambient, untracked). Construction ops forward to
+/// the owning `Context`; they form their own edges only when their result is
+/// later read *through a `Compute`*.
+///
+/// Fortification, as Zig allows:
+/// - **Sole tracking surface** — only `get` registers an edge. `getUntracked`
+///   and reads reached via `untracked()` never do. On the value-threaded path
+///   the ambient frame is detached, so even a bare `handle.get()` inside the
+///   closure registers nothing; `Compute.get` is the only thing that tracks.
+/// - **Non-escapable by convention** — Zig has no lifetime brands or `!Send`, so
+///   the view is passed by pointer into the closure and MUST NOT be stored past
+///   the recompute. The generation stamp turns a stored-and-replayed view into a
+///   checked failure rather than a misattributed edge.
+/// - **Generation-stamped** — `node_id` snapshots the recomputing node's arena
+///   id at construction. A read after the node is disposed (or its arena slot
+///   recycled) fails `alive()`, so a stale view can never register an edge
+///   against the wrong node: `tryGet` returns `error.StaleCompute` and `get`
+///   panics.
+pub const Compute = struct {
+    ctx: *Context,
+    node: *Slot,
+    /// Generation token: the recomputing node's arena id at mint time. Disposed
+    /// tombstones keep their id but set `disposed`; a recycled arena slot gets a
+    /// fresh id — either way `alive()` rejects a stale view.
+    node_id: u64,
+
+    pub fn init(ctx: *Context, node: *Slot) Compute {
+        return .{ .ctx = ctx, .node = node, .node_id = node.id.raw };
+    }
+
+    /// Whether the recomputing node is still the one this view was minted for.
+    pub fn alive(self: *const Compute) bool {
+        return !self.node.disposed and self.node.id.raw == self.node_id;
+    }
+
+    /// The explicit untracked escape: the owning `Context`, whose reads register
+    /// no dependency edge. Use it to reach mutators/teardown (`set`/`dispose`)
+    /// or to read a dependency without forming an edge from inside a compute.
+    pub fn untracked(self: *const Compute) *Context {
+        return self.ctx;
+    }
+
+    /// Tracked read: read `handle` and register the dependency edge
+    /// `dep(handle) -> node` against the recomputing node, by value. Panics if
+    /// the view is stale (disposed/recycled node) — a fortification breach.
+    pub fn get(self: *const Compute, handle: anytype) @TypeOf(handle.get()) {
+        return self.tryGet(handle) catch |err| {
+            std.debug.panic("Compute.get through a stale compute view: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// The checked tracked read. Registers the edge only when the view is still
+    /// live; otherwise returns `error.StaleCompute` without touching the graph.
+    pub fn tryGet(self: *const Compute, handle: anytype) error{StaleCompute}!@TypeOf(handle.get()) {
+        if (!self.alive()) return error.StaleCompute;
+        // Read first (untracked — the ambient frame is detached on this path),
+        // then register the edge explicitly against the value-threaded node.
+        const value = handle.get();
+        self.ctx.mutex.lock();
+        defer self.ctx.mutex.unlock();
+        // `dep.change_subscribers += node ; node.parents += dep`. Idempotent
+        // (getOrPut dedupes), so a re-read within the same recompute is free.
+        handle.slot.subscribeChangeUnlocked(self.node) catch {};
+        return value;
+    }
+
+    /// Untracked read through the view: reads `handle` and registers NO edge.
+    /// The symmetric sugar for `untracked()`-style reads that mirror lazily-rs
+    /// `c.untracked().get(&a)`.
+    pub fn getUntracked(self: *const Compute, handle: anytype) @TypeOf(handle.get()) {
+        _ = self;
+        return handle.get();
+    }
+
+    /// Open a batch through the owning context (a `ComputeOps` construction op).
+    /// The batch body receives the owning `*Context` (the untracked surface),
+    /// matching `Context.batch`.
+    pub fn batch(self: *const Compute, comptime run: anytype) void {
+        self.ctx.batch(run);
+    }
+};
+
 export fn initContext() FfiResult {
     // Default allocator: c_allocator when libc is linked (max throughput /
     // multi-thread scaling / long-running-process stability), else raw pages.

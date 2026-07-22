@@ -5,6 +5,9 @@ const TrackingFrame = @import("context.zig").TrackingFrame;
 const pushTracking = @import("context.zig").pushTracking;
 const popTracking = @import("context.zig").popTracking;
 const currentSlotFor = @import("context.zig").currentSlotFor;
+const detachTracking = @import("context.zig").detachTracking;
+const restoreTracking = @import("context.zig").restoreTracking;
+const Compute = @import("context.zig").Compute;
 const valueFnCacheKey = @import("context.zig").valueFnCacheKey;
 const slotKeyed = @import("slot.zig").slotKeyed;
 const ValueFn = @import("context.zig").ValueFn;
@@ -210,6 +213,51 @@ pub fn effectNoCleanup(
         }
     };
     return effect(void, ctx, Wrapper.call);
+}
+
+// -- Value-threaded (fortified) effect (`#lzcellkernel`) --------------------
+//
+// The primary fortified effect surface: the body receives a `*Compute` (the
+// value-threaded view carrying the recomputing node id), so tracked reads via
+// `Compute.get` register against that node by value with the ambient frame
+// detached — mirroring lazily-rs `Context::effect` taking `Fn(&Compute)`.
+
+/// A value-threaded effect body: receives the fortified `*Compute` view and may
+/// return a cleanup value.
+pub fn ComputeBodyFn(comptime Cleanup: type) type {
+    return *const fn (*Compute) anyerror!?Cleanup;
+}
+
+/// `effect`, fortified: the body receives a value-threaded `*Compute`.
+pub fn effectC(
+    comptime Cleanup: type,
+    ctx: *Context,
+    comptime bodyFn: ComputeBodyFn(Cleanup),
+) !*Effect(Cleanup) {
+    const bridge = struct {
+        fn call(_ctx: *Context) anyerror!?Cleanup {
+            const node = currentSlotFor(_ctx) orelse return error.MissingCurrentSlot;
+            const saved = detachTracking();
+            defer restoreTracking(saved);
+            var view = Compute.init(_ctx, node);
+            return bodyFn(&view);
+        }
+    }.call;
+    return effect(Cleanup, ctx, bridge);
+}
+
+/// `effectNoCleanup`, fortified: value-threaded body with no teardown.
+pub fn effectNoCleanupC(
+    ctx: *Context,
+    comptime bodyFn: *const fn (*Compute) anyerror!void,
+) !*Effect(void) {
+    const Wrapper = struct {
+        fn call(c: *Compute) anyerror!?void {
+            try bodyFn(c);
+            return null;
+        }
+    };
+    return effectC(void, ctx, Wrapper.call);
 }
 
 fn on_invalidate_hook(s: *Slot) void {
