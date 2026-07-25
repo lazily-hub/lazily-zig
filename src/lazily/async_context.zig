@@ -312,6 +312,26 @@ pub fn AsyncContext(comptime V: type) type {
         /// Resolve a slot, blocking-style: drains pending computes until the slot
         /// is Resolved (or Error). The Zig analog of `await get_async(handle)`.
         pub fn awaitResolved(self: *Self, id: u64) !V {
+            // Error -> Computing (docs/async.md § Async slot state machine;
+            // LazilyFormal.AsyncSlotState SlotEvent.retry). A slot in `.err`
+            // holds no cached result: the caller of the failed attempt already
+            // received its error, so this read re-spawns and returns *this*
+            // attempt's outcome. Replaying `err_value` would make a transient
+            // failure permanent for the slot's lifetime, with no read path able
+            // to recover it. The re-spawn happens once, on entry, so a read
+            // still costs exactly one compute.
+            if (self.slots.getPtr(id)) |node| {
+                if (node.state == .err) {
+                    // Clear `err_value` only after the enqueue succeeds and
+                    // actually moved the slot to `.computing`: a failed enqueue
+                    // (OOM) or a disposed/already-queued node leaves the slot in
+                    // `.err`, where the loop below unwraps `err_value`.
+                    try self.enqueueCompute(id);
+                    if (self.slots.getPtr(id)) |n| {
+                        if (n.state == .computing) n.err_value = null;
+                    }
+                }
+            }
             while (true) {
                 if (self.get(id)) |v| return v;
                 if (self.slots.get(id)) |node| {
@@ -1109,7 +1129,6 @@ test "lazily/async_context: a dropped dependency edge must surface, not resolve 
     });
     ctx.allocator = failing.allocator();
     _ = try ctx.settle();
-    ctx.allocator = backing;
 
     try std.testing.expect(failing.has_induced_failure);
 
@@ -1119,12 +1138,73 @@ test "lazily/async_context: a dropped dependency edge must surface, not resolve 
     // silently missing forever.
     try std.testing.expectEqual(AsyncSlotState.err, ctx.slots.getPtr(slot_id).?.state);
     try std.testing.expect(ctx.get(slot_id) == null);
+
+    // While the allocator is still failing, the read surfaces the failure
+    // rather than serving the stale pre-write value. The retry re-runs the
+    // compute and that run fails too, so the error still reaches the caller.
     try std.testing.expectError(error.OutOfMemory, ctx.awaitResolved(slot_id));
 
-    // And it stays visibly failed rather than quietly serving a stale value:
-    // the recompute that would have rebuilt the edge is the one that can no
-    // longer be reached, so silence here would have been permanent.
+    ctx.allocator = backing;
+
+    // Error -> Computing: once the condition clears, a read recovers the slot.
+    // A binding that cached and replayed `err_value` would be stuck at
+    // `error.OutOfMemory` here for the lifetime of the slot, even though the
+    // edge could now be rebuilt — a transient failure made permanent.
+    try std.testing.expectEqual(@as(u32, 7), try ctx.awaitResolved(slot_id));
+    try std.testing.expectEqual(AsyncSlotState.resolved, ctx.slots.getPtr(slot_id).?.state);
+
+    // And the edge really was rebuilt by that recovering recompute: writing
+    // `cell_b` now re-enqueues the slot, which it could not do while the edge
+    // was missing.
     try ctx.setCell(S.cell_b, 42);
+    try std.testing.expect(ctx.slots.getPtr(slot_id).?.queued);
     _ = try ctx.settle();
+    try std.testing.expectEqual(AsyncSlotState.resolved, ctx.slots.getPtr(slot_id).?.state);
+}
+
+// Error -> Computing is mandatory, not optional: a slot in `.err` holds no
+// cached result, so every read re-spawns. Asserted on the compute counter,
+// because a binding that caches and replays the stored error also "returns the
+// error" on each read while running the body exactly once.
+const ErrRetryState = struct {
+    var runs: u64 = 0;
+    var fail: bool = true;
+
+    fn compute(_: *anyopaque, _: *CC) anyerror!u32 {
+        runs += 1;
+        if (fail) return error.Boom;
+        return 7;
+    }
+};
+
+test "lazily/async_context: an errored slot re-spawns on the next read" {
+    const S = ErrRetryState;
+    S.runs = 0;
+    S.fail = true;
+    var ctx = ACtx.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    var dummy: u8 = 0;
+    const slot_id = try ctx.computedAsyncClosure(&dummy, S.compute);
+
+    try std.testing.expectError(error.Boom, ctx.awaitResolved(slot_id));
     try std.testing.expectEqual(AsyncSlotState.err, ctx.slots.getPtr(slot_id).?.state);
+    try std.testing.expectEqual(@as(u64, 1), S.runs);
+
+    // Still failing: each read costs exactly one compute, and the error is the
+    // one this read produced rather than a replay of the first.
+    try std.testing.expectError(error.Boom, ctx.awaitResolved(slot_id));
+    try std.testing.expectEqual(@as(u64, 2), S.runs);
+    try std.testing.expectError(error.Boom, ctx.awaitResolved(slot_id));
+    try std.testing.expectEqual(@as(u64, 3), S.runs);
+
+    // Recovery: the read that follows the condition clearing resolves.
+    S.fail = false;
+    try std.testing.expectEqual(@as(u32, 7), try ctx.awaitResolved(slot_id));
+    try std.testing.expectEqual(@as(u64, 4), S.runs);
+    try std.testing.expectEqual(AsyncSlotState.resolved, ctx.slots.getPtr(slot_id).?.state);
+
+    // And a resolved slot still short-circuits: no compute on a warm read.
+    try std.testing.expectEqual(@as(u32, 7), try ctx.awaitResolved(slot_id));
+    try std.testing.expectEqual(@as(u64, 4), S.runs);
 }
