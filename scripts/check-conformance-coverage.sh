@@ -127,6 +127,19 @@ while IFS= read -r fixture; do
   fi
 done < <(cd "$SPEC_DIR" && find . -name '*.json' | sed 's|^\./||' | sort)
 
+# The evidence channel guards itself. Every recorded id must resolve against the
+# corpus root; otherwise the manifest was truncated or interleaved in transit,
+# and coverage computed from it cannot be trusted.
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
+  if [ ! -f "$SPEC_DIR/$id" ]; then
+    echo "ERROR: manifest records '$id', which names no file in $SPEC_DIR." >&2
+    echo "       The recorder is dropping or interleaving writes; coverage computed" >&2
+    echo "       from this manifest cannot be trusted." >&2
+    missing=$((missing + 1))
+  fi
+done <<< "$OPENED"
+
 # A stale allowlist is its own drift: an entry naming a fixture that no longer
 # exists means the corpus moved and nobody updated the excuse.
 for known in "${KNOWN_UNCOVERED[@]:-}"; do

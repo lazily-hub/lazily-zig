@@ -52,16 +52,20 @@ var manifest_resolved: bool = false;
 /// Drop-in for the `readFixtureFile` helper each conformance file used to define
 /// for itself.
 pub fn specReadFile(path: []const u8) ![]u8 {
-    record(path);
-    if (comptime builtin.zig_version.minor >= 16) {
-        return std.Io.Dir.cwd().readFileAlloc(
+    const bytes = if (comptime builtin.zig_version.minor >= 16)
+        try std.Io.Dir.cwd().readFileAlloc(
             std.testing.io,
             path,
             std.testing.allocator,
             .limited(1024 * 1024),
-        );
-    }
-    return std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024);
+        )
+    else
+        try std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024);
+    // A failed lookup did not open fixture bytes and must not manufacture
+    // evidence. Recording after the successful read also keeps negative loader
+    // tests from poisoning the runtime manifest with nonexistent ids.
+    record(path);
+    return bytes;
 }
 
 /// Record a read without performing one. For fixtures replayed from bytes that
