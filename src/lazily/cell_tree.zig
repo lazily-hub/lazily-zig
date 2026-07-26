@@ -23,15 +23,15 @@ pub fn TreeIdContext(comptime K: type) type {
     };
 }
 
-/// A CellTreeNode is one node of an ordered keyed tree. It carries a value
+/// A SourceTreeNode is one node of an ordered keyed tree. It carries a value
 /// cell and the per-level reactive membership/order versions (mirroring
 /// `SourceMap`'s three-signal model). Child handles live in a non-reactive map
 /// kept in lockstep with `order`.
 ///
-/// Mirrors lazily-rs `CellTreeNode` (`cell_tree.rs:62-76`). Each node owns its
+/// Mirrors lazily-rs `SourceTreeNode` (`cell_tree.rs:62-76`). Each node owns its
 /// children (allocated in the caller's allocator); structural sharing is by
 /// pointer aliasing (the Zig analog of `Rc`).
-pub fn CellTreeNode(comptime Id: type, comptime V: type) type {
+pub fn SourceTreeNode(comptime Id: type, comptime V: type) type {
     return struct {
         id: Id,
         value: V,
@@ -104,7 +104,7 @@ pub fn CellTreeNode(comptime Id: type, comptime V: type) type {
                 existing.setValue(v);
                 return existing;
             }
-            const new_node = try CellTreeNode(Id, V).init(self.allocator, id, v);
+            const new_node = try SourceTreeNode(Id, V).init(self.allocator, id, v);
             try self.child_order.append(self.allocator, id);
             try self.children.put(id, new_node);
             self.membership_version += 1;
@@ -188,28 +188,38 @@ fn crdtEqVal(comptime V: type, a: V, b: V) bool {
 }
 
 /// An ordered keyed tree — composition of per-node value cells with per-level
-/// membership/order reactivity. Mirrors lazily-rs `CellTree` (`cell_tree.rs`).
+/// membership/order reactivity. Mirrors lazily-rs `SourceTree` (`cell_tree.rs`).
 /// One root node; structural sharing by pointer aliasing (attach pre-built
 /// subtrees). See `lazily-spec/cell-model.md § Ordered keyed tree`.
-pub fn CellTree(comptime Id: type, comptime V: type) type {
+pub fn SourceTree(comptime Id: type, comptime V: type) type {
     return struct {
-        root: *CellTreeNode(Id, V),
+        root: *SourceTreeNode(Id, V),
 
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator, root_id: Id, root_value: V) !Self {
-            return .{ .root = try CellTreeNode(Id, V).init(allocator, root_id, root_value) };
+            return .{ .root = try SourceTreeNode(Id, V).init(allocator, root_id, root_value) };
         }
 
         pub fn deinit(self: *Self) void {
             self.root.deinit();
         }
 
-        pub fn rootNode(self: *Self) *CellTreeNode(Id, V) {
+        pub fn rootNode(self: *Self) *SourceTreeNode(Id, V) {
             return self.root;
         }
     };
 }
+
+/// Deprecated: renamed to [`SourceTree`] when the v2 kernel renamed the node
+/// kinds to `Source` / `Computed`. Kept as an alias so existing callers keep
+/// compiling; use `SourceTree` in new code.
+pub const CellTree = SourceTree;
+
+/// Deprecated: renamed to [`SourceTreeNode`] when the v2 kernel renamed the
+/// node kinds to `Source` / `Computed`. Kept as an alias so existing callers
+/// keep compiling; use `SourceTreeNode` in new code.
+pub const CellTreeNode = SourceTreeNode;
 
 // ---------------------------------------------------------------------------
 // Tests — per-node / per-level invariants (mirrors lazily-rs cell_tree.rs)
@@ -217,7 +227,7 @@ pub fn CellTree(comptime Id: type, comptime V: type) type {
 
 test "lazily/cell_tree: per-node value isolation" {
     const allocator = std.testing.allocator;
-    var tree = try CellTree([]const u8, i64).init(allocator, "root", 0);
+    var tree = try SourceTree([]const u8, i64).init(allocator, "root", 0);
     defer tree.deinit();
 
     const a = try tree.root.insertChild("a", 1);
@@ -234,7 +244,7 @@ test "lazily/cell_tree: per-node value isolation" {
 
 test "lazily/cell_tree: atomic move bumps order only, preserves membership" {
     const allocator = std.testing.allocator;
-    var tree = try CellTree([]const u8, i64).init(allocator, "root", 0);
+    var tree = try SourceTree([]const u8, i64).init(allocator, "root", 0);
     defer tree.deinit();
 
     _ = try tree.root.insertChild("a", 1);
@@ -256,7 +266,7 @@ test "lazily/cell_tree: atomic move bumps order only, preserves membership" {
 
 test "lazily/cell_tree: remove + resolvePath" {
     const allocator = std.testing.allocator;
-    var tree = try CellTree([]const u8, i64).init(allocator, "root", 0);
+    var tree = try SourceTree([]const u8, i64).init(allocator, "root", 0);
     defer tree.deinit();
 
     const a = try tree.root.insertChild("a", 1);
@@ -267,4 +277,15 @@ test "lazily/cell_tree: remove + resolvePath" {
 
     try std.testing.expect(tree.root.removeChild("a"));
     try std.testing.expect(tree.root.resolvePath(&path) == null);
+}
+
+test "lazily/cell_tree: deprecated CellTree/CellTreeNode aliases still resolve" {
+    try std.testing.expect(CellTree([]const u8, i64) == SourceTree([]const u8, i64));
+    try std.testing.expect(CellTreeNode([]const u8, i64) == SourceTreeNode([]const u8, i64));
+
+    const allocator = std.testing.allocator;
+    var tree = try CellTree([]const u8, i64).init(allocator, "root", 0);
+    defer tree.deinit();
+    const a: *CellTreeNode([]const u8, i64) = try tree.rootNode().insertChild("a", 1);
+    try std.testing.expectEqual(@as(i64, 1), a.getValue());
 }

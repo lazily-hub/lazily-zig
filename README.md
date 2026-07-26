@@ -30,7 +30,7 @@ notes and platform carve-outs lives in
 | Async reactive context | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Flat state machine | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Harel state charts | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Keyed reactive maps (`ReactiveMap`: `SourceMap` / `ComputedMap`) + `CellTree` + reconcile | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Keyed reactive maps (`ReactiveMap`: `SourceMap` / `ComputedMap`) + `SourceTree` + reconcile | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Memoized semantic tree (`SemTree`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Stable-id alignment (manufactured identity) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Reactive queue (`QueueCell` SPSC/MPSC + `QueueStorage` adapter) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
@@ -87,7 +87,7 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/thread_safe_context.zig` | `ThreadSafeContext` — a lock-backed, `Send`-shareable reactive context (distinct from the build-flag mutex on `Context`): id-keyed cells + computed slots in a standalone registry, all serialized by one `ParkingMutex`, reads returned by copy. Per-key runtime cells (type-erased storage + monomorphic recompute thunks) + closure-userdata computes are what let a keyed family ride a real context. |
 | `src/lazily/thread_safe_reactive_map.zig` | `ThreadSafeReactiveMap` (`ThreadSafeSourceMap`/`ThreadSafeComputedMap`) — the `Send + Sync` flavor (`#reactivemap`): **rides on `ThreadSafeContext`** (every entry is a real reactive cell there), present-set behind a `ParkingMutex`. `getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager); cell-only `set`. Observational transparency + present-set monotonicity plus **materialization confluence** (`lazily-formal` `materialize_present_comm`/`materialize_observe_comm`). |
 | `src/lazily/async_reactive_map.zig` | `AsyncReactiveMap` (`AsyncSourceMap`/`AsyncComputedMap`) — the async flavor (`#reactivemap`): **rides on `AsyncContext(V)`** — cell entries are async cells, slot entries genuine async slots (pending until `drive`/`settle`). `getOrInsertHandle`/`getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager). A **resolution axis** (`observe` returns `?V`, `null` while pending) giving **eventual transparency** (`lazily-formal` `AsyncMaterialization`). |
-| `src/lazily/cell_tree.zig` | `CellTree` — ordered keyed tree composing `SourceMap` per level (atomic child move, per-level reactivity). |
+| `src/lazily/cell_tree.zig` | `SourceTree` — ordered keyed tree composing `SourceMap` per level (atomic child move, per-level reactivity). |
 | `src/lazily/reconcile.zig` | LIS-move-minimized keyed reconciliation op-set (`DiffOp`, `reconcile`, `longestIncreasingSubsequence`). |
 | `src/lazily/sem_tree.zig` | `SemTree` — memoized semantic tree; an edit recomputes only the ancestor chain (sibling isolation + memo guard). |
 | `src/lazily/stable_id.zig` | Manufactured identity for text (FNV-1a content hashes, in-band anchors, word-LCS similarity alignment). |
@@ -271,13 +271,14 @@ Signal/Effect rerun (`lazily-spec/docs/reactive-graph.md` § batch).
 classes (value / membership / order) — a value write never invalidates
 membership or order readers, and a pure reorder never invalidates membership or
 value readers. `moveTo` / `moveBefore` / `moveAfter` are atomic in-place
-reorders (the entry's handle and dependents survive). `CellTree(Id, V)`
+reorders (the entry's handle and dependents survive). `SourceTree(Id, V)`
 composes one `SourceMap` per level for an ordered keyed tree. `reconcile(old,
 new)` diffs two keyed sequences by stable key and emits the move-minimized
 `{insert, remove, move, update}` op-set (LIS over prior indices preserved).
 
 `SourceMap` / `ComputedMap` (and the `ThreadSafe*` / `Async*` flavors) were
-named `CellMap` / `SlotMap` before the v2 kernel renamed the node kinds to
+named `CellMap` / `SlotMap`, and `SourceTree` / `SourceTreeNode` were named
+`CellTree` / `CellTreeNode`, before the v2 kernel renamed the node kinds to
 `Source` / `Computed`. The old names remain as deprecated aliases so existing
 callers keep compiling; use the new names in new code.
 

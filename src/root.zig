@@ -313,8 +313,14 @@ pub const seq_crdt = @import("./lazily/seq_crdt.zig");
 pub const SeqCrdt = seq_crdt.SeqCrdt;
 pub const Position = seq_crdt.Position;
 pub const cell_tree = @import("./lazily/cell_tree.zig");
-pub const CellTree = cell_tree.CellTree;
-pub const CellTreeNode = cell_tree.CellTreeNode;
+pub const SourceTree = cell_tree.SourceTree;
+pub const SourceTreeNode = cell_tree.SourceTreeNode;
+// Deprecated tree aliases — the v2 kernel renamed the node kinds to `Source` /
+// `Computed`, so `CellTree` / `CellTreeNode` became `SourceTree` /
+// `SourceTreeNode`. Kept so existing callers keep compiling; prefer the new
+// names.
+pub const CellTree = SourceTree;
+pub const CellTreeNode = SourceTreeNode;
 pub const sem_tree = @import("./lazily/sem_tree.zig");
 pub const SemTree = sem_tree.SemTree;
 pub const stable_id = @import("./lazily/stable_id.zig");

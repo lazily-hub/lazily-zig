@@ -1,7 +1,7 @@
 const std = @import("std");
 const cell_tree = @import("cell_tree.zig");
-const CellTree = cell_tree.CellTree;
-const CellTreeNode = cell_tree.CellTreeNode;
+const SourceTree = cell_tree.SourceTree;
+const SourceTreeNode = cell_tree.SourceTreeNode;
 
 /// A memoized semantic tree — one memo slot per node folding
 /// `(node value, child derived values)`. Editing one node recomputes only its
@@ -32,7 +32,7 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
 
         pub fn build(
             allocator: std.mem.Allocator,
-            root: *CellTreeNode(Id, V),
+            root: *SourceTreeNode(Id, V),
             fold: *const fn (node_value: V, child_deriveds: []const D) D,
         ) !Self {
             var self = Self{
@@ -69,7 +69,7 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
 
         /// Recompute `id`'s derived value (folding its value + present child
         /// deriveds) and return whether the derived value changed.
-        fn recomputeOne(self: *Self, node: *CellTreeNode(Id, V)) !bool {
+        fn recomputeOne(self: *Self, node: *SourceTreeNode(Id, V)) !bool {
             const old = self.derived.get(node.id);
             // Gather present child derived values in current child order.
             var child_ds = std.ArrayList(D).empty;
@@ -89,7 +89,7 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
 
         /// Bottom-up derivation: children first, then this node folds their
         /// derived values with its own value.
-        fn deriveNode(self: *Self, node: *CellTreeNode(Id, V)) !void {
+        fn deriveNode(self: *Self, node: *SourceTreeNode(Id, V)) !void {
             for (node.childIds()) |cid| {
                 if (node.child(cid)) |child_node| {
                     try self.parent_of.put(cid, node.id);
@@ -102,7 +102,7 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
         /// Apply a node-value edit. Recomputes the ancestor chain bottom-up;
         /// sibling subtrees stay cached. The memo guard stops propagation when
         /// a recomputed derived value is unchanged.
-        pub fn applyEdit(self: *Self, tree_root: *CellTreeNode(Id, V), id: Id, new_value: V) !void {
+        pub fn applyEdit(self: *Self, tree_root: *SourceTreeNode(Id, V), id: Id, new_value: V) !void {
             const node = findNode(Id, V, tree_root, id) orelse return error.NodeNotFound;
             node.setValue(new_value);
             // Walk id and its ancestor chain, recomputing each. Stop cascading
@@ -119,7 +119,7 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
         /// Apply a remove-child op: re-derive the parent's subtree.
         pub fn applyRemoveChild(
             self: *Self,
-            tree_root: *CellTreeNode(Id, V),
+            tree_root: *SourceTreeNode(Id, V),
             parent_id: Id,
             child_id: Id,
         ) !void {
@@ -147,12 +147,12 @@ fn derivedEq(comptime D: type, a: D, b: D) bool {
     };
 }
 
-fn findNode(comptime Id: type, comptime V: type, root: *CellTreeNode(Id, V), id: Id) ?*CellTreeNode(Id, V) {
+fn findNode(comptime Id: type, comptime V: type, root: *SourceTreeNode(Id, V), id: Id) ?*SourceTreeNode(Id, V) {
     if (cell_tree.TreeIdContext(Id).eql(undefined, root.id, id)) return root;
     return findInChildren(Id, V, root, id);
 }
 
-fn findInChildren(comptime Id: type, comptime V: type, node: *CellTreeNode(Id, V), id: Id) ?*CellTreeNode(Id, V) {
+fn findInChildren(comptime Id: type, comptime V: type, node: *SourceTreeNode(Id, V), id: Id) ?*SourceTreeNode(Id, V) {
     for (node.childIds()) |cid| {
         if (node.child(cid)) |child| {
             if (cell_tree.TreeIdContext(Id).eql(undefined, child.id, id)) return child;
@@ -182,8 +182,8 @@ fn countPositiveFoldI64(node_value: i64, child_deriveds: []const i64) i64 {
 // Tests (mirror semtree_incremental.json scenarios)
 // ---------------------------------------------------------------------------
 
-const Tree = CellTree([]const u8, i64);
-const Node = CellTreeNode([]const u8, i64);
+const Tree = SourceTree([]const u8, i64);
+const Node = SourceTreeNode([]const u8, i64);
 
 fn buildSampleTree(allocator: std.mem.Allocator) !Tree {
     var t = try Tree.init(allocator, "root", 0);
