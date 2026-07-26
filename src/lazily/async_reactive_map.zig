@@ -25,6 +25,9 @@ const std = @import("std");
 const async_context = @import("async_context.zig");
 const AsyncContext = async_context.AsyncContext;
 const reactive_map = @import("reactive_map.zig");
+const keyed_order = @import("keyed_order.zig");
+const KeyedOrder = keyed_order.KeyedOrder;
+const Move = keyed_order.Move;
 
 pub const EntryKind = reactive_map.EntryKind;
 pub const Factory = reactive_map.Factory;
@@ -41,10 +44,10 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
     return struct {
         /// The shared async reactive context every entry lives in.
         actx: *AsyncContext(V),
-        /// Present set: key → its node id in `actx`. Grows on materialize.
-        materialized: HashMapFor(K, u64),
-        /// First-materialization order of the present set.
-        order: std.ArrayList(K),
+        /// Present set + authoritative order + the move algebra, shared verbatim
+        /// with the single-threaded and thread-safe flavors. The payload is the
+        /// entry's node id in `actx`.
+        core: KeyedOrder(K, u64),
         /// For slot maps: slot node id → the canonical value its async compute
         /// resolves to (recovered by the closure via `cc.slot_id`).
         /// **Heap-allocated** so its address is stable across the by-value map
@@ -52,6 +55,10 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// which relocates when `init` returns it. Empty for cell maps.
         slot_values: *SlotValues,
         allocator: std.mem.Allocator,
+        /// Membership version — bumped on add/remove only.
+        membership_version: u64 = 0,
+        /// Order version — bumped on add/remove **and** move/reorder.
+        order_version: u64 = 0,
 
         const Self = @This();
         const SlotValues = std.AutoHashMap(u64, V);
@@ -72,16 +79,14 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
             values.* = SlotValues.init(actx.allocator);
             return Self{
                 .actx = actx,
-                .materialized = HashMapFor(K, u64).init(actx.allocator),
-                .order = .empty,
+                .core = KeyedOrder(K, u64).init(actx.allocator),
                 .slot_values = values,
                 .allocator = actx.allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.order.deinit(self.allocator);
-            self.materialized.deinit();
+            self.core.deinit();
             self.slot_values.deinit();
             self.allocator.destroy(self.slot_values);
         }
@@ -91,7 +96,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// a slot entry is a genuine async slot (pending until driven). Warm key →
         /// cached id.
         fn mint(self: *Self, key: K, value: V) !u64 {
-            if (self.materialized.get(key)) |id| return id; // warm.
+            if (self.core.get(key)) |id| return id; // warm.
             const id = if (entry_kind == .source)
                 try self.actx.cell(value)
             else id: {
@@ -99,16 +104,19 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
                 try self.slot_values.put(sid, value);
                 break :id sid;
             };
-            try self.materialized.put(key, id);
-            try self.order.append(self.allocator, key);
-            return id;
+            const res = try self.core.insert(key, id);
+            if (res.mutation == .changed) {
+                self.membership_version += 1;
+                self.order_version += 1;
+            }
+            return res.handle;
         }
 
         /// Allocate `key`'s node via `factory(key)` on first access (mint-on-access
         /// / lazy pull), returning its node id. A slot starts pending; drive it
         /// with [`drive`]. Warm key → cached id (factory not re-run).
         pub fn getOrInsertHandle(self: *Self, key: K, factory: Factory(K, V)) !u64 {
-            if (self.materialized.get(key)) |id| return id; // warm.
+            if (self.core.get(key)) |id| return id; // warm.
             return self.mint(key, factory.call(key));
         }
 
@@ -126,7 +134,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// eventual-transparency completion. `key` must already be present
         /// (allocate first via [`getOrInsertHandle`] / [`materializeAll`] / `set`).
         pub fn drive(self: *Self, key: K) !V {
-            const id = self.materialized.get(key).?;
+            const id = self.core.get(key).?;
             if (entry_kind == .source) return self.actx.getCell(id).?;
             return self.actx.awaitResolved(id);
         }
@@ -134,7 +142,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// Non-blocking observe: `value` once resolved, `null` while pending or
         /// absent (`observe_pending_is_none`). Does not mint.
         pub fn observe(self: *Self, key: K) ?V {
-            const id = self.materialized.get(key) orelse return null;
+            const id = self.core.get(key) orelse return null;
             if (entry_kind == .source) return self.actx.getCell(id);
             return self.actx.get(id);
         }
@@ -156,25 +164,100 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
 
         /// Whether `key` is currently allocated (present). Non-reactive.
         pub fn isPresent(self: *Self, key: K) bool {
-            return self.materialized.contains(key);
+            return self.core.contains(key);
         }
 
         /// Whether `key` is allocated **and resolved** (a non-blocking observe
         /// would return a value).
         pub fn isResolved(self: *Self, key: K) bool {
-            const id = self.materialized.get(key) orelse return false;
+            const id = self.core.get(key) orelse return false;
             if (entry_kind == .source) return true;
             return self.actx.get(id) != null;
         }
 
         /// Number of currently-allocated entries.
         pub fn presentCount(self: *const Self) usize {
-            return self.order.items.len;
+            return self.core.len();
         }
 
         /// The currently-allocated keys, in first-materialization order.
         pub fn presentKeys(self: *const Self) []const K {
-            return self.order.items;
+            return self.core.keys();
+        }
+
+        /// Reactive snapshot of the keys in their current order.
+        pub fn keys(self: *const Self) []const K {
+            return self.core.keys();
+        }
+
+        /// Reactive entry count. Membership readers subscribe here.
+        pub fn len(self: *const Self) usize {
+            return self.core.len();
+        }
+
+        /// Reactive membership test for `key`.
+        pub fn containsKey(self: *const Self, key: K) bool {
+            return self.core.contains(key);
+        }
+
+        /// The entry's node id for `key`, or `null`. Non-minting.
+        ///
+        /// Core surface: the atomic-move law is stated in terms of handle
+        /// stability, so it is unassertable without this.
+        pub fn handle(self: *const Self, key: K) ?u64 {
+            return self.core.get(key);
+        }
+
+        /// Current 0-based position of `key` in the order, or `null` if absent.
+        pub fn position(self: *const Self, key: K) ?usize {
+            return self.core.position(key);
+        }
+
+        /// Remove `key`'s entry, disposing its node. Bumps membership + order.
+        pub fn remove(self: *Self, key: K) bool {
+            const res = self.core.remove(key);
+            const id = res.handle orelse return false;
+            self.actx.disposeNode(id);
+            if (entry_kind == .computed) _ = self.slot_values.remove(id);
+            self.membership_version += 1;
+            self.order_version += 1;
+            return true;
+        }
+
+        /// Current membership version (bumped on add/remove).
+        pub fn membershipVersion(self: *const Self) u64 {
+            return self.membership_version;
+        }
+
+        /// Current order version (bumped on add/remove and reorder).
+        pub fn orderVersion(self: *const Self) u64 {
+            return self.order_version;
+        }
+
+        // --- atomic move (order signal only; not async-coloured) ---
+
+        /// Atomically move `key` to absolute `index`. The entry keeps the same
+        /// node, dependents, and lineage; only the order version is bumped.
+        ///
+        /// Ordering awaits nothing and touches no entry node, so it is the same
+        /// synchronous algebra the other two flavors run.
+        pub fn moveTo(self: *Self, key: K, index: usize) bool {
+            return self.settleMove(self.core.moveTo(key, index));
+        }
+
+        /// Atomically move `key` to sit immediately **before** `before_key`.
+        pub fn moveBefore(self: *Self, key: K, before_key: K) bool {
+            return self.settleMove(self.core.moveBefore(key, before_key));
+        }
+
+        /// Atomically move `key` to sit immediately **after** `after_key`.
+        pub fn moveAfter(self: *Self, key: K, after_key: K) bool {
+            return self.settleMove(self.core.moveAfter(key, after_key));
+        }
+
+        fn settleMove(self: *Self, outcome: Move) bool {
+            if (outcome.changed()) self.order_version += 1;
+            return outcome.isPresent();
         }
 
         pub fn entryKind(self: *const Self) EntryKind {

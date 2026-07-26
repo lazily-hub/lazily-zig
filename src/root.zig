@@ -102,6 +102,7 @@ pub const disposal_test = @import("./lazily/disposal_test.zig");
 pub const compute_fortification_test = @import("./lazily/compute_fortification.zig");
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const keyed_order = @import("./lazily/keyed_order.zig");
+pub const collections_family_conformance = @import("./lazily/collections_family_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
 pub const SourceMap = reactive_map.SourceMap;

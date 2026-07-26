@@ -138,7 +138,12 @@ pub fn Factory(comptime K: type, comptime V: type) type {
 /// to hand back; identity here is the entry's value version, which a write bumps
 /// and a reorder must not. Strictly weaker than a node handle, and the reason
 /// this binding scores partial rather than green on the Core row.
-pub const EntryHandle = struct { version: u64 };
+pub const EntryHandle = struct {
+    /// Monotonic birth id, assigned once when the entry is minted. Stable across
+    /// value writes and reorders; a removed-and-re-minted key gets a fresh one.
+    /// This is the identity the atomic-move law is stated over.
+    id: u64,
+};
 
 /// The unified keyed reactive map (`#reactivemap`): keys `K` map to per-entry
 /// reactive nodes of the comptime-fixed [`EntryKind`], with reactive membership +
@@ -149,7 +154,14 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// value write is observable independently of membership and order —
         /// the third reader class the fixtures assert. Without it, `set` on an
         /// existing key changed nothing any reader could see.
-        pub const Entry = struct { value: V, version: u64 = 0 };
+        pub const Entry = struct {
+            value: V,
+            /// Bumped only by a write to this entry — the value reader class.
+            version: u64 = 0,
+            /// Birth id. Never changes for the life of the entry, which is what
+            /// makes it an identity rather than a change counter.
+            id: u64,
+        };
 
         ctx: *Context,
         /// Present set + authoritative order + the move algebra, shared verbatim
@@ -159,6 +171,9 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// Membership version — bumped on add/remove only. `len` / `contains`
         /// readers subscribe here.
         membership_version: u64 = 0,
+        /// Monotonic source of entry birth ids. Never reused within a map, so a
+        /// remove-then-re-mint is distinguishable from a reorder.
+        next_entry_id: u64 = 0,
         /// Order version — bumped on add/remove **and** move/reorder. `keys`
         /// readers subscribe here so an atomic move invalidates order readers
         /// without disturbing set-identity readers.
@@ -187,7 +202,9 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// recording membership + order. Bumps both the membership and order
         /// versions: a new key changes the set identity and the ordered key list.
         fn mint(self: *Self, key: K, value: V) !void {
-            const res = try self.core.insert(key, .{ .value = value });
+            const id = self.next_entry_id;
+            self.next_entry_id += 1;
+            const res = try self.core.insert(key, .{ .value = value, .id = id });
             if (res.mutation == .changed) {
                 self.membership_version += 1;
                 self.order_version += 1;
@@ -212,17 +229,18 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             return e.value;
         }
 
-        /// The entry's identity + value version for `key`, or `null` if absent.
+        /// The entry's identity for `key`, or `null` if absent.
         ///
         /// The Core-surface `handle`. This flavor is not graph-backed, so there
-        /// is no node id to return; what identifies an entry here is its slot in
-        /// the present set plus the value version that a write bumps. That is
-        /// enough to assert the atomic-move law (`handle_stable`: a reorder must
-        /// not disturb it) but strictly weaker than a node handle, and it is why
-        /// this binding is marked partial on the Core row rather than green.
+        /// is no node id to return; identity here is the entry's **birth id**,
+        /// which survives value writes and reorders and changes only on a
+        /// remove-then-re-mint. That is exactly what the atomic-move law is
+        /// stated over, so `handle_stable` is assertable — but it carries no
+        /// dependents and no lineage, which is why this binding is marked
+        /// partial on the Core row rather than green.
         pub fn handle(self: *const Self, key: K) ?EntryHandle {
             const e = self.core.get(key) orelse return null;
-            return .{ .version = e.version };
+            return .{ .id = e.id };
         }
 
         /// The value version for `key`, or `null` if absent. Bumped only by a
