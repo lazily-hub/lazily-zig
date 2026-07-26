@@ -101,6 +101,7 @@ pub const disposal_test = @import("./lazily/disposal_test.zig");
 // Fortification contract for the value-threaded `Compute` view (`#lzcellkernel`).
 pub const compute_fortification_test = @import("./lazily/compute_fortification.zig");
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
+pub const keyed_order = @import("./lazily/keyed_order.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
 pub const SourceMap = reactive_map.SourceMap;

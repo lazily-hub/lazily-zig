@@ -41,6 +41,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
+const keyed_order = @import("keyed_order.zig");
+const KeyedOrder = keyed_order.KeyedOrder;
+const Mutation = keyed_order.Mutation;
+const Move = keyed_order.Move;
 
 /// Which kind of reactive node a [`ReactiveMap`] entry is — the handle-kind axis
 /// the map fixes at comptime.
@@ -89,20 +93,12 @@ pub const EntryKind = enum {
     }
 };
 
-/// Choose the right hash map implementation for key type K.
-/// `[]const u8` uses `StringHashMap` (hashes content); everything else uses
-/// `AutoHashMap`.
-fn HashMapFor(comptime K: type, comptime V: type) type {
-    if (K == []const u8) return std.StringHashMap(V);
-    return std.AutoHashMap(K, V);
-}
+/// Choose the right hash map implementation for key type K. Re-exported from
+/// the shared bookkeeping core so all three flavors key alike.
+const HashMapFor = keyed_order.HashMapFor;
 
-/// Key-equality check that works for both string keys (`[]const u8`) and
-/// value-type keys (integers, etc.). Uses `std.mem.eql` for slices, `==` otherwise.
-fn keysEqual(comptime K: type, a: K, b: K) bool {
-    if (K == []const u8) return std.mem.eql(u8, a, b);
-    return std.meta.eql(a, b);
-}
+/// Key-equality for string and value-type keys. See [`HashMapFor`].
+const keysEqual = keyed_order.keysEqual;
 
 /// The canonical per-key value producer — a derived slot's recompute, or an
 /// input cell's initial value (`s.val` in the formal model). Zig has no
@@ -134,18 +130,32 @@ pub fn Factory(comptime K: type, comptime V: type) type {
     };
 }
 
+/// What identifies an entry on the single-threaded map.
+///
+/// The Core surface requires `handle(key)` so the atomic-move law ("a reorder
+/// keeps the entry's same handle") is assertable. This flavor is not
+/// graph-backed — entries are cached values, not nodes — so there is no node id
+/// to hand back; identity here is the entry's value version, which a write bumps
+/// and a reorder must not. Strictly weaker than a node handle, and the reason
+/// this binding scores partial rather than green on the Core row.
+pub const EntryHandle = struct { version: u64 };
+
 /// The unified keyed reactive map (`#reactivemap`): keys `K` map to per-entry
 /// reactive nodes of the comptime-fixed [`EntryKind`], with reactive membership +
 /// order. See the module docs and the [`SourceMap`] / [`ComputedMap`] specializations.
 pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: EntryKind) type {
     return struct {
+        /// One entry's payload. The cached value plus its **own** version, so a
+        /// value write is observable independently of membership and order —
+        /// the third reader class the fixtures assert. Without it, `set` on an
+        /// existing key changed nothing any reader could see.
+        pub const Entry = struct { value: V, version: u64 = 0 };
+
         ctx: *Context,
-        /// Present set: key → cached value. Grows on mint, never shrinks silently
-        /// (deferral, not de-allocation). The authoritative value axis.
-        materialized: HashMapFor(K, V),
-        /// Authoritative insertion/first-materialization order — the snapshot
-        /// returned by `keys` / `presentKeys`.
-        order: std.ArrayList(K),
+        /// Present set + authoritative order + the move algebra, shared verbatim
+        /// with the thread-safe and async flavors. The payload is the cached
+        /// value: this flavor is not graph-backed (see the module docs).
+        core: KeyedOrder(K, Entry),
         /// Membership version — bumped on add/remove only. `len` / `contains`
         /// readers subscribe here.
         membership_version: u64 = 0,
@@ -164,25 +174,24 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         pub fn init(ctx: *Context) Self {
             return .{
                 .ctx = ctx,
-                .materialized = HashMapFor(K, V).init(ctx.allocator),
-                .order = .empty,
+                .core = KeyedOrder(K, Entry).init(ctx.allocator),
                 .allocator = ctx.allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.order.deinit(self.allocator);
-            self.materialized.deinit();
+            self.core.deinit();
         }
 
         /// Mint the entry for `key` with `value` (assumes `key` is absent),
         /// recording membership + order. Bumps both the membership and order
         /// versions: a new key changes the set identity and the ordered key list.
         fn mint(self: *Self, key: K, value: V) !void {
-            try self.materialized.put(key, value);
-            try self.order.append(self.allocator, key);
-            self.membership_version += 1;
-            self.order_version += 1;
+            const res = try self.core.insert(key, .{ .value = value });
+            if (res.mutation == .changed) {
+                self.membership_version += 1;
+                self.order_version += 1;
+            }
         }
 
         /// Get the value at `key`, minting the entry via `factory(key)` first if
@@ -191,7 +200,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// input cell. Re-reading an existing key returns its current value
         /// without re-running the factory (the present set only grows).
         pub fn getOrInsertWith(self: *Self, key: K, factory: Factory(K, V)) !V {
-            if (self.materialized.get(key)) |v| return v; // warm: already present.
+            if (self.core.get(key)) |e| return e.value; // warm: already present.
             const value = factory.call(key);
             try self.mint(key, value);
             return value;
@@ -199,19 +208,35 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
 
         /// Read the value at `key` if present, else `null`. Non-minting.
         pub fn get(self: *const Self, key: K) ?V {
-            return self.materialized.get(key);
+            const e = self.core.get(key) orelse return null;
+            return e.value;
+        }
+
+        /// The entry's identity + value version for `key`, or `null` if absent.
+        ///
+        /// The Core-surface `handle`. This flavor is not graph-backed, so there
+        /// is no node id to return; what identifies an entry here is its slot in
+        /// the present set plus the value version that a write bumps. That is
+        /// enough to assert the atomic-move law (`handle_stable`: a reorder must
+        /// not disturb it) but strictly weaker than a node handle, and it is why
+        /// this binding is marked partial on the Core row rather than green.
+        pub fn handle(self: *const Self, key: K) ?EntryHandle {
+            const e = self.core.get(key) orelse return null;
+            return .{ .version = e.version };
+        }
+
+        /// The value version for `key`, or `null` if absent. Bumped only by a
+        /// write to that entry — never by membership or order changes.
+        pub fn valueVersion(self: *const Self, key: K) ?u64 {
+            const e = self.core.get(key) orelse return null;
+            return e.version;
         }
 
         /// Remove `key`'s entry. Bumps membership + order. Returns whether the key
         /// was present.
         pub fn remove(self: *Self, key: K) bool {
-            if (!self.materialized.remove(key)) return false;
-            for (self.order.items, 0..) |k, i| {
-                if (keysEqual(K, k, key)) {
-                    _ = self.order.orderedRemove(i);
-                    break;
-                }
-            }
+            const res = self.core.remove(key);
+            if (res.mutation == .unchanged) return false;
             self.membership_version += 1;
             self.order_version += 1;
             return true;
@@ -220,46 +245,43 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// Reactive snapshot of the keys in their current order — order readers
         /// (add/remove **and** move/reorder), not per-entry value changes.
         pub fn keys(self: *const Self) []const K {
-            return self.order.items;
+            return self.core.keys();
         }
 
         /// The currently-materialized (present) keys, in first-materialization
         /// order. Alias for [`keys`].
         pub fn presentKeys(self: *const Self) []const K {
-            return self.order.items;
+            return self.core.keys();
         }
 
         /// Number of currently-materialized (present) entries.
         pub fn presentCount(self: *const Self) usize {
-            return self.order.items.len;
+            return self.core.len();
         }
 
         /// Whether `key` is currently materialized (present). Non-reactive.
         pub fn isPresent(self: *const Self, key: K) bool {
-            return self.materialized.contains(key);
+            return self.core.contains(key);
         }
 
         /// Current 0-based position of `key` in the order, or `null` if absent.
         pub fn position(self: *const Self, key: K) ?usize {
-            for (self.order.items, 0..) |k, i| {
-                if (keysEqual(K, k, key)) return i;
-            }
-            return null;
+            return self.core.position(key);
         }
 
         /// Reactive entry count. Membership readers subscribe here.
         pub fn len(self: *const Self) usize {
-            return self.order.items.len;
+            return self.core.len();
         }
 
         /// Reactive emptiness check.
         pub fn isEmpty(self: *const Self) bool {
-            return self.order.items.len == 0;
+            return self.core.len() == 0;
         }
 
         /// Reactive membership test for `key`.
         pub fn contains(self: *const Self, key: K) bool {
-            return self.materialized.contains(key);
+            return self.core.contains(key);
         }
 
         /// Current membership version (bumped on add/remove).
@@ -286,31 +308,26 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// bumped (once). `index` clamps to `[0, len)`. Returns whether `key` was
         /// present.
         pub fn moveTo(self: *Self, key: K, index: usize) bool {
-            const from = self.position(key) orelse return false;
-            const k = self.order.orderedRemove(from);
-            // After removal the list is shorter, so an index pointing at the old
-            // end becomes an append.
-            const clamped = @min(index, self.order.items.len);
-            if (from == clamped) {
-                // No-op: re-insert at the same spot and do not invalidate readers.
-                self.order.insert(self.allocator, from, k) catch return false;
-                return true;
-            }
-            self.order.insert(self.allocator, clamped, k) catch return false;
-            self.order_version += 1;
-            return true;
+            return self.settleMove(self.core.moveTo(key, index));
         }
 
-        /// Atomically move `key` to just before `before_key`. Order signal only.
+        /// Atomically move `key` to sit immediately **before** `before_key`.
+        /// Order signal only.
         pub fn moveBefore(self: *Self, key: K, before_key: K) bool {
-            const target = self.position(before_key) orelse return false;
-            return self.moveTo(key, target);
+            return self.settleMove(self.core.moveBefore(key, before_key));
         }
 
-        /// Atomically move `key` to just after `after_key`. Order signal only.
+        /// Atomically move `key` to sit immediately **after** `after_key`.
+        /// Order signal only.
         pub fn moveAfter(self: *Self, key: K, after_key: K) bool {
-            const target = self.position(after_key) orelse return false;
-            return self.moveTo(key, target + 1);
+            return self.settleMove(self.core.moveAfter(key, after_key));
+        }
+
+        /// Bump the order version iff the order actually changed, and report
+        /// whether the move could be expressed. Shared by all three `move*`.
+        fn settleMove(self: *Self, outcome: Move) bool {
+            if (outcome.changed()) self.order_version += 1;
+            return outcome.isPresent();
         }
 
         /// Which reader classes would be invalidated by applying `op` — the
@@ -331,7 +348,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// Cell-only: compile error on a slot map.
         pub fn entry(self: *Self, key: K, value: V) !V {
             if (entry_kind != .source) @compileError("ReactiveMap.entry is only valid on cell (input) maps");
-            if (self.materialized.get(key)) |v| return v;
+            if (self.core.get(key)) |e| return e.value;
             try self.mint(key, value);
             return value;
         }
@@ -340,7 +357,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// the key is absent. Cell-only.
         pub fn entryWith(self: *Self, key: K, default_fn: *const fn () V) !V {
             if (entry_kind != .source) @compileError("ReactiveMap.entryWith is only valid on cell (input) maps");
-            if (self.materialized.get(key)) |v| return v;
+            if (self.core.get(key)) |e| return e.value;
             const value = default_fn();
             try self.mint(key, value);
             return value;
@@ -353,9 +370,12 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// is not writable.
         pub fn set(self: *Self, key: K, value: V) !void {
             if (entry_kind != .source) @compileError("ReactiveMap.set is only valid on cell (input) maps");
-            if (self.materialized.getPtr(key)) |vp| {
-                if (std.meta.eql(vp.*, value)) return; // PartialEq guard.
-                vp.* = value; // value axis only — membership/order untouched.
+            if (self.core.getPtr(key)) |ep| {
+                if (std.meta.eql(ep.value, value)) return; // PartialEq guard.
+                // Value axis only — membership/order untouched. The per-entry
+                // version bump is what makes that observable to a reader.
+                ep.value = value;
+                ep.version +%= 1;
                 return;
             }
             try self.mint(key, value);
@@ -1072,3 +1092,4 @@ test "lazily/reactive_map: EntryKind.fromWireName accepts both spellings, reject
     try testing.expectEqual(EntryKind.source, try EntryKind.fromWireName(EntryKind.source.wireName()));
     try testing.expectEqual(EntryKind.computed, try EntryKind.fromWireName(EntryKind.computed.wireName()));
 }
+

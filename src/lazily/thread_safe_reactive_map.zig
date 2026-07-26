@@ -33,6 +33,9 @@ const tsc = @import("thread_safe_context.zig");
 const ThreadSafeContext = tsc.ThreadSafeContext;
 const TsHandle = tsc.TsHandle;
 const reactive_map = @import("reactive_map.zig");
+const keyed_order = @import("keyed_order.zig");
+const KeyedOrder = keyed_order.KeyedOrder;
+const Move = keyed_order.Move;
 
 pub const EntryKind = reactive_map.EntryKind;
 pub const Factory = reactive_map.Factory;
@@ -58,12 +61,17 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         /// present-set `mutex`, exactly like lazily-rs `ThreadSafeReactiveMap`
         /// over `ThreadSafeContext`).
         tsctx: *ThreadSafeContext,
-        /// Present set: key → the handle of its reactive cell in `tsctx`.
-        /// Guarded by `mutex`; grows on materialize, never shrinks.
-        materialized: HashMapFor(K, TsHandle(V)),
-        /// First-materialization order of the present set. Guarded by `mutex`.
-        order: std.ArrayList(K),
+        /// Present set + authoritative order + the move algebra, shared verbatim
+        /// with the single-threaded and async flavors. The payload is the handle
+        /// of the entry's reactive node in `tsctx`. Guarded by `mutex`.
+        core: KeyedOrder(K, Entry),
         allocator: std.mem.Allocator,
+        /// Membership version — bumped on add/remove only. `len` / `contains`
+        /// readers subscribe here.
+        membership_version: u64 = 0,
+        /// Order version — bumped on add/remove **and** move/reorder, so `keys`
+        /// readers are invalidated independently of set-identity readers.
+        order_version: u64 = 0,
         /// Serializes the present-set map (`tsctx` serializes the cells). The
         /// confluence proof is what lets one lock guard the whole value axis.
         mutex: ParkingMutex,
@@ -77,28 +85,74 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         pub fn init(tsctx: *ThreadSafeContext) Self {
             return .{
                 .tsctx = tsctx,
-                .materialized = HashMapFor(K, TsHandle(V)).init(tsctx.allocator),
-                .order = .empty,
+                .core = KeyedOrder(K, Entry).init(tsctx.allocator),
                 .allocator = tsctx.allocator,
                 .mutex = ParkingMutex.init(),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.order.deinit(self.allocator);
-            self.materialized.deinit();
+            // Free every parked seed before dropping the present set — a derived
+            // entry's recompute reads from its box, so the box outlives the mint.
+            for (self.core.keys()) |k| {
+                if (self.core.get(k)) |e| self.freeSeed(e);
+            }
+            self.core.deinit();
+        }
+
+        /// Release an entry's parked seed, if it has one. A `.source` entry
+        /// holds its value in the cell itself and parks nothing.
+        fn freeSeed(self: *Self, e: Entry) void {
+            if (e.seed) |box| self.allocator.destroy(box);
         }
 
         /// Materialize `key` if absent: allocate a real reactive cell in `tsctx`
         /// seeded with `value`, record it + first-materialization order, and
         /// return its handle. Caller MUST hold `mutex`. A warm key returns the
         /// cached handle — the present set only grows.
+        /// One entry's seed value, parked so a `.computed` entry's recompute can
+        /// reach it. Zig has no closures, so the derived node's compute reads
+        /// this box rather than capturing.
+        /// One entry: its node in `tsctx`, plus the parked seed a derived entry's
+        /// recompute reads from (`null` for an input cell, which holds its own
+        /// value). The seed is owned by the map and freed on remove/deinit.
+        pub const Entry = struct { node: TsHandle(V), seed: ?*SeedBox = null };
+
+        const SeedBox = struct {
+            value: V,
+            fn compute(ptr: *anyopaque, ctx: *tsc.ThreadSafeContext.ComputeContext) V {
+                _ = ctx;
+                return @as(*SeedBox, @ptrCast(@alignCast(ptr))).value;
+            }
+        };
+
         fn mintLocked(self: *Self, key: K, value: V) !TsHandle(V) {
-            if (self.materialized.get(key)) |h| return h; // warm.
-            const handle = try self.tsctx.cell(V, value);
-            try self.materialized.put(key, handle);
-            try self.order.append(self.allocator, key);
-            return handle;
+            if (self.core.get(key)) |e| return e.node; // warm.
+            // Honour the map's entry kind. This used to always call `tsctx.cell`,
+            // so a ThreadSafeComputedMap's "derived" entries were input cells —
+            // the wrong node kind, silently, on the whole flavor.
+            const entry: Entry = switch (entry_kind) {
+                .source => .{ .node = try self.tsctx.cell(V, value) },
+                .computed => blk: {
+                    const box = try self.allocator.create(SeedBox);
+                    errdefer self.allocator.destroy(box);
+                    box.* = .{ .value = value };
+                    break :blk .{
+                        .node = try self.tsctx.computedClosure(V, box, SeedBox.compute),
+                        .seed = box,
+                    };
+                },
+            };
+            const res = try self.core.insert(key, entry);
+            if (res.mutation == .changed) {
+                self.membership_version += 1;
+                self.order_version += 1;
+            } else {
+                // Lost the race: the core kept the existing entry, so ours is
+                // orphaned. Its seed is ours to free.
+                self.freeSeed(entry);
+            }
+            return res.handle.node;
         }
 
         /// Get `key`'s value, minting its cell via `factory(key)` on first access
@@ -106,17 +160,17 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         pub fn getOrInsertWith(self: *Self, key: K, factory: Factory(K, V)) !V {
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.materialized.get(key)) |h| return self.tsctx.getCell(V, h); // warm.
-            const handle = try self.mintLocked(key, factory.call(key));
-            return self.tsctx.getCell(V, handle);
+            if (self.core.get(key)) |e| return self.tsctx.get(V, e.node); // warm.
+            const node = try self.mintLocked(key, factory.call(key));
+            return self.tsctx.get(V, node);
         }
 
         /// Non-blocking read: `value` if present, else `null`. Does not mint.
         pub fn observe(self: *Self, key: K) ?V {
             self.mutex.lock();
             defer self.mutex.unlock();
-            const handle = self.materialized.get(key) orelse return null;
-            return self.tsctx.getCell(V, handle);
+            const e = self.core.get(key) orelse return null;
+            return self.tsctx.get(V, e.node);
         }
 
         /// Overwrite an input **cell** entry's value (cells are writable inputs)
@@ -126,8 +180,8 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
             if (entry_kind != .source) @compileError("ThreadSafeReactiveMap.set is only valid on cell (input) maps");
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.materialized.get(key)) |h| {
-                self.tsctx.setCell(V, h, value);
+            if (self.core.get(key)) |e| {
+                self.tsctx.setCell(V, e.node, value);
                 return;
             }
             _ = try self.mintLocked(key, value);
@@ -146,14 +200,14 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         pub fn isPresent(self: *Self, key: K) bool {
             self.mutex.lock();
             defer self.mutex.unlock();
-            return self.materialized.contains(key);
+            return self.core.contains(key);
         }
 
         /// Number of currently-materialized entries.
         pub fn presentCount(self: *Self) usize {
             self.mutex.lock();
             defer self.mutex.unlock();
-            return self.order.items.len;
+            return self.core.len();
         }
 
         /// A stable snapshot of the currently-materialized keys, in
@@ -164,10 +218,109 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         pub fn presentKeys(self: *Self, allocator: std.mem.Allocator) ![]K {
             self.mutex.lock();
             defer self.mutex.unlock();
-            return allocator.dupe(K, self.order.items);
+            return allocator.dupe(K, self.core.keys());
         }
 
         /// This map's entry kind.
+        /// The entry's node handle for `key`, or `null`. Non-minting.
+        ///
+        /// Core surface: the atomic-move law is stated in terms of handle
+        /// stability, so it is unassertable without this.
+        pub fn handle(self: *Self, key: K) ?TsHandle(V) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const e = self.core.get(key) orelse return null;
+            return e.node;
+        }
+
+        /// Reactive snapshot of the keys in their current order — order readers,
+        /// not per-entry value changes.
+        pub fn keys(self: *Self, allocator: std.mem.Allocator) ![]K {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return allocator.dupe(K, self.core.keys());
+        }
+
+        /// Reactive entry count. Membership readers subscribe here.
+        pub fn len(self: *Self) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.core.len();
+        }
+
+        /// Reactive membership test for `key`.
+        pub fn containsKey(self: *Self, key: K) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.core.contains(key);
+        }
+
+        /// Current 0-based position of `key` in the order, or `null` if absent.
+        pub fn position(self: *Self, key: K) ?usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.core.position(key);
+        }
+
+        /// Remove `key`'s entry, disposing its node. Bumps membership + order.
+        pub fn remove(self: *Self, key: K) bool {
+            const res = blk: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                break :blk self.core.remove(key);
+            };
+            const e = res.handle orelse return false;
+            // Disposal runs with the map lock released: tearing a node down
+            // invalidates dependents, which can re-enter this map.
+            self.tsctx.disposeNode(e.node.id);
+            self.freeSeed(e);
+            self.membership_version += 1;
+            self.order_version += 1;
+            return true;
+        }
+
+        /// Current membership version (bumped on add/remove).
+        pub fn membershipVersion(self: *Self) u64 {
+            return self.membership_version;
+        }
+
+        /// Current order version (bumped on add/remove and reorder).
+        pub fn orderVersion(self: *Self) u64 {
+            return self.order_version;
+        }
+
+        // --- atomic move (order signal only; not thread-coloured) ---
+
+        /// Atomically move `key` to absolute `index`. The entry keeps the same
+        /// node, dependents, and lineage; only the order version is bumped.
+        pub fn moveTo(self: *Self, key: K, index: usize) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.settleMoveLocked(self.core.moveTo(key, index));
+        }
+
+        /// Atomically move `key` to sit immediately **before** `before_key`.
+        pub fn moveBefore(self: *Self, key: K, before_key: K) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.settleMoveLocked(self.core.moveBefore(key, before_key));
+        }
+
+        /// Atomically move `key` to sit immediately **after** `after_key`.
+        pub fn moveAfter(self: *Self, key: K, after_key: K) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.settleMoveLocked(self.core.moveAfter(key, after_key));
+        }
+
+        /// Bump the order version iff the order changed. Caller holds `mutex`;
+        /// this touches only map-local state, never `tsctx`, so it cannot
+        /// re-enter.
+        fn settleMoveLocked(self: *Self, outcome: Move) bool {
+            if (outcome.changed()) self.order_version += 1;
+            return outcome.isPresent();
+        }
+
         pub fn entryKind(self: *Self) EntryKind {
             _ = self;
             return entry_kind;
