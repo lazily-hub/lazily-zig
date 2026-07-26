@@ -185,16 +185,26 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
 }
 
 /// An async **input-cell** map: every entry is an always-resolved async cell.
-pub fn AsyncCellMap(comptime K: type, comptime V: type) type {
+pub fn AsyncSourceMap(comptime K: type, comptime V: type) type {
     return AsyncReactiveMap(K, V, .cell);
 }
 
 /// An async **derived-slot** map: `getOrInsertHandle` mints on first access
 /// (lazy), [`materializeAll`](AsyncReactiveMap.materializeAll) pre-mints (eager);
 /// resolved via [`drive`](AsyncReactiveMap.drive).
-pub fn AsyncSlotMap(comptime K: type, comptime V: type) type {
+pub fn AsyncComputedMap(comptime K: type, comptime V: type) type {
     return AsyncReactiveMap(K, V, .slot);
 }
+
+/// Deprecated: renamed to [`AsyncSourceMap`] when the v2 kernel renamed the node
+/// kinds to `Source` / `Computed`. Kept as an alias so existing callers keep
+/// compiling; use `AsyncSourceMap` in new code.
+pub const AsyncCellMap = AsyncSourceMap;
+
+/// Deprecated: renamed to [`AsyncComputedMap`] when the v2 kernel renamed the
+/// node kinds to `Source` / `Computed`. Kept as an alias so existing callers
+/// keep compiling; use `AsyncComputedMap` in new code.
+pub const AsyncSlotMap = AsyncComputedMap;
 
 // ---------------------------------------------------------------------------
 // Tests — mirror lazily-rs `src/async_reactive_family.rs`, naming the
@@ -219,13 +229,13 @@ fn identity(k: u32) u32 {
     return k;
 }
 
-const SlotMapU32 = AsyncSlotMap(u32, u32);
-const CellMapBool = AsyncCellMap(u32, bool);
+const ComputedMapU32 = AsyncComputedMap(u32, u32);
+const SourceMapBool = AsyncSourceMap(u32, bool);
 
 test "lazily/async_reactive_map: eager cell map resolves immediately" {
     var actx = AsyncContext(bool).init(testing.allocator);
     defer actx.deinit();
-    var map = try CellMapBool.init(&actx);
+    var map = try SourceMapBool.init(&actx);
     defer map.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| try map.set(k, true);
 
@@ -238,7 +248,7 @@ test "lazily/async_reactive_map: eager cell map resolves immediately" {
 test "lazily/async_reactive_map: lazy slot map defers until read then resolves" {
     var actx = AsyncContext(u32).init(testing.allocator);
     defer actx.deinit();
-    var map = try SlotMapU32.init(&actx);
+    var map = try ComputedMapU32.init(&actx);
     defer map.deinit();
 
     try testing.expectEqual(@as(usize, 0), map.presentCount());
@@ -256,7 +266,7 @@ test "lazily/async_reactive_map: lazy slot map defers until read then resolves" 
 test "lazily/async_reactive_map: pending read is null (observe_pending_is_none)" {
     var actx = AsyncContext(u32).init(testing.allocator);
     defer actx.deinit();
-    var map = try SlotMapU32.init(&actx);
+    var map = try ComputedMapU32.init(&actx);
     defer map.deinit();
     try map.materializeAll(&.{ 5, 6 }, Factory(u32, u32).pure(timesTwo));
     try testing.expectEqual(@as(usize, 2), map.presentCount());
@@ -268,12 +278,12 @@ test "lazily/async_reactive_map: pending read is null (observe_pending_is_none)"
 test "lazily/async_reactive_map: eventual transparency eager == lazy" {
     var actx_e = AsyncContext(u32).init(testing.allocator);
     defer actx_e.deinit();
-    var eager_map = try SlotMapU32.init(&actx_e);
+    var eager_map = try ComputedMapU32.init(&actx_e);
     defer eager_map.deinit();
     try eager_map.materializeAll(&.{ 1, 2, 3 }, Factory(u32, u32).pure(timesTwo));
     var actx_l = AsyncContext(u32).init(testing.allocator);
     defer actx_l.deinit();
-    var lazy_map = try SlotMapU32.init(&actx_l);
+    var lazy_map = try ComputedMapU32.init(&actx_l);
     defer lazy_map.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| {
         _ = try lazy_map.getOrInsertHandle(k, Factory(u32, u32).pure(timesTwo));
@@ -284,7 +294,7 @@ test "lazily/async_reactive_map: eventual transparency eager == lazy" {
 test "lazily/async_reactive_map: present set grows monotonically" {
     var actx = AsyncContext(u32).init(testing.allocator);
     defer actx.deinit();
-    var map = try SlotMapU32.init(&actx);
+    var map = try ComputedMapU32.init(&actx);
     defer map.deinit();
     _ = try map.getOrInsertHandle(5, Factory(u32, u32).pure(identity));
     _ = try map.getOrInsertHandle(5, Factory(u32, u32).pure(identity)); // repeat: no growth
@@ -296,7 +306,7 @@ test "lazily/async_reactive_map: present set grows monotonically" {
 test "lazily/async_reactive_map: cell map reacts to set" {
     var actx = AsyncContext(bool).init(testing.allocator);
     defer actx.deinit();
-    var map = try CellMapBool.init(&actx);
+    var map = try SourceMapBool.init(&actx);
     defer map.deinit();
     try map.set(10, true);
     try map.set(20, true);
@@ -309,10 +319,15 @@ test "lazily/async_reactive_map: cell map reacts to set" {
 test "lazily/async_reactive_map: resolving one node never disturbs another (no churn)" {
     var actx = AsyncContext(u32).init(testing.allocator);
     defer actx.deinit();
-    var map = try SlotMapU32.init(&actx);
+    var map = try ComputedMapU32.init(&actx);
     defer map.deinit();
     try map.materializeAll(&.{ 1, 2 }, Factory(u32, u32).pure(timesTwo));
     try testing.expectEqual(@as(u32, 2), try map.drive(1));
     try testing.expectEqual(@as(u32, 4), try map.drive(2)); // resolve_preserves_observe
     try testing.expectEqual(@as(?u32, 2), map.observe(1));
+}
+
+test "lazily/async_reactive_map: deprecated AsyncCellMap/AsyncSlotMap aliases still resolve" {
+    try testing.expect(AsyncCellMap(u32, u32) == AsyncSourceMap(u32, u32));
+    try testing.expect(AsyncSlotMap(u32, u32) == AsyncComputedMap(u32, u32));
 }

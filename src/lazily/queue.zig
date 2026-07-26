@@ -249,7 +249,7 @@ pub fn VecDequeStorage(comptime T: type) type {
         /// View the buffered elements in FIFO order. Non-reactive — for
         /// debugging, snapshot/serde, and conformance-fixture verification.
         /// There is no reactive random-access `queue[N]` reader; per-position
-        /// reactivity is the domain of `CellMap`, not `QueueCell`.
+        /// reactivity is the domain of `SourceMap`, not `QueueCell`.
         pub fn items(self: *const Self) []const T {
             return self.buf.items;
         }

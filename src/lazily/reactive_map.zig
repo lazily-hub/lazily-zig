@@ -1,4 +1,4 @@
-//! The unified keyed reactive map (`ReactiveMap`) and its `CellMap` / `SlotMap`
+//! The unified keyed reactive map (`ReactiveMap`) and its `SourceMap` / `ComputedMap`
 //! specializations (`#reactivemap`).
 //!
 //! `lazily-spec/cell-model.md` § "Keyed cell collections" fixes ONE keyed
@@ -11,20 +11,20 @@
 //!
 //! # One primitive, two specializations
 //!
-//! - **[`CellMap`]** (`ReactiveMap(K, V, .cell)`) — **input-cell** entries. Adds
+//! - **[`SourceMap`]** (`ReactiveMap(K, V, .cell)`) — **input-cell** entries. Adds
 //!   cell-only [`set`](ReactiveMap.set) and eager value-minting
 //!   ([`entry`](ReactiveMap.entry) / [`entryWith`](ReactiveMap.entryWith)).
-//! - **[`SlotMap`]** (`ReactiveMap(K, V, .slot)`) — **derived-slot** entries.
+//! - **[`ComputedMap`]** (`ReactiveMap(K, V, .slot)`) — **derived-slot** entries.
 //!   [`getOrInsertWith`](ReactiveMap.getOrInsertWith) mints a slot on first access
-//!   (**lazy materialization**); a slot's value is derived, so `SlotMap` has **no
+//!   (**lazy materialization**); a slot's value is derived, so `ComputedMap` has **no
 //!   `set`**. Eager materialization is a pre-mint loop over the keyset
 //!   ([`materializeAll`](ReactiveMap.materializeAll)); lazy is mint-on-access.
 //!   There is **no eager/lazy mode flag** — eager = pre-mint, lazy = mint-on-access.
 //!
 //! The shared surface — `getOrInsertWith` / `remove` / `move*` / membership /
 //! order / `keys` / `len` / `contains` — lives on the generic `ReactiveMap`.
-//! `set` and eager value-minting are the `CellMap`-only specialization; the
-//! pre-mint eager helper is the `SlotMap`-only specialization.
+//! `set` and eager value-minting are the `SourceMap`-only specialization; the
+//! pre-mint eager helper is the `ComputedMap`-only specialization.
 //!
 //! # Three reader-class signals
 //!
@@ -101,7 +101,7 @@ pub fn Factory(comptime K: type, comptime V: type) type {
 
 /// The unified keyed reactive map (`#reactivemap`): keys `K` map to per-entry
 /// reactive nodes of the comptime-fixed [`EntryKind`], with reactive membership +
-/// order. See the module docs and the [`CellMap`] / [`SlotMap`] specializations.
+/// order. See the module docs and the [`SourceMap`] / [`ComputedMap`] specializations.
 pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: EntryKind) type {
     return struct {
         ctx: *Context,
@@ -151,8 +151,8 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         }
 
         /// Get the value at `key`, minting the entry via `factory(key)` first if
-        /// the key is absent — the mint-on-access recipe. For a [`SlotMap`] this
-        /// is the **lazy materialization** pull; for a [`CellMap`] it seeds an
+        /// the key is absent — the mint-on-access recipe. For a [`ComputedMap`] this
+        /// is the **lazy materialization** pull; for a [`SourceMap`] it seeds an
         /// input cell. Re-reading an existing key returns its current value
         /// without re-running the factory (the present set only grows).
         pub fn getOrInsertWith(self: *Self, key: K, factory: Factory(K, V)) !V {
@@ -237,8 +237,8 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             return self.order_version;
         }
 
-        /// This map's entry kind ([`EntryKind.cell`] for a [`CellMap`],
-        /// [`EntryKind.slot`] for a [`SlotMap`]).
+        /// This map's entry kind ([`EntryKind.cell`] for a [`SourceMap`],
+        /// [`EntryKind.slot`] for a [`ComputedMap`]).
         pub fn entryKind(self: *const Self) EntryKind {
             _ = self;
             return entry_kind;
@@ -288,7 +288,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             };
         }
 
-        // --- CellMap-only surface: eager value-minting + `set` ---
+        // --- SourceMap-only surface: eager value-minting + `set` ---
 
         /// Return the value for `key`, minting it with `value` on first access
         /// (eager value-minting). Adding a new key bumps membership + order;
@@ -314,7 +314,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// Set the value at `key`, inserting a new entry (and bumping membership +
         /// order) if absent. Updating an existing entry leaves membership and order
         /// untouched and invalidates only that entry's value axis. An equal-value
-        /// set is a no-op (PartialEq guard). Cell-only: a derived [`SlotMap`] slot
+        /// set is a no-op (PartialEq guard). Cell-only: a derived [`ComputedMap`] slot
         /// is not writable.
         pub fn set(self: *Self, key: K, value: V) !void {
             if (entry_kind != .cell) @compileError("ReactiveMap.set is only valid on cell (input) maps");
@@ -326,7 +326,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             try self.mint(key, value);
         }
 
-        // --- SlotMap-only surface: the eager pre-mint helper ---
+        // --- ComputedMap-only surface: the eager pre-mint helper ---
 
         /// **Eager materialization**: pre-mint a derived slot for every key in
         /// `all_keys` via `factory`, up front. Observationally identical to minting
@@ -340,20 +340,30 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
 }
 
 /// A keyed **input-cell** map: every entry is a settable input cell. The
-/// `CellMap` specialization of [`ReactiveMap`] adds cell-only `set` and eager
+/// `SourceMap` specialization of [`ReactiveMap`] adds cell-only `set` and eager
 /// value-minting (`entry` / `entryWith`) on top of the shared reactive surface.
-pub fn CellMap(comptime K: type, comptime V: type) type {
+pub fn SourceMap(comptime K: type, comptime V: type) type {
     return ReactiveMap(K, V, .cell);
 }
 
 /// A keyed **derived-slot** map: every entry is a derived slot.
 /// [`getOrInsertWith`](ReactiveMap.getOrInsertWith) mints a slot on first access
 /// (lazy materialization); [`materializeAll`](ReactiveMap.materializeAll)
-/// pre-mints the keyset (eager). A slot's value is derived, so `SlotMap` has **no
+/// pre-mints the keyset (eager). A slot's value is derived, so `ComputedMap` has **no
 /// `set`**.
-pub fn SlotMap(comptime K: type, comptime V: type) type {
+pub fn ComputedMap(comptime K: type, comptime V: type) type {
     return ReactiveMap(K, V, .slot);
 }
+
+/// Deprecated: renamed to [`SourceMap`] when the v2 kernel renamed the node
+/// kinds to `Source` / `Computed`. Kept as an alias so existing callers keep
+/// compiling; use `SourceMap` in new code.
+pub const CellMap = SourceMap;
+
+/// Deprecated: renamed to [`ComputedMap`] when the v2 kernel renamed the node
+/// kinds to `Source` / `Computed`. Kept as an alias so existing callers keep
+/// compiling; use `ComputedMap` in new code.
+pub const SlotMap = ComputedMap;
 
 /// Operations that can be applied to a [`ReactiveMap`] (mirrors conformance
 /// fixture op types).
@@ -395,7 +405,7 @@ test "lazily/reactive_map: entry caches one value per key" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap([]const u8, i32).init(ctx);
+    var map = SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(i32, 1), try map.entry("a", 1));
@@ -408,7 +418,7 @@ test "lazily/reactive_map: set inserts then updates in place" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap([]const u8, i32).init(ctx);
+    var map = SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
 
     try map.set("a", 1);
@@ -431,7 +441,7 @@ test "lazily/reactive_map: PartialEq guard on equal set is a no-op" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap([]const u8, i32).init(ctx);
+    var map = SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
 
     try map.set("a", 1);
@@ -446,7 +456,7 @@ test "lazily/reactive_map: membership vs value independence" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap([]const u8, i32).init(ctx);
+    var map = SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
     _ = try map.entry("a", 1);
     _ = try map.entry("b", 2);
@@ -470,7 +480,7 @@ test "lazily/reactive_map: getOrInsertWith mints once then returns existing" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SlotMap(u32, u32).init(ctx);
+    var map = ComputedMap(u32, u32).init(ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(u32, 14), try map.getOrInsertWith(7, Factory(u32, u32).pure(timesTwo)));
@@ -481,11 +491,11 @@ test "lazily/reactive_map: getOrInsertWith mints once then returns existing" {
     try testing.expectEqual(@as(?u32, 14), map.get(7));
 }
 
-test "lazily/reactive_map: SlotMap materializeAll is eager" {
+test "lazily/reactive_map: ComputedMap materializeAll is eager" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SlotMap(u32, u32).init(ctx);
+    var map = ComputedMap(u32, u32).init(ctx);
     defer map.deinit();
     try map.materializeAll(&.{ 0, 1, 2, 5, 9 }, Factory(u32, u32).pure(timesThree));
     try testing.expectEqual(@as(usize, 5), map.presentCount());
@@ -494,15 +504,15 @@ test "lazily/reactive_map: SlotMap materializeAll is eager" {
     try testing.expectEqual(EntryKind.slot, map.entryKind());
 }
 
-test "lazily/reactive_map: SlotMap lazy vs eager observe identically" {
+test "lazily/reactive_map: ComputedMap lazy vs eager observe identically" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var eager_map = SlotMap(u32, u32).init(ctx);
+    var eager_map = ComputedMap(u32, u32).init(ctx);
     defer eager_map.deinit();
     try eager_map.materializeAll(&.{ 0, 1, 2, 5, 9 }, Factory(u32, u32).pure(timesThree));
 
-    var lazy_map = SlotMap(u32, u32).init(ctx);
+    var lazy_map = ComputedMap(u32, u32).init(ctx);
     defer lazy_map.deinit();
     for ([_]u32{ 0, 1, 2, 5, 9 }) |k| {
         try testing.expectEqual(eager_map.get(k).?, try lazy_map.getOrInsertWith(k, Factory(u32, u32).pure(timesThree)));
@@ -513,7 +523,7 @@ test "lazily/reactive_map: present set is monotone across reads" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SlotMap(u32, u32).init(ctx);
+    var map = ComputedMap(u32, u32).init(ctx);
     defer map.deinit();
 
     var sizes: [4]usize = undefined;
@@ -531,7 +541,7 @@ test "lazily/reactive_map: cell entries are writable inputs" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap(u32, u32).init(ctx);
+    var map = SourceMap(u32, u32).init(ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(u32, 7), try map.entry(7, 7));
@@ -546,7 +556,7 @@ test "lazily/reactive_map: cell map materialized on entry in any use" {
     defer ctx.deinit();
 
     const cell_keys = [_][]const u8{ "a", "b", "c" };
-    var map = CellMap([]const u8, u32).init(ctx);
+    var map = SourceMap([]const u8, u32).init(ctx);
     defer map.deinit();
     for (cell_keys) |k| _ = try map.entry(k, 0);
     try testing.expectEqual(EntryKind.cell, map.entryKind());
@@ -557,7 +567,7 @@ test "lazily/reactive_map: atomic move bumps order only, preserves membership + 
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap([]const u8, i32).init(ctx);
+    var map = SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
     _ = try map.entry("a", 1);
     _ = try map.entry("b", 2);
@@ -586,7 +596,7 @@ test "lazily/reactive_map: no-op move does not bump order" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap([]const u8, i32).init(ctx);
+    var map = SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
     _ = try map.entry("a", 1);
     _ = try map.entry("b", 2);
@@ -604,7 +614,7 @@ test "lazily/reactive_map: moveBefore / moveAfter place relative to anchor" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = CellMap(i32, i32).init(ctx);
+    var map = SourceMap(i32, i32).init(ctx);
     defer map.deinit();
     for ([_]i32{ 0, 1, 2, 3 }) |k| _ = try map.entry(k, k * 10);
     try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, map.keys());
@@ -625,25 +635,25 @@ test "lazily/reactive_map: moveBefore / moveAfter place relative to anchor" {
 test "lazily/reactive_map: invalidate flags match conformance contract" {
     try testing.expectEqual(
         InvalidateFlags{ .value = true, .membership = false, .order = false },
-        CellMap(u32, u32).invalidates(.set_value),
+        SourceMap(u32, u32).invalidates(.set_value),
     );
     try testing.expectEqual(
         InvalidateFlags{ .value = false, .membership = true, .order = true },
-        CellMap(u32, u32).invalidates(.insert),
+        SourceMap(u32, u32).invalidates(.insert),
     );
     try testing.expectEqual(
         InvalidateFlags{ .value = false, .membership = true, .order = true },
-        CellMap(u32, u32).invalidates(.remove),
+        SourceMap(u32, u32).invalidates(.remove),
     );
     try testing.expectEqual(
         InvalidateFlags{ .value = false, .membership = false, .order = true },
-        CellMap(u32, u32).invalidates(.move_to),
+        SourceMap(u32, u32).invalidates(.move_to),
     );
 }
 
 // ---------------------------------------------------------------------------
 // lazily-spec conformance fixture replay
-// `../lazily-spec/conformance/materialization/*.json` (model: SlotMap) — the
+// `../lazily-spec/conformance/materialization/*.json` (model: ComputedMap) — the
 // executable form of the `lazily-formal` Materialization theorems (mirrors
 // lazily-rs `tests/materialization_conformance.rs`). Eager = pre-mint loop
 // (`materializeAll`); lazy = mint-on-access (`getOrInsertWith`).
@@ -746,8 +756,8 @@ fn arrayItems(value: json.Value) ![]const json.Value {
     };
 }
 
-const Slots = SlotMap([]const u8, FV);
-const Cells = CellMap([]const u8, FV);
+const Slots = ComputedMap([]const u8, FV);
+const Cells = SourceMap([]const u8, FV);
 
 /// Shared checks for the two `spec.val` fixtures (all-slot maps): default mode
 /// eager, eager materializes all, observational transparency eager==lazy.
@@ -912,7 +922,7 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
 
     // Split the map's declared entries by kind: input cells vs derived slots.
     // A single ReactiveMap fixes one handle kind, so a mixed-kind fixture is
-    // modelled by a CellMap over the cell entries and a SlotMap over the slot
+    // modelled by a SourceMap over the cell entries and a ComputedMap over the slot
     // entries — sharing one logical key space (mirrors lazily-rs).
     const entries_obj = switch (try jsonFieldRequired(try jsonFieldRequired(fixture, "spec"), "entries")) {
         .object => |o| o,
@@ -989,4 +999,11 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
             try testing.expectEqual(want, try lazy_slots.getOrInsertWith(key, lookup.factory()));
         }
     }
+}
+
+test "lazily/reactive_map: deprecated CellMap/SlotMap aliases still resolve" {
+    try testing.expect(CellMap(u32, u32) == SourceMap(u32, u32));
+    try testing.expect(SlotMap(u32, u32) == ComputedMap(u32, u32));
+    try testing.expectEqual(EntryKind.cell, CellMap(u32, u32).kind);
+    try testing.expectEqual(EntryKind.slot, SlotMap(u32, u32).kind);
 }

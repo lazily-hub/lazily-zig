@@ -22,15 +22,15 @@ notes and platform carve-outs lives in
 | Feature | Rust | Python | Kotlin | JS | Dart | Zig | Go | C++ | C# |
 | --------- | :----: | :------: | :------: | :--: | :----: | :---: | :--: | :---: | :--: |
 | Reactive graph — two cell kinds (nodes `SourceCell` / `ComputedCell`; handles `Source<T, M>` / `Computed<T>`) + `Effect` sink + eager `Computed` (`computed().eager()`) / all cells guarded / batch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Keyed-map materialization (`SlotMap`) — mint-on-access derived slots: transparency + deferral (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Thread-safe keyed map (`ThreadSafeSlotMap`) — `Send + Sync` + materialization confluence (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Async keyed map (`AsyncSlotMap`) — eventual transparency (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Keyed-map materialization (`ComputedMap`) — mint-on-access derived slots: transparency + deferral (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Thread-safe keyed map (`ThreadSafeComputedMap`) — `Send + Sync` + materialization confluence (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Async keyed map (`AsyncComputedMap`) — eventual transparency (`#lzmatmode`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Keyed-map sync — membership propagation + materialize-on-ingest + derived-aggregate transparency (`#lzfamilysync`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Thread-safe context (lock-backed) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async reactive context | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Flat state machine | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Harel state charts | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Keyed reactive maps (`ReactiveMap`: `CellMap` / `SlotMap`) + `CellTree` + reconcile | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Keyed reactive maps (`ReactiveMap`: `SourceMap` / `ComputedMap`) + `CellTree` + reconcile | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Memoized semantic tree (`SemTree`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Stable-id alignment (manufactured identity) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Reactive queue (`QueueCell` SPSC/MPSC + `QueueStorage` adapter) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
@@ -83,11 +83,11 @@ replayed by in-source deterministic tests in each module.
 | `src/lazily/transport.zig` | Cross-process zero-copy transport (`#lzzcpy`): the `BlobBackend` adapter seam (vtable), `InProcessBackend` (wraps `ShmBlobArena`), `ArrowBackend` (Arrow IPC stream bytes), `ShmBackend` (genuine POSIX `shm_open`+`mmap` region, Linux — cross-process), `spillValue`/`spillState`/`spillMessage` policy + `resolveValue`, and the receiver-side `BlobRouter` (routes a descriptor to the backend of its `backend` kind). The backend-agnostic laws (`resolve_write` identity, `resolve_wrong_backend`, ABA generation safety, checksum rejection) are proven in `../lazily-formal/LazilyFormal/ZeroCopyTransport.lean` and replayed as in-source tests. |
 | `src/lazily/context.zig` | Reactive `Context` (lazy cache + mutex), `Slot`, `TrackingFrame`, `Context.batch(run)` boundary, and always-on `Instrumentation` counters (`node_allocations`, `slot_recomputes`, `dependency_edges_*`, `effect_queue_*`). |
 | `src/lazily/cell.zig` / `signal.zig` / `effect.zig` | The Cell kernel (`#lzcellkernel`): two concrete handles (no `Cell(T, K)` genus — `Cell` is the value-node concept only) — `Source(T[, M])` (written from outside; `set`/`merge` under merge policy `M`; `SourceCellWith(T, M)` for an explicit policy) and `Computed(T)` (computed from upstream; guarded + lazy, `.eager()` makes it eager). All cells are guarded — an equal write/recompute suppresses the cascade — so a separate `memo` is gone. `set`/`merge` are comptime-guarded to the source handle, so `computed.set(…)` does not compile (§3/§4). `Effect` is the value-less sink outside the hierarchy. Constructors `source` / `computed` / `.eager()` / `.lazy()`; `slot()` stays the non-guarded storage-value primitive; `cell`/`signal` retained as deprecated aliases (an eager `Computed` replaces the former standalone `Signal`). |
-| `src/lazily/reactive_map.zig` | `ReactiveMap` — the ONE unified keyed reactive map (`#reactivemap`) over a comptime `EntryKind` (`cell` input / `slot` derived), with reactive membership + order, atomic move, `getOrInsertWith` mint-on-access, and three-signal (value/membership/order) independence. `CellMap` = `ReactiveMap(K,V,.cell)` (cell-only `set` + eager value-minting `entry`); `SlotMap` = `ReactiveMap(K,V,.slot)` (lazy `getOrInsertWith` + eager pre-mint `materializeAll`; no `set`). No eager/lazy mode flag — eager = pre-mint loop, lazy = mint-on-access. Observationally transparent eager vs lazy; deferral-not-deallocation present-set monotonicity; entry-kind orthogonal to strategy. Replays `../lazily-spec/conformance/materialization/*.json`. |
+| `src/lazily/reactive_map.zig` | `ReactiveMap` — the ONE unified keyed reactive map (`#reactivemap`) over a comptime `EntryKind` (`cell` input / `slot` derived), with reactive membership + order, atomic move, `getOrInsertWith` mint-on-access, and three-signal (value/membership/order) independence. `SourceMap` = `ReactiveMap(K,V,.cell)` (cell-only `set` + eager value-minting `entry`); `ComputedMap` = `ReactiveMap(K,V,.slot)` (lazy `getOrInsertWith` + eager pre-mint `materializeAll`; no `set`). No eager/lazy mode flag — eager = pre-mint loop, lazy = mint-on-access. Observationally transparent eager vs lazy; deferral-not-deallocation present-set monotonicity; entry-kind orthogonal to strategy. Replays `../lazily-spec/conformance/materialization/*.json`. |
 | `src/lazily/thread_safe_context.zig` | `ThreadSafeContext` — a lock-backed, `Send`-shareable reactive context (distinct from the build-flag mutex on `Context`): id-keyed cells + computed slots in a standalone registry, all serialized by one `ParkingMutex`, reads returned by copy. Per-key runtime cells (type-erased storage + monomorphic recompute thunks) + closure-userdata computes are what let a keyed family ride a real context. |
-| `src/lazily/thread_safe_reactive_map.zig` | `ThreadSafeReactiveMap` (`ThreadSafeCellMap`/`ThreadSafeSlotMap`) — the `Send + Sync` flavor (`#reactivemap`): **rides on `ThreadSafeContext`** (every entry is a real reactive cell there), present-set behind a `ParkingMutex`. `getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager); cell-only `set`. Observational transparency + present-set monotonicity plus **materialization confluence** (`lazily-formal` `materialize_present_comm`/`materialize_observe_comm`). |
-| `src/lazily/async_reactive_map.zig` | `AsyncReactiveMap` (`AsyncCellMap`/`AsyncSlotMap`) — the async flavor (`#reactivemap`): **rides on `AsyncContext(V)`** — cell entries are async cells, slot entries genuine async slots (pending until `drive`/`settle`). `getOrInsertHandle`/`getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager). A **resolution axis** (`observe` returns `?V`, `null` while pending) giving **eventual transparency** (`lazily-formal` `AsyncMaterialization`). |
-| `src/lazily/cell_tree.zig` | `CellTree` — ordered keyed tree composing `CellMap` per level (atomic child move, per-level reactivity). |
+| `src/lazily/thread_safe_reactive_map.zig` | `ThreadSafeReactiveMap` (`ThreadSafeSourceMap`/`ThreadSafeComputedMap`) — the `Send + Sync` flavor (`#reactivemap`): **rides on `ThreadSafeContext`** (every entry is a real reactive cell there), present-set behind a `ParkingMutex`. `getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager); cell-only `set`. Observational transparency + present-set monotonicity plus **materialization confluence** (`lazily-formal` `materialize_present_comm`/`materialize_observe_comm`). |
+| `src/lazily/async_reactive_map.zig` | `AsyncReactiveMap` (`AsyncSourceMap`/`AsyncComputedMap`) — the async flavor (`#reactivemap`): **rides on `AsyncContext(V)`** — cell entries are async cells, slot entries genuine async slots (pending until `drive`/`settle`). `getOrInsertHandle`/`getOrInsertWith` mint-on-access (lazy) / `materializeAll` pre-mint (eager). A **resolution axis** (`observe` returns `?V`, `null` while pending) giving **eventual transparency** (`lazily-formal` `AsyncMaterialization`). |
+| `src/lazily/cell_tree.zig` | `CellTree` — ordered keyed tree composing `SourceMap` per level (atomic child move, per-level reactivity). |
 | `src/lazily/reconcile.zig` | LIS-move-minimized keyed reconciliation op-set (`DiffOp`, `reconcile`, `longestIncreasingSubsequence`). |
 | `src/lazily/sem_tree.zig` | `SemTree` — memoized semantic tree; an edit recomputes only the ancestor chain (sibling isolation + memo guard). |
 | `src/lazily/stable_id.zig` | Manufactured identity for text (FNV-1a content hashes, in-band anchors, word-LCS similarity alignment). |
@@ -267,14 +267,19 @@ Signal/Effect rerun (`lazily-spec/docs/reactive-graph.md` § batch).
 
 ### Keyed collections
 
-`CellMap(K, V)` is a keyed reactive collection with three independent reader
+`SourceMap(K, V)` is a keyed reactive collection with three independent reader
 classes (value / membership / order) — a value write never invalidates
 membership or order readers, and a pure reorder never invalidates membership or
 value readers. `moveTo` / `moveBefore` / `moveAfter` are atomic in-place
 reorders (the entry's handle and dependents survive). `CellTree(Id, V)`
-composes one `CellMap` per level for an ordered keyed tree. `reconcile(old,
+composes one `SourceMap` per level for an ordered keyed tree. `reconcile(old,
 new)` diffs two keyed sequences by stable key and emits the move-minimized
 `{insert, remove, move, update}` op-set (LIS over prior indices preserved).
+
+`SourceMap` / `ComputedMap` (and the `ThreadSafe*` / `Async*` flavors) were
+named `CellMap` / `SlotMap` before the v2 kernel renamed the node kinds to
+`Source` / `Computed`. The old names remain as deprecated aliases so existing
+callers keep compiling; use the new names in new code.
 
 ### CRDTs
 

@@ -25,7 +25,7 @@ pub fn TreeIdContext(comptime K: type) type {
 
 /// A CellTreeNode is one node of an ordered keyed tree. It carries a value
 /// cell and the per-level reactive membership/order versions (mirroring
-/// `CellMap`'s three-signal model). Child handles live in a non-reactive map
+/// `SourceMap`'s three-signal model). Child handles live in a non-reactive map
 /// kept in lockstep with `order`.
 ///
 /// Mirrors lazily-rs `CellTreeNode` (`cell_tree.rs:62-76`). Each node owns its

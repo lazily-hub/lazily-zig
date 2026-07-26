@@ -103,18 +103,27 @@ pub const compute_fortification_test = @import("./lazily/compute_fortification.z
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
-pub const CellMap = reactive_map.CellMap;
-pub const SlotMap = reactive_map.SlotMap;
+pub const SourceMap = reactive_map.SourceMap;
+pub const ComputedMap = reactive_map.ComputedMap;
 pub const EntryKind = reactive_map.EntryKind;
 pub const Factory = reactive_map.Factory;
 pub const CollectionOp = reactive_map.CollectionOp;
 pub const InvalidateFlags = reactive_map.InvalidateFlags;
 pub const ThreadSafeReactiveMap = @import("./lazily/thread_safe_reactive_map.zig").ThreadSafeReactiveMap;
-pub const ThreadSafeCellMap = @import("./lazily/thread_safe_reactive_map.zig").ThreadSafeCellMap;
-pub const ThreadSafeSlotMap = @import("./lazily/thread_safe_reactive_map.zig").ThreadSafeSlotMap;
+pub const ThreadSafeSourceMap = @import("./lazily/thread_safe_reactive_map.zig").ThreadSafeSourceMap;
+pub const ThreadSafeComputedMap = @import("./lazily/thread_safe_reactive_map.zig").ThreadSafeComputedMap;
 pub const AsyncReactiveMap = @import("./lazily/async_reactive_map.zig").AsyncReactiveMap;
-pub const AsyncCellMap = @import("./lazily/async_reactive_map.zig").AsyncCellMap;
-pub const AsyncSlotMap = @import("./lazily/async_reactive_map.zig").AsyncSlotMap;
+pub const AsyncSourceMap = @import("./lazily/async_reactive_map.zig").AsyncSourceMap;
+pub const AsyncComputedMap = @import("./lazily/async_reactive_map.zig").AsyncComputedMap;
+// Deprecated map aliases — the v2 kernel renamed the node kinds to `Source` /
+// `Computed`, so `CellMap` / `SlotMap` became `SourceMap` / `ComputedMap`.
+// Kept so existing callers keep compiling; prefer the new names.
+pub const CellMap = SourceMap;
+pub const SlotMap = ComputedMap;
+pub const ThreadSafeCellMap = ThreadSafeSourceMap;
+pub const ThreadSafeSlotMap = ThreadSafeComputedMap;
+pub const AsyncCellMap = AsyncSourceMap;
+pub const AsyncSlotMap = AsyncComputedMap;
 pub const queue = @import("./lazily/queue.zig");
 pub const QueueCell = queue.QueueCell;
 pub const QueueVersions = queue.QueueVersions;

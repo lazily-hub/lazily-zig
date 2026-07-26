@@ -9,8 +9,8 @@
 //! value axis.
 //!
 //! Two specializations mirror the single-threaded core:
-//! - **[`ThreadSafeCellMap`]** — input cells; adds cell-only `set`.
-//! - **[`ThreadSafeSlotMap`]** — derived slots; `getOrInsertWith` mints on first
+//! - **[`ThreadSafeSourceMap`]** — input cells; adds cell-only `set`.
+//! - **[`ThreadSafeComputedMap`]** — derived slots; `getOrInsertWith` mints on first
 //!   access (lazy), [`materializeAll`] pre-mints (eager). There is **no
 //!   eager/lazy mode flag** — eager = pre-mint, lazy = mint-on-access.
 //!
@@ -176,16 +176,26 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
 }
 
 /// A thread-safe **input-cell** map: every entry is a settable reactive cell.
-pub fn ThreadSafeCellMap(comptime K: type, comptime V: type) type {
+pub fn ThreadSafeSourceMap(comptime K: type, comptime V: type) type {
     return ThreadSafeReactiveMap(K, V, .cell);
 }
 
 /// A thread-safe **derived-slot** map: `getOrInsertWith` mints on first access
 /// (lazy), [`materializeAll`](ThreadSafeReactiveMap.materializeAll) pre-mints
 /// (eager).
-pub fn ThreadSafeSlotMap(comptime K: type, comptime V: type) type {
+pub fn ThreadSafeComputedMap(comptime K: type, comptime V: type) type {
     return ThreadSafeReactiveMap(K, V, .slot);
 }
+
+/// Deprecated: renamed to [`ThreadSafeSourceMap`] when the v2 kernel renamed the
+/// node kinds to `Source` / `Computed`. Kept as an alias so existing callers
+/// keep compiling; use `ThreadSafeSourceMap` in new code.
+pub const ThreadSafeCellMap = ThreadSafeSourceMap;
+
+/// Deprecated: renamed to [`ThreadSafeComputedMap`] when the v2 kernel renamed
+/// the node kinds to `Source` / `Computed`. Kept as an alias so existing callers
+/// keep compiling; use `ThreadSafeComputedMap` in new code.
+pub const ThreadSafeSlotMap = ThreadSafeComputedMap;
 
 // ---------------------------------------------------------------------------
 // Tests — mirror lazily-rs `src/thread_safe_reactive_family.rs`, which names the
@@ -208,13 +218,13 @@ fn identity(k: u32) u32 {
     return k;
 }
 
-const SlotMapU32 = ThreadSafeSlotMap(u32, u32);
-const CellMapBool = ThreadSafeCellMap(u32, bool);
+const ComputedMapU32 = ThreadSafeComputedMap(u32, u32);
+const SourceMapBool = ThreadSafeSourceMap(u32, bool);
 
 test "lazily/thread_safe_reactive_map: eager cell map materializes all via set" {
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var map = CellMapBool.init(&ctx);
+    var map = SourceMapBool.init(&ctx);
     defer map.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| try map.set(k, true);
 
@@ -230,7 +240,7 @@ test "lazily/thread_safe_reactive_map: eager cell map materializes all via set" 
 test "lazily/thread_safe_reactive_map: lazy slot map defers until read" {
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var map = SlotMapU32.init(&ctx);
+    var map = ComputedMapU32.init(&ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(usize, 0), map.presentCount());
@@ -244,7 +254,7 @@ test "lazily/thread_safe_reactive_map: lazy slot map defers until read" {
 test "lazily/thread_safe_reactive_map: eager materializeAll materializes all at build" {
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var map = SlotMapU32.init(&ctx);
+    var map = ComputedMapU32.init(&ctx);
     defer map.deinit();
     try map.materializeAll(&.{ 7, 8 }, Factory(u32, u32).pure(timesTen));
     try testing.expectEqual(@as(usize, 2), map.presentCount());
@@ -253,10 +263,10 @@ test "lazily/thread_safe_reactive_map: eager materializeAll materializes all at 
 test "lazily/thread_safe_reactive_map: observational transparency eager == lazy" {
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var eager_map = SlotMapU32.init(&ctx);
+    var eager_map = ComputedMapU32.init(&ctx);
     defer eager_map.deinit();
     try eager_map.materializeAll(&.{ 1, 2, 3 }, Factory(u32, u32).pure(timesTwo));
-    var lazy_map = SlotMapU32.init(&ctx);
+    var lazy_map = ComputedMapU32.init(&ctx);
     defer lazy_map.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| {
         try testing.expectEqual(eager_map.observe(k).?, try lazy_map.getOrInsertWith(k, Factory(u32, u32).pure(timesTwo)));
@@ -266,7 +276,7 @@ test "lazily/thread_safe_reactive_map: observational transparency eager == lazy"
 test "lazily/thread_safe_reactive_map: present set grows monotonically" {
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var map = SlotMapU32.init(&ctx);
+    var map = ComputedMapU32.init(&ctx);
     defer map.deinit();
     _ = try map.getOrInsertWith(5, Factory(u32, u32).pure(identity));
     _ = try map.getOrInsertWith(5, Factory(u32, u32).pure(identity)); // repeat: no growth
@@ -280,7 +290,7 @@ test "lazily/thread_safe_reactive_map: present set grows monotonically" {
 test "lazily/thread_safe_reactive_map: cell map set overwrites value in place" {
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var map = CellMapBool.init(&ctx);
+    var map = SourceMapBool.init(&ctx);
     defer map.deinit();
     try map.set(10, true);
     try map.set(20, true);
@@ -296,7 +306,7 @@ test "lazily/thread_safe_reactive_map: cell map set overwrites value in place" {
 // (materialize_present_comm / materialize_observe_comm). Only meaningful when
 // the build links threading; guard on single-threaded targets.
 const Soak = struct {
-    map: *SlotMapU32,
+    map: *ComputedMapU32,
     lo: u32,
     hi: u32,
 
@@ -315,7 +325,7 @@ test "lazily/thread_safe_reactive_map: concurrent materialization is confluent" 
     if (builtin.single_threaded) return error.SkipZigTest;
     var ctx = ThreadSafeContext.init(testing.allocator);
     defer ctx.deinit();
-    var map = SlotMapU32.init(&ctx);
+    var map = ComputedMapU32.init(&ctx);
     defer map.deinit();
 
     const N = 4;
@@ -336,4 +346,9 @@ test "lazily/thread_safe_reactive_map: concurrent materialization is confluent" 
         // thread materialized it first.
         try testing.expectEqual(k * 2, map.observe(k).?);
     }
+}
+
+test "lazily/thread_safe_reactive_map: deprecated ThreadSafeCellMap/ThreadSafeSlotMap aliases still resolve" {
+    try testing.expect(ThreadSafeCellMap(u32, u32) == ThreadSafeSourceMap(u32, u32));
+    try testing.expect(ThreadSafeSlotMap(u32, u32) == ThreadSafeComputedMap(u32, u32));
 }
