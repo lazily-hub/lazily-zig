@@ -29,6 +29,23 @@ fn jsonU64(value: std.json.Value) !u64 {
     };
 }
 
+fn jsonRequireOnly(value: std.json.Value, allowed: []const []const u8) !void {
+    var iterator = switch (value) {
+        .object => |object| object.iterator(),
+        else => return error.ExpectedObject,
+    };
+    while (iterator.next()) |entry| {
+        var known = false;
+        for (allowed) |name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.UnexpectedField;
+    }
+}
+
 /// Signaling protocol wire types (`lazily-spec/protocol.md § Signaling
 /// Protocol (WebSocket)`). Type discriminator is `"type"`; variants are
 /// kebab-case. The `from` field on every forwarded frame is the sender
@@ -105,6 +122,7 @@ pub const ClientMessage = union(ClientTag) {
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !ClientMessage {
         return switch (try ClientTag.fromWireName(try jsonStr(try jsonField(value, "type")))) {
             .join => blk: {
+                try jsonRequireOnly(value, &.{ "type", "peer", "capabilities" });
                 var caps: ?[]const []const u8 = null;
                 if (jsonGet(value, "capabilities")) |raw| {
                     const items = switch (raw) {
@@ -121,17 +139,32 @@ pub const ClientMessage = union(ClientTag) {
                     .capabilities = caps,
                 } };
             },
-            .offer => .{ .offer = try sdpFromJson(value) },
-            .answer => .{ .answer = try sdpFromJson(value) },
-            .ice => .{ .ice = .{
-                .to = try jsonU64(try jsonField(value, "to")),
-                .candidate = try jsonStr(try jsonField(value, "candidate")),
-            } },
-            .relay => .{ .relay = .{
-                .to = try jsonU64(try jsonField(value, "to")),
-                .payload = try jsonField(value, "payload"),
-            } },
-            .leave => .leave,
+            .offer => blk: {
+                try jsonRequireOnly(value, &.{ "type", "to", "sdp" });
+                break :blk .{ .offer = try sdpFromJson(value) };
+            },
+            .answer => blk: {
+                try jsonRequireOnly(value, &.{ "type", "to", "sdp" });
+                break :blk .{ .answer = try sdpFromJson(value) };
+            },
+            .ice => blk: {
+                try jsonRequireOnly(value, &.{ "type", "to", "candidate" });
+                break :blk .{ .ice = .{
+                    .to = try jsonU64(try jsonField(value, "to")),
+                    .candidate = try jsonStr(try jsonField(value, "candidate")),
+                } };
+            },
+            .relay => blk: {
+                try jsonRequireOnly(value, &.{ "type", "to", "payload" });
+                break :blk .{ .relay = .{
+                    .to = try jsonU64(try jsonField(value, "to")),
+                    .payload = try jsonField(value, "payload"),
+                } };
+            },
+            .leave => blk: {
+                try jsonRequireOnly(value, &.{"type"});
+                break :blk .leave;
+            },
         };
     }
 
@@ -273,6 +306,7 @@ pub const ServerMessage = union(ServerTag) {
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !ServerMessage {
         return switch (try ServerTag.fromWireName(try jsonStr(try jsonField(value, "type")))) {
             .welcome => blk: {
+                try jsonRequireOnly(value, &.{ "type", "peer", "peers" });
                 const items = switch (try jsonField(value, "peers")) {
                     .array => |a| a.items,
                     else => return error.ExpectedArray,
@@ -280,27 +314,52 @@ pub const ServerMessage = union(ServerTag) {
                 const peers = try allocator.alloc(ipc.PeerId, items.len);
                 errdefer allocator.free(peers);
                 for (items, peers) |item, *slot| slot.* = try jsonU64(item);
+                const peer = try jsonU64(try jsonField(value, "peer"));
+                for (peers) |roster_peer| {
+                    if (roster_peer == peer) return error.WelcomeRosterContainsSelf;
+                }
                 break :blk .{ .welcome = .{
-                    .peer = try jsonU64(try jsonField(value, "peer")),
+                    .peer = peer,
                     .peers = peers,
                 } };
             },
-            .peer_joined => .{ .peer_joined = .{ .peer = try jsonU64(try jsonField(value, "peer")) } },
-            .peer_left => .{ .peer_left = .{ .peer = try jsonU64(try jsonField(value, "peer")) } },
-            .offer => .{ .offer = try fromSdpFromJson(value) },
-            .answer => .{ .answer = try fromSdpFromJson(value) },
-            .ice => .{ .ice = .{
-                .from = try jsonU64(try jsonField(value, "from")),
-                .candidate = try jsonStr(try jsonField(value, "candidate")),
-            } },
-            .relay => .{ .relay = .{
-                .from = try jsonU64(try jsonField(value, "from")),
-                .payload = try jsonField(value, "payload"),
-            } },
-            .error_msg => .{ .error_msg = .{
-                .code = try jsonStr(try jsonField(value, "code")),
-                .message = try jsonStr(try jsonField(value, "message")),
-            } },
+            .peer_joined => blk: {
+                try jsonRequireOnly(value, &.{ "type", "peer" });
+                break :blk .{ .peer_joined = .{ .peer = try jsonU64(try jsonField(value, "peer")) } };
+            },
+            .peer_left => blk: {
+                try jsonRequireOnly(value, &.{ "type", "peer" });
+                break :blk .{ .peer_left = .{ .peer = try jsonU64(try jsonField(value, "peer")) } };
+            },
+            .offer => blk: {
+                try jsonRequireOnly(value, &.{ "type", "from", "sdp" });
+                break :blk .{ .offer = try fromSdpFromJson(value) };
+            },
+            .answer => blk: {
+                try jsonRequireOnly(value, &.{ "type", "from", "sdp" });
+                break :blk .{ .answer = try fromSdpFromJson(value) };
+            },
+            .ice => blk: {
+                try jsonRequireOnly(value, &.{ "type", "from", "candidate" });
+                break :blk .{ .ice = .{
+                    .from = try jsonU64(try jsonField(value, "from")),
+                    .candidate = try jsonStr(try jsonField(value, "candidate")),
+                } };
+            },
+            .relay => blk: {
+                try jsonRequireOnly(value, &.{ "type", "from", "payload" });
+                break :blk .{ .relay = .{
+                    .from = try jsonU64(try jsonField(value, "from")),
+                    .payload = try jsonField(value, "payload"),
+                } };
+            },
+            .error_msg => blk: {
+                try jsonRequireOnly(value, &.{ "type", "code", "message" });
+                break :blk .{ .error_msg = .{
+                    .code = try jsonStr(try jsonField(value, "code")),
+                    .message = try jsonStr(try jsonField(value, "message")),
+                } };
+            },
         };
     }
 

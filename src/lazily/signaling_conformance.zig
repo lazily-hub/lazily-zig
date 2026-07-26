@@ -191,6 +191,25 @@ test "signaling conformance: frames.json" {
         }
     }
 
+    const rejects = try cj.asArray(try cj.required(parsed.value, "rejects"));
+    for (rejects) |reject| {
+        const direction = try cj.asStr(try cj.required(reject, "direction"));
+        const wire = try cj.required(reject, "wire");
+        if (std.mem.eql(u8, direction, "client")) {
+            if (signaling.ClientMessage.fromJson(allocator, wire)) |message| {
+                defer message.deinitDecoded(allocator);
+                return error.RejectedClientFrameWasAccepted;
+            } else |_| {}
+        } else if (std.mem.eql(u8, direction, "server")) {
+            if (signaling.ServerMessage.fromJson(allocator, wire)) |message| {
+                defer message.deinitDecoded(allocator);
+                return error.RejectedServerFrameWasAccepted;
+            } else |_| {}
+        } else {
+            return error.UnknownFrameDirection;
+        }
+    }
+
     // Both halves of the protocol must actually have been exercised.
     try testing.expect(client_frames > 0 and server_frames > 0);
     try testing.expect(assertions_checked > 0);
@@ -337,4 +356,14 @@ test "signaling conformance: anti_spoof_session.json" {
     // produced frames of each kind.
     try testing.expect(rosters_seen > 0);
     try testing.expect(forwards_seen > 0);
+
+    const rejects = try cj.asArray(try cj.required(fixture, "rejects"));
+    for (rejects) |reject| {
+        const input = try cj.required(reject, "input");
+        const recv = try cj.required(input, "recv");
+        if (signaling.ClientMessage.fromJson(allocator, recv)) |message| {
+            defer message.deinitDecoded(allocator);
+            return error.RejectedClientFrameWasAccepted;
+        } else |_| {}
+    }
 }
