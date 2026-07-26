@@ -157,6 +157,33 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    const interop_peer = b.addExecutable(.{
+        .name = "lazily-interop-peer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/interop_peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lazily", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(interop_peer);
+    const interop_peer_step = b.step("interop-peer", "Run the Lazily interop peer");
+    const interop_peer_run = b.addRunArtifact(interop_peer);
+    interop_peer_step.dependOn(&interop_peer_run.step);
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| interop_peer_run.addArgs(args);
+    }
+
+    const interop_peer_check = b.step(
+        "interop-peer-check",
+        "Run the Lazily interop peer contract self-check",
+    );
+    const interop_peer_check_run = b.addRunArtifact(interop_peer);
+    interop_peer_check_run.addArg("--self-check");
+    interop_peer_check.dependOn(&interop_peer_check_run.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -191,6 +218,11 @@ pub fn build(b: *std.Build) void {
         "Test name filters",
     );
     const filters = cli_filters orelse &.{};
+    const conformance_manifest = b.option(
+        []const u8,
+        "conformance-manifest",
+        "Absolute runtime conformance evidence path",
+    ) orelse b.graph.environ_map.get("LAZILY_CONFORMANCE_MANIFEST");
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -398,7 +430,7 @@ pub fn build(b: *std.Build) void {
     // cached run skips the binary entirely and would leave the freshly
     // truncated manifest empty — reported downstream as missing evidence, which
     // is correct but useless. Collecting evidence requires actually running.
-    if (b.graph.environ_map.get("LAZILY_CONFORMANCE_MANIFEST")) |manifest_path| {
+    if (conformance_manifest) |manifest_path| {
         for (run_test.dependencies.items) |dep| {
             // `Step` spells its kind `id` on 0.16.0 and `tag` on nightly. Both
             // toolchains gate CI, so this reads through a `@hasField` shim

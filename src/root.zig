@@ -347,6 +347,7 @@ pub const StateGraphMirror = state_mirror.StateGraphMirror;
 pub const crdt_plane = @import("./lazily/crdt_plane.zig");
 pub const CrdtPlane = crdt_plane.CrdtPlane;
 pub const CrdtPlaneRuntime = crdt_plane.CrdtPlaneRuntime;
+pub const ConvergedEntry = crdt_plane.ConvergedEntry;
 pub const OpLog = crdt_plane.OpLog;
 pub const PlaneLwwCell = crdt_plane.PlaneLwwCell;
 pub const webrtc_transport = @import("./lazily/webrtc_transport.zig");

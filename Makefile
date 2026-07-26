@@ -10,17 +10,22 @@ CONFORMANCE_MANIFEST ?= $(CURDIR)/build/conformance-fixtures-loaded.txt
 
 .PHONY: \
 	check \
-	test \
-	test-lean-formal
+test \
+test-interop-peer \
+test-lean-formal
 
-check: test test-lean-formal conformance-coverage
+check: test test-interop-peer test-lean-formal conformance-coverage
 
 # Truncate once here, then let every test binary APPEND. The recorder is a no-op
 # when LAZILY_CONFORMANCE_MANIFEST is unset, so a bare `zig build test` (or
 # `mise run test`) is unaffected by any of this.
 test:
 	@mkdir -p $(dir $(CONFORMANCE_MANIFEST)) && : > $(CONFORMANCE_MANIFEST)
-	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) $(ZIG) build test
+	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) $(ZIG) build test \
+		-Dconformance-manifest=$(CONFORMANCE_MANIFEST)
+
+test-interop-peer:
+	$(ZIG) build interop-peer-check
 
 # Verify the formal model (lazily-formal) builds cleanly. This is the
 # executable reference behind the state-chart and collection conformance
@@ -37,5 +42,5 @@ test-lean-formal:
 # canonical fixture's bytes were never opened by the suite. Depends on `test`
 # having just run with the recorder attached — a missing manifest is missing
 # evidence and fails.
-conformance-coverage:
+conformance-coverage: test
 	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) ./scripts/check-conformance-coverage.sh

@@ -127,6 +127,13 @@ pub const PlaneLwwCell = struct {
     key: ?NodeKey = null,
 };
 
+/// One address's winning production-plane payload, in canonical snapshot order.
+pub const ConvergedEntry = struct {
+    node: NodeId,
+    key: ?NodeKey,
+    state: IpcValue,
+};
+
 /// Locally-private base for minted family entry node ids (`#lzfamilysync`), set
 /// far above any application-registered id so a materialized family entry can
 /// never collide with an app cell. Mirrors lazily-rs `FAMILY_NODE_BASE`.
@@ -421,6 +428,32 @@ pub const CrdtPlaneRuntime = struct {
         const frontier = try self.wireFrontier(allocator);
         const ops = try allocator.dupe(CrdtOp, self.log.ops.items);
         return CrdtSync.init(frontier, ops);
+    }
+
+    /// Return the winning state per `(node, key)`, sorted by node then key with
+    /// null keys first. This is a projection of the production LWW cell map,
+    /// not a second interop-only merge implementation.
+    pub fn converged(self: *const CrdtPlaneRuntime, allocator: std.mem.Allocator) ![]ConvergedEntry {
+        var entries = try std.ArrayList(ConvergedEntry).initCapacity(allocator, self.cells.count());
+        errdefer entries.deinit(allocator);
+        var iterator = self.cells.iterator();
+        while (iterator.next()) |entry| {
+            const state = entry.value_ptr.state orelse continue;
+            try entries.append(allocator, .{
+                .node = entry.key_ptr.*,
+                .key = entry.value_ptr.key,
+                .state = state,
+            });
+        }
+        std.mem.sort(ConvergedEntry, entries.items, {}, struct {
+            fn lessThan(_: void, left: ConvergedEntry, right: ConvergedEntry) bool {
+                if (left.node != right.node) return left.node < right.node;
+                if (left.key == null) return right.key != null;
+                if (right.key == null) return false;
+                return std.mem.lessThan(u8, left.key.?, right.key.?);
+            }
+        }.lessThan);
+        return entries.toOwnedSlice(allocator);
     }
 };
 
