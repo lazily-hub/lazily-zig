@@ -2205,7 +2205,17 @@ pub fn normalizeCompute(comptime Ret: type, comptime f: anytype) *const fn (*Com
         .@"fn" => FT,
         else => @compileError("normalizeCompute expects a function or function pointer, got " ++ @typeName(FT)),
     };
-    const P0 = @typeInfo(FnType).@"fn".param_types[0].?;
+    // Zig renamed the parameter reflection between 0.16 and 0.17-dev:
+    // `params: []const Param` (with `.type: ?type`) became
+    // `param_types: []const ?type` plus a parallel `param_attrs`. Both shapes
+    // are read here so one source tree compiles on the pinned toolchains and on
+    // nightly — the branch not taken is never analyzed, because the condition is
+    // comptime-known.
+    const fn_info = @typeInfo(FnType).@"fn";
+    const P0 = if (@hasField(@TypeOf(fn_info), "param_types"))
+        fn_info.param_types[0].?
+    else
+        fn_info.params[0].type.?;
     if (P0 == *Compute) {
         return @as(*const fn (*Compute) anyerror!Ret, f);
     } else if (P0 == *Context) {

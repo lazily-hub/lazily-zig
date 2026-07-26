@@ -11,23 +11,26 @@ jobs:
   # ---------------------------------------------------------------------------
   # Zig build + test, across the toolchains this repo claims to support.
   #
-  # `master` is deliberately NOT a gate. zig master has already gutted
-  # `std.posix`/`std.fs` under this repo once (which is why parts of the code
-  # reach for `std.os.linux` raw syscalls), and a main branch that is red
-  # because of an upstream commit nobody here made is a branch people learn to
-  # ignore. It runs as an early-warning signal instead.
+  # 0.16.0 and `master` (nightly, currently 0.17.0-dev) are both gates.
   #
-  # 0.15.2 is also non-gating, but for a different reason: the tree does not
-  # currently compile there (`std.testing.io` in reliable_sync.zig and the `O`
-  # flags struct in transport.zig both postdate it). That is pre-existing and
-  # is tracked separately from the observer-semantics migration; the job is
-  # kept so the gap stays visible rather than being silently dropped.
+  # `master` was previously non-gating on the reasoning that a main branch red
+  # from an upstream commit nobody here made is a branch people learn to ignore.
+  # That reasoning cuts the other way now: development happens ON nightly, so
+  # nightly is the toolchain most likely to be exercised and least likely to be
+  # noticed when it rots. It is gating because the alternative in practice was
+  # nightly-only code reaching main and breaking the 0.16.0 gate instead —
+  # `Type.Fn.param_types` (nightly) vs `Type.Fn.params` (0.16.0) did exactly
+  # that. Version-sensitive reflection belongs behind a `@hasField` shim so one
+  # tree satisfies both; see `normalizeCompute` in src/lazily/context.zig.
   #
-  # 0.16.0 is the real gate.
+  # 0.15.2 stays non-gating: the tree does not compile there at all
+  # (`std.testing.io` in reliable_sync.zig, a comptime dependency loop in
+  # cell.zig). That is pre-existing and tracked separately; the job is kept so
+  # the gap stays visible rather than being silently dropped.
   test:
     name: Zig ${{ matrix.zig }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.zig != '0.16.0' }}
+    continue-on-error: ${{ matrix.zig == '0.15.2' }}
     strategy:
       fail-fast: false
       matrix:
