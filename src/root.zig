@@ -103,6 +103,13 @@ pub const compute_fortification_test = @import("./lazily/compute_fortification.z
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const keyed_order = @import("./lazily/keyed_order.zig");
 pub const collections_family_conformance = @import("./lazily/collections_family_conformance.zig");
+// Canonical replays for the fixtures this binding used to assert with inline
+// mirrors (`#lazilyzigconformance`). Referenced here so `refAllDecls` pulls
+// their tests into the root test binary.
+pub const conformance_json = @import("./lazily/conformance_json.zig");
+pub const collections_conformance = @import("./lazily/collections_conformance.zig");
+pub const distributed_conformance = @import("./lazily/distributed_conformance.zig");
+pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
 pub const SourceMap = reactive_map.SourceMap;

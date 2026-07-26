@@ -237,98 +237,25 @@ pub fn assignStableKeys(allocator: std.mem.Allocator, old: []const Block, new: [
 }
 
 // ---------------------------------------------------------------------------
-// Tests (mirror stableid_alignment.json scenarios)
+// Tests. All six `stableid_alignment.json` scenarios are replayed from the
+// canonical corpus in `collections_conformance.zig`. What remains here is the
+// keyspace-disjointness rule, which the corpus states in prose but no scenario
+// exercises.
 // ---------------------------------------------------------------------------
 
-test "lazily/stable_id: content key survives reflow but not edit" {
-    try std.testing.expectEqual(
-        contentHash("the quick brown fox"),
-        contentHash("the   quick\n  brown   fox\n"),
-    );
-    try std.testing.expect(contentHash("the quick brown fox") != contentHash("the quick red fox"));
-}
+test "lazily/stable_id: the a:/c: prefixes keep the two keyspaces disjoint" {
+    // An anchor that happens to spell a content key's hex must not collide with
+    // it — that is the whole reason the prefixes exist.
+    const content = BlockKey.fromBlock(.{ .text = "some prose" });
+    var content_buf: [64]u8 = undefined;
+    const content_str = content.writeString(&content_buf);
+    try std.testing.expect(content_str[0] == 'c' and content_str[1] == ':');
 
-test "lazily/stable_id: anchored key survives full body rewrite" {
-    const a = Block{ .anchor = "item-1", .text = "original body" };
-    const b = Block{ .anchor = "item-1", .text = "completely different prose now" };
-    try std.testing.expect(BlockKey.fromBlock(a).eqlString(BlockKey.fromBlock(b)));
-}
+    const anchored = BlockKey{ .anchored = content_str[2..] };
+    var anchored_buf: [64]u8 = undefined;
+    const anchored_str = anchored.writeString(&anchored_buf);
+    try std.testing.expect(anchored_str[0] == 'a' and anchored_str[1] == ':');
 
-test "lazily/stable_id: pure reorder is all Same, no removed" {
-    const allocator = std.testing.allocator;
-    const old = [_]Block{
-        .{ .text = "alpha" },
-        .{ .text = "beta" },
-        .{ .text = "gamma" },
-    };
-    const new = [_]Block{
-        .{ .text = "gamma" },
-        .{ .text = "alpha" },
-        .{ .text = "beta" },
-    };
-    var al = try alignBlocks(allocator, &old, &new);
-    defer al.deinit();
-    try std.testing.expect(al.new_matches[0] == .same and al.new_matches[0].same == 2);
-    try std.testing.expect(al.new_matches[1] == .same and al.new_matches[1].same == 0);
-    try std.testing.expect(al.new_matches[2] == .same and al.new_matches[2].same == 1);
-    try std.testing.expectEqual(@as(usize, 0), al.removed.len);
-}
-
-test "lazily/stable_id: small edit is Edited not Insert+Remove" {
-    const allocator = std.testing.allocator;
-    const old = [_]Block{
-        .{ .text = "the quick brown fox jumps over the lazy dog" },
-    };
-    const new = [_]Block{
-        .{ .text = "the quick brown fox jumps over the sleepy dog" },
-    };
-    var al = try alignBlocks(allocator, &old, &new);
-    defer al.deinit();
-    try std.testing.expect(al.new_matches[0] == .edited);
-    try std.testing.expect(al.new_matches[0].edited.old == 0);
-    try std.testing.expect(al.new_matches[0].edited.similarity >= 0.5);
-    try std.testing.expectEqual(@as(usize, 0), al.removed.len);
-}
-
-test "lazily/stable_id: genuine insert and remove" {
-    const allocator = std.testing.allocator;
-    const old = [_]Block{
-        .{ .text = "keep me" },
-        .{ .text = "delete me entirely" },
-    };
-    const new = [_]Block{
-        .{ .text = "keep me" },
-        .{ .text = "brand new unrelated content here" },
-    };
-    var al = try alignBlocks(allocator, &old, &new);
-    defer al.deinit();
-    try std.testing.expect(al.new_matches[0] == .same and al.new_matches[0].same == 0);
-    try std.testing.expect(al.new_matches[1] == .inserted);
-    try std.testing.expectEqual(@as(usize, 1), al.removed.len);
-    try std.testing.expectEqual(@as(usize, 1), al.removed[0]);
-}
-
-test "lazily/stable_id: assign_stable_keys flows identity through edit" {
-    const allocator = std.testing.allocator;
-    const old = [_]Block{
-        .{ .text = "first paragraph stays the same" },
-        .{ .text = "second paragraph will be tweaked a little" },
-    };
-    const new = [_]Block{
-        .{ .text = "second paragraph will be tweaked a bit" },
-        .{ .text = "first paragraph stays the same" },
-    };
-    const keys = try assignStableKeys(allocator, &old, &new);
-    defer {
-        for (keys) |k| allocator.free(k);
-        allocator.free(keys);
-    }
-    // new[0] (edited second) inherits old[1]'s key; new[1] (same first) inherits old[0]'s key.
-    var old_key_bufs: [2][256]u8 = undefined;
-    const old_keys = [_][]const u8{
-        BlockKey.fromBlock(old[0]).writeString(&old_key_bufs[0]),
-        BlockKey.fromBlock(old[1]).writeString(&old_key_bufs[1]),
-    };
-    try std.testing.expectEqualStrings(old_keys[1], keys[0]);
-    try std.testing.expectEqualStrings(old_keys[0], keys[1]);
+    try std.testing.expect(!content.eqlString(anchored));
+    try std.testing.expect(!std.mem.eql(u8, content_str, anchored_str));
 }

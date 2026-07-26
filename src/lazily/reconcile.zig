@@ -156,7 +156,11 @@ pub fn reconcile(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (mirror keyed_reconciliation_lis.json)
+// Tests. `keyed_reconciliation_lis.json` is replayed from the canonical corpus
+// in `collections_conformance.zig` — including the part the mirror here could
+// not express, that a stable key's value cell survives a sibling reorder
+// uninvalidated. What remains below is move-minimization on inputs the corpus
+// does not carry.
 // ---------------------------------------------------------------------------
 
 test "lazily/reconcile: longestIncreasingSubsequence basic" {
@@ -166,30 +170,6 @@ test "lazily/reconcile: longestIncreasingSubsequence basic" {
     defer allocator.free(lis);
     // LIS is [1,2,3] → indices [0,1,3].
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3 }, lis);
-}
-
-test "lazily/reconcile: prior [a,b,c,d] -> target [b,c,a] emits {remove d, move a}" {
-    const allocator = std.testing.allocator;
-    const old = [_]KV([]const u8, i32){
-        .{ .key = "a", .value = 1 },
-        .{ .key = "b", .value = 2 },
-        .{ .key = "c", .value = 3 },
-        .{ .key = "d", .value = 4 },
-    };
-    const new = [_]KV([]const u8, i32){
-        .{ .key = "b", .value = 2 },
-        .{ .key = "c", .value = 3 },
-        .{ .key = "a", .value = 1 },
-    };
-    const ops = try reconcile([]const u8, i32, allocator, &old, &new);
-    defer allocator.free(ops);
-
-    // Exactly 2 ops: remove d, move a (b and c are stable — in LIS).
-    try std.testing.expectEqual(@as(usize, 2), ops.len);
-    try std.testing.expect(ops[0] == .remove);
-    try std.testing.expectEqualStrings("d", ops[0].remove.key);
-    try std.testing.expect(ops[1] == .move);
-    try std.testing.expectEqualStrings("a", ops[1].move.key);
 }
 
 test "lazily/reconcile: pure reversal is minimal (n-1 moves for n keys)" {

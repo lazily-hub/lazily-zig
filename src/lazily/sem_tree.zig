@@ -163,8 +163,15 @@ fn findInChildren(comptime Id: type, comptime V: type, node: *SourceTreeNode(Id,
 }
 
 // ---------------------------------------------------------------------------
-// Folds used by the tests / conformance fixture replay.
+// Tests. All three `semtree_incremental.json` scenarios are replayed from the
+// canonical corpus in `collections_conformance.zig`, each against the tree the
+// fixture actually declares. The mirrors that used to live here shared ONE
+// hand-built tree across all three — including the removal scenario, whose
+// canonical tree has a different shape and only coincidentally the same totals.
+// That is the drift a hand-transcribed fixture cannot report.
 // ---------------------------------------------------------------------------
+
+const Tree = SourceTree([]const u8, i64);
 
 fn sumFoldI64(node_value: i64, child_deriveds: []const i64) i64 {
     var total = node_value;
@@ -172,81 +179,19 @@ fn sumFoldI64(node_value: i64, child_deriveds: []const i64) i64 {
     return total;
 }
 
-fn countPositiveFoldI64(node_value: i64, child_deriveds: []const i64) i64 {
-    var total: i64 = if (node_value > 0) 1 else 0;
-    for (child_deriveds) |d| total += d;
-    return total;
-}
-
-// ---------------------------------------------------------------------------
-// Tests (mirror semtree_incremental.json scenarios)
-// ---------------------------------------------------------------------------
-
-const Tree = SourceTree([]const u8, i64);
-const Node = SourceTreeNode([]const u8, i64);
-
-fn buildSampleTree(allocator: std.mem.Allocator) !Tree {
-    var t = try Tree.init(allocator, "root", 0);
-    errdefer t.deinit();
-    const a = try t.root.insertChild("a", 1);
-    _ = try a.insertChild("a1", 10);
-    _ = try a.insertChild("a2", 20);
-    const b = try t.root.insertChild("b", 2);
-    _ = try b.insertChild("b1", 100);
-    return t;
-}
-
-test "lazily/sem_tree: folds whole subtree; edit recomputes only ancestor chain" {
-    const allocator = std.testing.allocator;
-    var tree = try buildSampleTree(allocator);
-    defer tree.deinit();
-
-    var sem = try SemTree([]const u8, i64, i64).build(allocator, tree.root, sumFoldI64);
-    defer sem.deinit();
-
-    try std.testing.expectEqual(@as(i64, 133), sem.nodeValue("root").?);
-    try std.testing.expectEqual(@as(i64, 31), sem.nodeValue("a").?);
-    try std.testing.expectEqual(@as(i64, 102), sem.nodeValue("b").?);
-
-    const a_count_before = sem.recomputeCount("a");
-    try sem.applyEdit(tree.root, "b1", 200);
-
-    try std.testing.expectEqual(@as(i64, 233), sem.nodeValue("root").?);
-    try std.testing.expectEqual(@as(i64, 202), sem.nodeValue("b").?);
-    try std.testing.expectEqual(@as(i64, 31), sem.nodeValue("a").?);
-    // Sibling isolation: a was NOT recomputed.
-    try std.testing.expectEqual(a_count_before, sem.recomputeCount("a"));
-}
-
-test "lazily/sem_tree: memo guard stops propagation when result unchanged" {
+test "lazily/sem_tree: editing a node that is not in the tree is an error, not a silent no-op" {
+    // Not in the corpus: every fixture scenario edits a node that exists, so
+    // the not-found path has no canonical coverage.
     const allocator = std.testing.allocator;
     var tree = try Tree.init(allocator, "root", 0);
     defer tree.deinit();
-    _ = try tree.root.insertChild("a", -1);
-    _ = try tree.root.insertChild("b", 7);
-
-    var sem = try SemTree([]const u8, i64, i64).build(allocator, tree.root, countPositiveFoldI64);
-    defer sem.deinit();
-
-    try std.testing.expectEqual(@as(i64, 1), sem.nodeValue("root").?);
-
-    const root_before = sem.recomputeCount("root");
-    // Edit b from 7 to 9 — count_positive(root) stays at 1 (memo guard).
-    try sem.applyEdit(tree.root, "b", 9);
-    try std.testing.expectEqual(@as(i64, 1), sem.nodeValue("root").?);
-    try std.testing.expectEqual(root_before, sem.recomputeCount("root"));
-}
-
-test "lazily/sem_tree: removal updates derivation (dropped subtree)" {
-    const allocator = std.testing.allocator;
-    var tree = try buildSampleTree(allocator);
-    defer tree.deinit();
+    _ = try tree.root.insertChild("a", 1);
 
     var sem = try SemTree([]const u8, i64, i64).build(allocator, tree.root, sumFoldI64);
     defer sem.deinit();
 
-    try std.testing.expectEqual(@as(i64, 133), sem.nodeValue("root").?);
-
-    try sem.applyRemoveChild(tree.root, "root", "b");
-    try std.testing.expectEqual(@as(i64, 31), sem.nodeValue("root").?);
+    try std.testing.expectError(error.NodeNotFound, sem.applyEdit(tree.root, "nope", 5));
+    try std.testing.expectError(error.NodeNotFound, sem.applyRemoveChild(tree.root, "root", "nope"));
+    // The derivation is untouched by the rejected edits.
+    try std.testing.expectEqual(@as(i64, 1), sem.nodeValue("root").?);
 }

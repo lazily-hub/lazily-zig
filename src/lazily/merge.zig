@@ -171,29 +171,8 @@ test "MergeCell: Cell ≡ MergeCell(KeepLatest), Sum accumulates" {
     try std.testing.expectEqual(@as(i64, 10), mc.get());
 }
 
-test "MergeCell: converged determinism mirrors mergecell_algebra.json" {
-    // Inline mirror of lazily-spec/conformance/collections/mergecell_algebra.json
-    // (zig has no collections-JSON harness): same op streams → same converged
-    // values as lazily-rs / lazily-js / lazily-py / lazily-go.
-    const allocator = std.testing.allocator;
-    const ctx = try Context.init(allocator);
-    defer ctx.deinit();
-
-    // Sum, initial 0: 5,-3,8,2,0 → 12
-    var s = try MergeCell(i64).init(ctx, struct {
-        fn f(_: *Context) !i64 {
-            return 0;
-        }
-    }.f, sum(i64));
-    for ([_]i64{ 5, -3, 8, 2, 0 }) |op| s.merge(op);
-    try std.testing.expectEqual(@as(i64, 12), s.get());
-
-    // Max, initial 10: 5,10,42,0,42 → 42
-    var m = try MergeCell(i64).init(ctx, struct {
-        fn f(_: *Context) !i64 {
-            return 10;
-        }
-    }.f, max(i64));
-    for ([_]i64{ 5, 10, 42, 0, 42 }) |op| m.merge(op);
-    try std.testing.expectEqual(@as(i64, 42), m.get());
-}
+// `mergecell_algebra.json` is replayed from the canonical corpus in
+// `collections_conformance.zig`. The inline mirror that used to sit here
+// re-typed two of its three op streams and asserted only the final value, so it
+// could not see a policy that stopped suppressing an equal write — nor a
+// fixture change, since the numbers lived in this file.

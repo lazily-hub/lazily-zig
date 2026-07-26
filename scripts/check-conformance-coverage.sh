@@ -13,8 +13,12 @@
 # lazily-rs's own topic tests — is caught here. A source grep cannot see that
 # case at all: it counts the mention.
 #
-# The upgrade dropped this binding from 94 "named" to 72 "opened". The 22 that
-# fell out are listed in KNOWN_UNCOVERED below with what each one actually is.
+# The upgrade dropped this binding from 94 "named" to 72 "opened". Of the 22 that
+# fell out, 14 were vendored @embedFile copies (a compile-time embed opens
+# nothing; conformance_manifest.zig asserts them byte-identical to canonical
+# instead) and 8 were inline mirrors, since replaced by real runners. What is
+# left in KNOWN_UNCOVERED below is fixtures with no runner in this binding at
+# all — each entry a claim that someone looked.
 #
 # A missing manifest is missing EVIDENCE and fails. It does not mean "no fixtures
 # were read"; it means the suite ran without the recorder attached, and passing in
@@ -65,21 +69,21 @@ KNOWN_UNCOVERED=(
   "message-passing/terminal_conflict_fail_closed.json"
   "reliable-sync/coalesce_bounds_outbox.json"
   "reliable-sync/liveness_lease_eviction.json"
-
-  # Named in a comment, hand-transcribed inline, never opened
-  # (#lazilyupgradeconformance). These are what the static grep was counting as
-  # covered. The test that "mirrors" each of them asserts against values typed
-  # into the .zig source, so upstream can change the fixture and the mirror stays
-  # green. Each needs a real runner over the canonical JSON.
-  "collections/keyed_reconciliation_lis.json"   # src/lazily/reconcile.zig "mirror ..." tests
-  "collections/mergecell_algebra.json"          # src/lazily/merge.zig inline mirror
-  "collections/semtree_incremental.json"        # src/lazily/sem_tree.zig "mirror ... scenarios"
-  "collections/stableid_alignment.json"         # src/lazily/stable_id.zig "mirror ... scenarios"
-  "distributed/anti_entropy_converge.json"      # src/lazily/crdt_plane.zig "mirror ..." tests
-  "distributed/crdt_sync_frames.json"           # src/lazily/crdt_plane.zig + ipc.zig, inline wire shapes
-  "signaling/anti_spoof_session.json"           # src/lazily/signaling.zig inline wire shapes
-  "signaling/frames.json"                       # src/lazily/signaling.zig inline wire shapes
 )
+
+# The eight inline-mirror fixtures this list used to carry are GONE from it: they
+# are replayed for real by src/lazily/{collections,distributed,signaling}_conformance.zig
+# and now show up as OPENED. Retiring them found three wire defects the mirrors
+# could not see, because each mirror was transcribed from this implementation
+# rather than from the corpus:
+#
+#   - the stamp frontier was encoded as `{peer, stamp}` where the schema pins a
+#     2-element `[peer, stamp]` tuple (ipc.zig, both directions);
+#   - `CrdtOp.key` was omitted when null and rejected when explicitly null,
+#     though the schema lists it as required-and-nullable (ipc.zig);
+#   - `welcome.peers` came out in hash-map order against an explicit
+#     `roster_sorted_ascending` assertion, and the unknown-target error text did
+#     not match the transcript (signaling.zig).
 
 # ABSOLUTE by contract — test binaries may run from a working directory other
 # than the repo root, so the recorder cannot resolve a relative path the same way

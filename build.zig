@@ -400,7 +400,14 @@ pub fn build(b: *std.Build) void {
     // is correct but useless. Collecting evidence requires actually running.
     if (b.graph.environ_map.get("LAZILY_CONFORMANCE_MANIFEST")) |manifest_path| {
         for (run_test.dependencies.items) |dep| {
-            if (dep.tag != .run) continue;
+            // `Step` spells its kind `id` on 0.16.0 and `tag` on nightly. Both
+            // toolchains gate CI, so this reads through a `@hasField` shim
+            // rather than pinning one — the same shape as `normalizeCompute` in
+            // src/lazily/context.zig. Pinning `tag` made the build SCRIPT fail
+            // to compile on 0.16.0, so every `zig build` on that toolchain died
+            // before reaching a single test.
+            const kind = if (@hasField(std.Build.Step, "tag")) dep.tag else dep.id;
+            if (kind != .run) continue;
             const run: *std.Build.Step.Run = @fieldParentPtr("step", dep);
             run.setEnvironmentVariable("LAZILY_CONFORMANCE_MANIFEST", manifest_path);
             run.has_side_effects = true;

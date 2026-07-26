@@ -68,8 +68,9 @@ jobs:
       - name: Assert conformance fixtures are present
         run: |
           set -euo pipefail
-          for d in coordination materialization membership presence rateshape \
-                   reactive-graph resilience service temporal windowing; do
+          for d in collections coordination distributed materialization membership \
+                   presence rateshape reactive-graph resilience service signaling \
+                   temporal windowing; do
             dir="../lazily-spec/conformance/$d"
             test -d "$dir" || {
               echo "::error::$dir missing — its replay test would skip and CI would report green having tested nothing"
@@ -81,8 +82,25 @@ jobs:
             }
           done
 
+      # The recorder is a no-op unless LAZILY_CONFORMANCE_MANIFEST is set, so a
+      # bare `zig build test` collects no evidence and the coverage guard below
+      # could never run here. Until now it only ran under a local `make check`,
+      # which meant the KNOWN_UNCOVERED ledger was enforced by whoever
+      # remembered to run it — the same "enforced on one developer machine" gap
+      # the benchmark budgets have.
       - name: Test
-        run: zig build test --summary all
+        run: |
+          mkdir -p build && : > build/conformance-fixtures-loaded.txt
+          LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
+            zig build test --summary all
+
+      # A fixture that lands upstream and is replayed by nobody here must fail
+      # the build, not wait to be noticed. Runs on every toolchain in the matrix
+      # because the manifest is per-run evidence, not a cached artifact.
+      - name: Conformance coverage guard
+        run: |
+          LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
+            ./scripts/check-conformance-coverage.sh
 
   # ---------------------------------------------------------------------------
   # `make check` also runs the Lean model in lazily-formal. It is split out

@@ -743,10 +743,19 @@ pub const CrdtOp = struct {
     stamp: WireStamp,
     state: IpcValue,
 
+    /// `key` is ALWAYS present on a `CrdtOp` — explicitly `null` when unset.
+    /// `schemas/distributed.json` lists it in `required` and documents the
+    /// difference from `NodeSnapshot`/`NodeAdd`, which omit it; lazily-rs's
+    /// derived struct serializes it the same way. This binding used to omit it
+    /// when null and to reject an incoming explicit null, so it could neither
+    /// produce nor read a keyless op the way the corpus spells one.
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !CrdtOp {
         return .{
             .node = try asU64(try field(value, "node")),
-            .key = if (objectGet(value, "key")) |k| try asString(k) else null,
+            .key = switch (objectGet(value, "key") orelse std.json.Value{ .null = {} }) {
+                .null => null,
+                else => |k| try asString(k),
+            },
             .stamp = try WireStamp.fromJson(try field(value, "stamp")),
             .state = try IpcValue.fromJson(allocator, try field(value, "state")),
         };
@@ -756,10 +765,8 @@ pub const CrdtOp = struct {
         try jw.beginObject();
         try jw.objectField("node");
         try jw.write(self.node);
-        if (self.key) |k| {
-            try jw.objectField("key");
-            try jw.write(k);
-        }
+        try jw.objectField("key");
+        if (self.key) |k| try jw.write(k) else try jw.write(null);
         try jw.objectField("stamp");
         try jw.write(self.stamp);
         try jw.objectField("state");
@@ -769,24 +776,35 @@ pub const CrdtOp = struct {
 };
 
 /// A per-peer stamp frontier entry — `(peer, WireStamp)`.
+///
+/// On the wire this is a **2-element tuple** `[peer, stamp]`, not an object:
+/// `schemas/distributed.json#/$defs/StampFrontierEntry` pins it with
+/// `prefixItems` + `minItems`/`maxItems` of 2, `distributed/crdt_sync_frames.json`
+/// ships it that way, and lazily-rs models it as `Vec<(u64, WireStamp)>` (a
+/// serde tuple). This binding used to encode and decode `{peer, stamp}`, so its
+/// frontier advertisement was unreadable by every other binding — invisible
+/// until the frames fixture was actually replayed rather than mirrored.
 pub const FrontierEntry = struct {
     peer: u64,
     stamp: WireStamp,
 
     pub fn fromJson(value: std.json.Value) !FrontierEntry {
+        const items = switch (value) {
+            .array => |a| a.items,
+            else => return error.ExpectedArray,
+        };
+        if (items.len != 2) return error.MalformedFrontierEntry;
         return .{
-            .peer = try asU64(try field(value, "peer")),
-            .stamp = try WireStamp.fromJson(try field(value, "stamp")),
+            .peer = try asU64(items[0]),
+            .stamp = try WireStamp.fromJson(items[1]),
         };
     }
 
     pub fn jsonStringify(self: FrontierEntry, jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("peer");
+        try jw.beginArray();
         try jw.write(self.peer);
-        try jw.objectField("stamp");
         try jw.write(self.stamp);
-        try jw.endObject();
+        try jw.endArray();
     }
 };
 

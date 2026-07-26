@@ -425,69 +425,15 @@ pub const CrdtPlaneRuntime = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Tests (mirror anti_entropy_converge.json + crdt_sync_frames.json)
+// Tests. `anti_entropy_converge.json` and `crdt_sync_frames.json` are replayed
+// from the canonical corpus in `distributed_conformance.zig`. The mirrors that
+// used to live here had already drifted from the transcript they claimed to
+// follow — wrong stamps in the idempotence case, a dropped op in the
+// reverse-order case, and no `applied_count` assertion anywhere.
 // ---------------------------------------------------------------------------
 
 fn makeInlineState(comptime byte: u8) IpcValue {
     return IpcValue.fromInline(&[_]u8{byte});
-}
-
-test "lazily/crdt_plane: LWW last-writer-wins over out-of-order delivery" {
-    const allocator = std.testing.allocator;
-    var rt = CrdtPlaneRuntime.init(allocator, 0);
-    defer rt.deinit();
-
-    const ops = [_]CrdtOp{
-        .{ .node = 1, .key = "doc/title", .stamp = .{ .wall_time = 10, .logical = 0, .peer = 1 }, .state = makeInlineState(65) },
-        .{ .node = 1, .key = "doc/title", .stamp = .{ .wall_time = 12, .logical = 0, .peer = 2 }, .state = makeInlineState(66) },
-        .{ .node = 1, .key = "doc/title", .stamp = .{ .wall_time = 11, .logical = 0, .peer = 1 }, .state = makeInlineState(67) },
-        .{ .node = 2, .key = "doc/count", .stamp = .{ .wall_time = 5, .logical = 3, .peer = 1 }, .state = makeInlineState(9) },
-        .{ .node = 2, .key = "doc/count", .stamp = .{ .wall_time = 5, .logical = 3, .peer = 2 }, .state = makeInlineState(7) },
-    };
-    const applied = try rt.ingest(CrdtSync.init(&.{}, &ops), 0);
-    try std.testing.expectEqual(@as(usize, 5), applied);
-
-    // Node 1 winner = (12,0,2) → byte 66; node 2 tie (5,3,1) vs (5,3,2) → peer 2 → byte 7.
-    const n1 = rt.cells.get(1).?;
-    try std.testing.expectEqual(@as(u8, 66), n1.state.?.Inline[0]);
-    const n2 = rt.cells.get(2).?;
-    try std.testing.expectEqual(@as(u8, 7), n2.state.?.Inline[0]);
-}
-
-test "lazily/crdt_plane: idempotent re-delivery applies 0 new ops" {
-    const allocator = std.testing.allocator;
-    var rt = CrdtPlaneRuntime.init(allocator, 0);
-    defer rt.deinit();
-
-    const ops = [_]CrdtOp{
-        .{ .node = 1, .key = null, .stamp = .{ .wall_time = 10, .logical = 0, .peer = 1 }, .state = makeInlineState(65) },
-        .{ .node = 1, .key = null, .stamp = .{ .wall_time = 11, .logical = 0, .peer = 1 }, .state = makeInlineState(66) },
-    };
-    const first = try rt.ingest(CrdtSync.init(&.{}, &ops), 0);
-    try std.testing.expectEqual(@as(usize, 2), first);
-    const redeliver = try rt.ingest(CrdtSync.init(&.{}, &ops), 0);
-    try std.testing.expectEqual(@as(usize, 0), redeliver);
-}
-
-test "lazily/crdt_plane: reverse-order delivery converges identically" {
-    const allocator = std.testing.allocator;
-    var forward = CrdtPlaneRuntime.init(allocator, 0);
-    defer forward.deinit();
-    var reverse = CrdtPlaneRuntime.init(allocator, 0);
-    defer reverse.deinit();
-
-    const ops = [_]CrdtOp{
-        .{ .node = 1, .key = null, .stamp = .{ .wall_time = 10, .logical = 0, .peer = 1 }, .state = makeInlineState(65) },
-        .{ .node = 1, .key = null, .stamp = .{ .wall_time = 12, .logical = 0, .peer = 2 }, .state = makeInlineState(66) },
-    };
-    _ = try forward.ingest(CrdtSync.init(&.{}, &ops), 0);
-    const reversed = [_]CrdtOp{ ops[1], ops[0] };
-    _ = try reverse.ingest(CrdtSync.init(&.{}, &reversed), 0);
-
-    try std.testing.expectEqual(
-        forward.cells.get(1).?.state.?.Inline[0],
-        reverse.cells.get(1).?.state.?.Inline[0],
-    );
 }
 
 test "lazily/crdt_plane: local_update emits keyed op and records it" {
