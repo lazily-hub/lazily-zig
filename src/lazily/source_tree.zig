@@ -28,7 +28,7 @@ pub fn TreeIdContext(comptime K: type) type {
 /// `SourceMap`'s three-signal model). Child handles live in a non-reactive map
 /// kept in lockstep with `order`.
 ///
-/// Mirrors lazily-rs `SourceTreeNode` (`cell_tree.rs:62-76`). Each node owns its
+/// Mirrors lazily-rs `SourceTreeNode` (`source_tree.rs:62-76`). Each node owns its
 /// children (allocated in the caller's allocator); structural sharing is by
 /// pointer aliasing (the Zig analog of `Rc`).
 pub fn SourceTreeNode(comptime Id: type, comptime V: type) type {
@@ -188,7 +188,7 @@ fn crdtEqVal(comptime V: type, a: V, b: V) bool {
 }
 
 /// An ordered keyed tree — composition of per-node value cells with per-level
-/// membership/order reactivity. Mirrors lazily-rs `SourceTree` (`cell_tree.rs`).
+/// membership/order reactivity. Mirrors lazily-rs `SourceTree` (`source_tree.rs`).
 /// One root node; structural sharing by pointer aliasing (attach pre-built
 /// subtrees). See `lazily-spec/cell-model.md § Ordered keyed tree`.
 pub fn SourceTree(comptime Id: type, comptime V: type) type {
@@ -222,10 +222,10 @@ pub const CellTree = SourceTree;
 pub const CellTreeNode = SourceTreeNode;
 
 // ---------------------------------------------------------------------------
-// Tests — per-node / per-level invariants (mirrors lazily-rs cell_tree.rs)
+// Tests — per-node / per-level invariants (mirrors lazily-rs source_tree.rs)
 // ---------------------------------------------------------------------------
 
-test "lazily/cell_tree: per-node value isolation" {
+test "lazily/source_tree: per-node value isolation" {
     const allocator = std.testing.allocator;
     var tree = try SourceTree([]const u8, i64).init(allocator, "root", 0);
     defer tree.deinit();
@@ -242,7 +242,7 @@ test "lazily/cell_tree: per-node value isolation" {
     try std.testing.expectEqual(@as(i64, 2), tree.root.child("b").?.getValue());
 }
 
-test "lazily/cell_tree: atomic move bumps order only, preserves membership" {
+test "lazily/source_tree: atomic move bumps order only, preserves membership" {
     const allocator = std.testing.allocator;
     var tree = try SourceTree([]const u8, i64).init(allocator, "root", 0);
     defer tree.deinit();
@@ -264,7 +264,7 @@ test "lazily/cell_tree: atomic move bumps order only, preserves membership" {
     try std.testing.expectEqualStrings("b", ids[2]);
 }
 
-test "lazily/cell_tree: remove + resolvePath" {
+test "lazily/source_tree: remove + resolvePath" {
     const allocator = std.testing.allocator;
     var tree = try SourceTree([]const u8, i64).init(allocator, "root", 0);
     defer tree.deinit();
@@ -279,7 +279,7 @@ test "lazily/cell_tree: remove + resolvePath" {
     try std.testing.expect(tree.root.resolvePath(&path) == null);
 }
 
-test "lazily/cell_tree: deprecated CellTree/CellTreeNode aliases still resolve" {
+test "lazily/source_tree: deprecated CellTree/CellTreeNode aliases still resolve" {
     try std.testing.expect(CellTree([]const u8, i64) == SourceTree([]const u8, i64));
     try std.testing.expect(CellTreeNode([]const u8, i64) == SourceTreeNode([]const u8, i64));
 

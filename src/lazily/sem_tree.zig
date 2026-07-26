@@ -1,7 +1,7 @@
 const std = @import("std");
-const cell_tree = @import("cell_tree.zig");
-const SourceTree = cell_tree.SourceTree;
-const SourceTreeNode = cell_tree.SourceTreeNode;
+const source_tree = @import("source_tree.zig");
+const SourceTree = source_tree.SourceTree;
+const SourceTreeNode = source_tree.SourceTreeNode;
 
 /// A memoized semantic tree — one memo slot per node folding
 /// `(node value, child derived values)`. Editing one node recomputes only its
@@ -19,12 +19,12 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
     return struct {
         allocator: std.mem.Allocator,
         /// Derived value per node (memoized).
-        derived: std.HashMap(Id, D, cell_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage),
+        derived: std.HashMap(Id, D, source_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage),
         /// Per-node recomputation counter (for the `sibling_a_cached` /
         /// `downstream_consumer_reran` conformance assertions).
-        recompute_counts: std.HashMap(Id, u64, cell_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage),
+        recompute_counts: std.HashMap(Id, u64, source_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage),
         /// Parent map: child id -> parent id (for ancestor-chain walks).
-        parent_of: std.HashMap(Id, Id, cell_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage),
+        parent_of: std.HashMap(Id, Id, source_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage),
         root_id: Id,
         fold: *const fn (node_value: V, child_deriveds: []const D) D,
 
@@ -37,9 +37,9 @@ pub fn SemTree(comptime Id: type, comptime V: type, comptime D: type) type {
         ) !Self {
             var self = Self{
                 .allocator = allocator,
-                .derived = std.HashMap(Id, D, cell_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage).init(allocator),
-                .recompute_counts = std.HashMap(Id, u64, cell_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage).init(allocator),
-                .parent_of = std.HashMap(Id, Id, cell_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage).init(allocator),
+                .derived = std.HashMap(Id, D, source_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage).init(allocator),
+                .recompute_counts = std.HashMap(Id, u64, source_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage).init(allocator),
+                .parent_of = std.HashMap(Id, Id, source_tree.TreeIdContext(Id), std.hash_map.default_max_load_percentage).init(allocator),
                 .root_id = root.id,
                 .fold = fold,
             };
@@ -148,14 +148,14 @@ fn derivedEq(comptime D: type, a: D, b: D) bool {
 }
 
 fn findNode(comptime Id: type, comptime V: type, root: *SourceTreeNode(Id, V), id: Id) ?*SourceTreeNode(Id, V) {
-    if (cell_tree.TreeIdContext(Id).eql(undefined, root.id, id)) return root;
+    if (source_tree.TreeIdContext(Id).eql(undefined, root.id, id)) return root;
     return findInChildren(Id, V, root, id);
 }
 
 fn findInChildren(comptime Id: type, comptime V: type, node: *SourceTreeNode(Id, V), id: Id) ?*SourceTreeNode(Id, V) {
     for (node.childIds()) |cid| {
         if (node.child(cid)) |child| {
-            if (cell_tree.TreeIdContext(Id).eql(undefined, child.id, id)) return child;
+            if (source_tree.TreeIdContext(Id).eql(undefined, child.id, id)) return child;
             if (findInChildren(Id, V, child, id)) |found| return found;
         }
     }

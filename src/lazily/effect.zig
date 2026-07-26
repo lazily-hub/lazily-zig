@@ -9,7 +9,7 @@ const ValueFn = @import("context.zig").ValueFn;
 const CellMod = @import("cell.zig");
 const SignalMod = @import("signal.zig");
 
-/// An Effect is a side-effecting observer that reruns whenever a tracked
+/// An Effect is a side-effecting graph node that reruns whenever a tracked
 /// dependency invalidates. It is the 4th reactive primitive
 /// (`Cell / Slot / Signal / Effect`) per `lazily-spec/docs/reactive-graph.md`.
 ///
@@ -199,7 +199,7 @@ pub fn effectKeyed(
     return self;
 }
 
-/// A no-cleanup effect variant for observers that don't need tear-down.
+/// A no-cleanup effect variant for effects that don't need tear-down.
 pub fn effectNoCleanup(
     ctx: *Context,
     comptime bodyFn: anytype,
