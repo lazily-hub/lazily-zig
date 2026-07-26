@@ -92,7 +92,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// cached id.
         fn mint(self: *Self, key: K, value: V) !u64 {
             if (self.materialized.get(key)) |id| return id; // warm.
-            const id = if (entry_kind == .cell)
+            const id = if (entry_kind == .source)
                 try self.actx.cell(value)
             else id: {
                 const sid = try self.actx.computedAsyncClosure(self.slot_values, slotCompute);
@@ -117,7 +117,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// is pending, else the resolved `value`. A cell resolves at allocation.
         pub fn getOrInsertWith(self: *Self, key: K, factory: Factory(K, V)) !?V {
             const id = try self.getOrInsertHandle(key, factory);
-            if (entry_kind == .cell) return self.actx.getCell(id);
+            if (entry_kind == .source) return self.actx.getCell(id);
             return self.actx.get(id);
         }
 
@@ -127,7 +127,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// (allocate first via [`getOrInsertHandle`] / [`materializeAll`] / `set`).
         pub fn drive(self: *Self, key: K) !V {
             const id = self.materialized.get(key).?;
-            if (entry_kind == .cell) return self.actx.getCell(id).?;
+            if (entry_kind == .source) return self.actx.getCell(id).?;
             return self.actx.awaitResolved(id);
         }
 
@@ -135,14 +135,14 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// absent (`observe_pending_is_none`). Does not mint.
         pub fn observe(self: *Self, key: K) ?V {
             const id = self.materialized.get(key) orelse return null;
-            if (entry_kind == .cell) return self.actx.getCell(id);
+            if (entry_kind == .source) return self.actx.getCell(id);
             return self.actx.get(id);
         }
 
         /// Overwrite an input **cell** entry (cells are writable, always
         /// resolved). Allocates the entry if absent. Compile error on a slot map.
         pub fn set(self: *Self, key: K, value: V) !void {
-            if (entry_kind != .cell) @compileError("AsyncReactiveMap.set is only valid on cell (input) maps");
+            if (entry_kind != .source) @compileError("AsyncReactiveMap.set is only valid on cell (input) maps");
             const id = try self.mint(key, value);
             try self.actx.setCell(id, value);
         }
@@ -150,7 +150,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// **Eager materialization**: pre-mint a derived slot for every key in
         /// `all_keys` via `factory`, up front (each starts pending). Slot-only.
         pub fn materializeAll(self: *Self, all_keys: []const K, factory: Factory(K, V)) !void {
-            if (entry_kind != .slot) @compileError("AsyncReactiveMap.materializeAll is only valid on slot (derived) maps");
+            if (entry_kind != .computed) @compileError("AsyncReactiveMap.materializeAll is only valid on slot (derived) maps");
             for (all_keys) |key| _ = try self.mint(key, factory.call(key));
         }
 
@@ -163,7 +163,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// would return a value).
         pub fn isResolved(self: *Self, key: K) bool {
             const id = self.materialized.get(key) orelse return false;
-            if (entry_kind == .cell) return true;
+            if (entry_kind == .source) return true;
             return self.actx.get(id) != null;
         }
 
@@ -186,14 +186,14 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
 
 /// An async **input-cell** map: every entry is an always-resolved async cell.
 pub fn AsyncSourceMap(comptime K: type, comptime V: type) type {
-    return AsyncReactiveMap(K, V, .cell);
+    return AsyncReactiveMap(K, V, .source);
 }
 
 /// An async **derived-slot** map: `getOrInsertHandle` mints on first access
 /// (lazy), [`materializeAll`](AsyncReactiveMap.materializeAll) pre-mints (eager);
 /// resolved via [`drive`](AsyncReactiveMap.drive).
 pub fn AsyncComputedMap(comptime K: type, comptime V: type) type {
-    return AsyncReactiveMap(K, V, .slot);
+    return AsyncReactiveMap(K, V, .computed);
 }
 
 /// Deprecated: renamed to [`AsyncSourceMap`] when the v2 kernel renamed the node
@@ -239,7 +239,7 @@ test "lazily/async_reactive_map: eager cell map resolves immediately" {
     defer map.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| try map.set(k, true);
 
-    try testing.expectEqual(EntryKind.cell, map.entryKind());
+    try testing.expectEqual(EntryKind.source, map.entryKind());
     try testing.expectEqual(@as(usize, 3), map.presentCount());
     try testing.expectEqual(@as(?bool, true), map.observe(2)); // cell_resolved_at_build
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, map.presentKeys());

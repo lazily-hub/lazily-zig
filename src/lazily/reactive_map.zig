@@ -11,10 +11,10 @@
 //!
 //! # One primitive, two specializations
 //!
-//! - **[`SourceMap`]** (`ReactiveMap(K, V, .cell)`) — **input-cell** entries. Adds
+//! - **[`SourceMap`]** (`ReactiveMap(K, V, .source)`) — **input-cell** entries. Adds
 //!   cell-only [`set`](ReactiveMap.set) and eager value-minting
 //!   ([`entry`](ReactiveMap.entry) / [`entryWith`](ReactiveMap.entryWith)).
-//! - **[`ComputedMap`]** (`ReactiveMap(K, V, .slot)`) — **derived-slot** entries.
+//! - **[`ComputedMap`]** (`ReactiveMap(K, V, .computed)`) — **derived-slot** entries.
 //!   [`getOrInsertWith`](ReactiveMap.getOrInsertWith) mints a slot on first access
 //!   (**lazy materialization**); a slot's value is derived, so `ComputedMap` has **no
 //!   `set`**. Eager materialization is a pre-mint loop over the keyset
@@ -47,11 +47,46 @@ const Context = @import("context.zig").Context;
 ///
 /// Mirrors `EntryKind` in `lazily-formal`'s `Materialization` module and the Rust
 /// `EntryKind`.
+///
+/// The tag identifiers follow the v2 cell kernel (`Source` / `Computed`); the
+/// **wire** spelling does not. Conformance fixtures and the sibling binding
+/// runners still speak `"cell"` / `"slot"`, so serialization goes through
+/// [`wireName`](EntryKind.wireName) / [`fromWireName`](EntryKind.fromWireName)
+/// and never `@tagName`.
 pub const EntryKind = enum {
-    /// An **input** cell — always materialized on access; writable via `set`.
-    cell,
-    /// A **derived** slot — materialized eagerly (pre-mint) or lazily on first read.
-    slot,
+    /// An **input** source cell — always materialized on access; writable via `set`.
+    source,
+    /// A **derived** computed — materialized eagerly (pre-mint) or lazily on first read.
+    computed,
+
+    /// Deprecated: renamed to [`EntryKind.source`] when the v2 kernel renamed the
+    /// node kinds to `Source` / `Computed`. Kept as a namespaced constant so
+    /// `EntryKind.cell` still resolves; use `.source` in new code. (Zig has no
+    /// enum-tag aliases, so the enum-literal form `.cell` does **not** resolve.)
+    pub const cell: EntryKind = .source;
+
+    /// Deprecated: renamed to [`EntryKind.computed`]. See [`EntryKind.cell`].
+    pub const slot: EntryKind = .computed;
+
+    /// The stable **wire** spelling — `"cell"` / `"slot"`. Frozen: nine binding
+    /// runners and the spec fixtures read these strings, so this mapping is
+    /// written out explicitly rather than derived from `@tagName`.
+    pub fn wireName(self: EntryKind) []const u8 {
+        return switch (self) {
+            .source => "cell",
+            .computed => "slot",
+        };
+    }
+
+    /// Parse a fixture/wire `kind` field. Accepts the frozen wire spellings
+    /// (`"cell"` / `"slot"`) **and** the v2 kernel spellings (`"source"` /
+    /// `"computed"`) so a fixture flip is a no-op here. Anything else is an
+    /// error — never a silent default.
+    pub fn fromWireName(name: []const u8) error{UnknownEntryKind}!EntryKind {
+        if (std.mem.eql(u8, name, "cell") or std.mem.eql(u8, name, "source")) return .source;
+        if (std.mem.eql(u8, name, "slot") or std.mem.eql(u8, name, "computed")) return .computed;
+        return error.UnknownEntryKind;
+    }
 };
 
 /// Choose the right hash map implementation for key type K.
@@ -237,8 +272,8 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             return self.order_version;
         }
 
-        /// This map's entry kind ([`EntryKind.cell`] for a [`SourceMap`],
-        /// [`EntryKind.slot`] for a [`ComputedMap`]).
+        /// This map's entry kind ([`EntryKind.source`] for a [`SourceMap`],
+        /// [`EntryKind.computed`] for a [`ComputedMap`]).
         pub fn entryKind(self: *const Self) EntryKind {
             _ = self;
             return entry_kind;
@@ -295,7 +330,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// re-fetching an existing key returns its current value without a bump.
         /// Cell-only: compile error on a slot map.
         pub fn entry(self: *Self, key: K, value: V) !V {
-            if (entry_kind != .cell) @compileError("ReactiveMap.entry is only valid on cell (input) maps");
+            if (entry_kind != .source) @compileError("ReactiveMap.entry is only valid on cell (input) maps");
             if (self.materialized.get(key)) |v| return v;
             try self.mint(key, value);
             return value;
@@ -304,7 +339,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// Like [`entry`] but the default is produced by `default_fn` only when
         /// the key is absent. Cell-only.
         pub fn entryWith(self: *Self, key: K, default_fn: *const fn () V) !V {
-            if (entry_kind != .cell) @compileError("ReactiveMap.entryWith is only valid on cell (input) maps");
+            if (entry_kind != .source) @compileError("ReactiveMap.entryWith is only valid on cell (input) maps");
             if (self.materialized.get(key)) |v| return v;
             const value = default_fn();
             try self.mint(key, value);
@@ -317,7 +352,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// set is a no-op (PartialEq guard). Cell-only: a derived [`ComputedMap`] slot
         /// is not writable.
         pub fn set(self: *Self, key: K, value: V) !void {
-            if (entry_kind != .cell) @compileError("ReactiveMap.set is only valid on cell (input) maps");
+            if (entry_kind != .source) @compileError("ReactiveMap.set is only valid on cell (input) maps");
             if (self.materialized.getPtr(key)) |vp| {
                 if (std.meta.eql(vp.*, value)) return; // PartialEq guard.
                 vp.* = value; // value axis only — membership/order untouched.
@@ -333,7 +368,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// each key lazily on first read ([`getOrInsertWith`]) — it only changes
         /// *when* the nodes are allocated. Slot-only.
         pub fn materializeAll(self: *Self, all_keys: []const K, factory: Factory(K, V)) !void {
-            if (entry_kind != .slot) @compileError("ReactiveMap.materializeAll is only valid on slot (derived) maps");
+            if (entry_kind != .computed) @compileError("ReactiveMap.materializeAll is only valid on slot (derived) maps");
             for (all_keys) |key| _ = try self.getOrInsertWith(key, factory);
         }
     };
@@ -343,7 +378,7 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
 /// `SourceMap` specialization of [`ReactiveMap`] adds cell-only `set` and eager
 /// value-minting (`entry` / `entryWith`) on top of the shared reactive surface.
 pub fn SourceMap(comptime K: type, comptime V: type) type {
-    return ReactiveMap(K, V, .cell);
+    return ReactiveMap(K, V, .source);
 }
 
 /// A keyed **derived-slot** map: every entry is a derived slot.
@@ -352,7 +387,7 @@ pub fn SourceMap(comptime K: type, comptime V: type) type {
 /// pre-mints the keyset (eager). A slot's value is derived, so `ComputedMap` has **no
 /// `set`**.
 pub fn ComputedMap(comptime K: type, comptime V: type) type {
-    return ReactiveMap(K, V, .slot);
+    return ReactiveMap(K, V, .computed);
 }
 
 /// Deprecated: renamed to [`SourceMap`] when the v2 kernel renamed the node
@@ -501,7 +536,7 @@ test "lazily/reactive_map: ComputedMap materializeAll is eager" {
     try testing.expectEqual(@as(usize, 5), map.presentCount());
     for ([_]u32{ 0, 1, 2, 5, 9 }) |k| try testing.expect(map.isPresent(k));
     try testing.expectEqual(@as(?u32, 15), map.get(5));
-    try testing.expectEqual(EntryKind.slot, map.entryKind());
+    try testing.expectEqual(EntryKind.computed, map.entryKind());
 }
 
 test "lazily/reactive_map: ComputedMap lazy vs eager observe identically" {
@@ -547,7 +582,7 @@ test "lazily/reactive_map: cell entries are writable inputs" {
     try testing.expectEqual(@as(u32, 7), try map.entry(7, 7));
     try map.set(7, 100);
     try testing.expectEqual(@as(?u32, 100), map.get(7));
-    try testing.expectEqual(EntryKind.cell, map.entryKind());
+    try testing.expectEqual(EntryKind.source, map.entryKind());
     _ = identity; // referenced to keep helper parity with sibling flavors
 }
 
@@ -559,7 +594,7 @@ test "lazily/reactive_map: cell map materialized on entry in any use" {
     var map = SourceMap([]const u8, u32).init(ctx);
     defer map.deinit();
     for (cell_keys) |k| _ = try map.entry(k, 0);
-    try testing.expectEqual(EntryKind.cell, map.entryKind());
+    try testing.expectEqual(EntryKind.source, map.entryKind());
     try testing.expectEqual(@as(usize, 3), map.presentCount());
 }
 
@@ -939,11 +974,13 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
         const key = entry.key_ptr.*;
         const kind = try jsonAsString(try jsonFieldRequired(entry.value_ptr.*, "kind"));
         try lookup.map.put(key, try jsonAsI64(try jsonFieldRequired(entry.value_ptr.*, "val")));
-        if (std.mem.eql(u8, kind, "cell")) {
-            try cell_keys.append(testing.allocator, key);
-        } else if (std.mem.eql(u8, kind, "slot")) {
-            try slot_keys.append(testing.allocator, key);
-        } else return error.UnknownEntryKind;
+        // Forward-compatible: the fixture may spell the kinds either the frozen
+        // wire way (`"cell"` / `"slot"`) or the v2 kernel way (`"source"` /
+        // `"computed"`). Anything else is a hard error.
+        switch (try EntryKind.fromWireName(kind)) {
+            .source => try cell_keys.append(testing.allocator, key),
+            .computed => try slot_keys.append(testing.allocator, key),
+        }
     }
 
     // Eager build: every entry present (cells via entry, slots via materializeAll).
@@ -953,8 +990,8 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     var eager_slots = Slots.init(ctx);
     defer eager_slots.deinit();
     try eager_slots.materializeAll(slot_keys.items, lookup.factory());
-    try testing.expectEqual(EntryKind.cell, eager_cells.entryKind());
-    try testing.expectEqual(EntryKind.slot, eager_slots.entryKind());
+    try testing.expectEqual(EntryKind.source, eager_cells.entryKind());
+    try testing.expectEqual(EntryKind.computed, eager_slots.entryKind());
     try testing.expectEqual(
         eager_cells.presentCount() + eager_slots.presentCount(),
         (try arrayItems(try jsonFieldRequired(expected, "eager_present"))).len,
@@ -1004,6 +1041,34 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
 test "lazily/reactive_map: deprecated CellMap/SlotMap aliases still resolve" {
     try testing.expect(CellMap(u32, u32) == SourceMap(u32, u32));
     try testing.expect(SlotMap(u32, u32) == ComputedMap(u32, u32));
-    try testing.expectEqual(EntryKind.cell, CellMap(u32, u32).kind);
-    try testing.expectEqual(EntryKind.slot, SlotMap(u32, u32).kind);
+    try testing.expectEqual(EntryKind.source, CellMap(u32, u32).kind);
+    try testing.expectEqual(EntryKind.computed, SlotMap(u32, u32).kind);
+}
+
+test "lazily/reactive_map: deprecated EntryKind.cell/.slot constants still resolve" {
+    try testing.expectEqual(EntryKind.source, EntryKind.cell);
+    try testing.expectEqual(EntryKind.computed, EntryKind.slot);
+}
+
+test "lazily/reactive_map: EntryKind wire spelling stays cell/slot after the tag rename" {
+    // Frozen cross-binding wire contract: the v2 tag rename must NOT reach the
+    // wire. `@tagName` now says source/computed, so wireName is an explicit map.
+    try testing.expectEqualStrings("cell", EntryKind.source.wireName());
+    try testing.expectEqualStrings("slot", EntryKind.computed.wireName());
+    try testing.expectEqualStrings("source", @tagName(EntryKind.source));
+    try testing.expectEqualStrings("computed", @tagName(EntryKind.computed));
+}
+
+test "lazily/reactive_map: EntryKind.fromWireName accepts both spellings, rejects others" {
+    try testing.expectEqual(EntryKind.source, try EntryKind.fromWireName("cell"));
+    try testing.expectEqual(EntryKind.source, try EntryKind.fromWireName("source"));
+    try testing.expectEqual(EntryKind.computed, try EntryKind.fromWireName("slot"));
+    try testing.expectEqual(EntryKind.computed, try EntryKind.fromWireName("computed"));
+    // No silent default: anything else is a hard error.
+    try testing.expectError(error.UnknownEntryKind, EntryKind.fromWireName("signal"));
+    try testing.expectError(error.UnknownEntryKind, EntryKind.fromWireName(""));
+    try testing.expectError(error.UnknownEntryKind, EntryKind.fromWireName("Cell"));
+    // Round-trip: the wire name a kind emits parses back to that kind.
+    try testing.expectEqual(EntryKind.source, try EntryKind.fromWireName(EntryKind.source.wireName()));
+    try testing.expectEqual(EntryKind.computed, try EntryKind.fromWireName(EntryKind.computed.wireName()));
 }

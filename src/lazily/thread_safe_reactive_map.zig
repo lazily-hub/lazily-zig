@@ -123,7 +123,7 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         /// through the reactive context, so dependents recompute. Inserts a new
         /// entry if absent. Compile error on a slot map.
         pub fn set(self: *Self, key: K, value: V) !void {
-            if (entry_kind != .cell) @compileError("ThreadSafeReactiveMap.set is only valid on cell (input) maps");
+            if (entry_kind != .source) @compileError("ThreadSafeReactiveMap.set is only valid on cell (input) maps");
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.materialized.get(key)) |h| {
@@ -136,7 +136,7 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
         /// **Eager materialization**: pre-mint a derived slot for every key in
         /// `all_keys` via `factory`, up front. Slot-only.
         pub fn materializeAll(self: *Self, all_keys: []const K, factory: Factory(K, V)) !void {
-            if (entry_kind != .slot) @compileError("ThreadSafeReactiveMap.materializeAll is only valid on slot (derived) maps");
+            if (entry_kind != .computed) @compileError("ThreadSafeReactiveMap.materializeAll is only valid on slot (derived) maps");
             self.mutex.lock();
             defer self.mutex.unlock();
             for (all_keys) |key| _ = try self.mintLocked(key, factory.call(key));
@@ -177,14 +177,14 @@ pub fn ThreadSafeReactiveMap(comptime K: type, comptime V: type, comptime entry_
 
 /// A thread-safe **input-cell** map: every entry is a settable reactive cell.
 pub fn ThreadSafeSourceMap(comptime K: type, comptime V: type) type {
-    return ThreadSafeReactiveMap(K, V, .cell);
+    return ThreadSafeReactiveMap(K, V, .source);
 }
 
 /// A thread-safe **derived-slot** map: `getOrInsertWith` mints on first access
 /// (lazy), [`materializeAll`](ThreadSafeReactiveMap.materializeAll) pre-mints
 /// (eager).
 pub fn ThreadSafeComputedMap(comptime K: type, comptime V: type) type {
-    return ThreadSafeReactiveMap(K, V, .slot);
+    return ThreadSafeReactiveMap(K, V, .computed);
 }
 
 /// Deprecated: renamed to [`ThreadSafeSourceMap`] when the v2 kernel renamed the
@@ -228,7 +228,7 @@ test "lazily/thread_safe_reactive_map: eager cell map materializes all via set" 
     defer map.deinit();
     for ([_]u32{ 1, 2, 3 }) |k| try map.set(k, true);
 
-    try testing.expectEqual(EntryKind.cell, map.entryKind());
+    try testing.expectEqual(EntryKind.source, map.entryKind());
     try testing.expectEqual(@as(usize, 3), map.presentCount());
     try testing.expect(map.isPresent(1) and map.isPresent(2) and map.isPresent(3));
 
