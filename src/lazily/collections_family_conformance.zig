@@ -45,17 +45,10 @@ const SPEC_DIR = "../lazily-spec/conformance/collections";
 /// Entry value type used across all collection fixtures (JSON integers).
 const V = i64;
 
-fn readFixtureFile(path: []const u8) ![]u8 {
-    if (comptime builtin.zig_version.minor >= 16) {
-        return std.Io.Dir.cwd().readFileAlloc(
-            std.testing.io,
-            path,
-            std.testing.allocator,
-            .limited(1024 * 1024),
-        );
-    }
-    return std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024);
-}
+/// Reads through the runtime conformance manifest recorder
+/// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
+/// coverage guard is fed by observed reads rather than a source grep.
+const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
 
 fn fixturesPresent() bool {
     const raw = readFixtureFile(SPEC_DIR ++ "/cellmap_atomic_move.json") catch return false;

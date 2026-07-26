@@ -1050,17 +1050,10 @@ test "lazily/queue: pluggable storage — custom bounded ring backend" {
 
 const json = std.json;
 
-fn readFixtureFile(path: []const u8) ![]u8 {
-    if (comptime builtin.zig_version.minor >= 16) {
-        return std.Io.Dir.cwd().readFileAlloc(
-            std.testing.io,
-            path,
-            std.testing.allocator,
-            .limited(1024 * 1024),
-        );
-    }
-    return std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024);
-}
+/// Reads through the runtime conformance manifest recorder
+/// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
+/// coverage guard is fed by observed reads rather than a source grep.
+const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
 
 fn jsonField(value: json.Value, name: []const u8) ?json.Value {
     return switch (value) {

@@ -7,3 +7,6 @@ zig-out/
 *.iml
 
 .tsift/
+
+# Runtime conformance manifest (#lazilyupgradeconformance), written by make test.
+build/

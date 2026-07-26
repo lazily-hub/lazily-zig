@@ -2,6 +2,12 @@ LAKE ?= lake
 ZIG ?= zig
 LEAN_DIR ?= ../lazily-formal
 
+# Runtime conformance manifest (#lazilyupgradeconformance). ABSOLUTE on purpose:
+# `zig build test` runs a dozen separate test binaries and a build runner may
+# start them from a working directory other than the repo root, so a relative
+# path would scatter partial manifests instead of accumulating one union.
+CONFORMANCE_MANIFEST ?= $(CURDIR)/build/conformance-fixtures-loaded.txt
+
 .PHONY: \
 	check \
 	test \
@@ -9,8 +15,12 @@ LEAN_DIR ?= ../lazily-formal
 
 check: test test-lean-formal conformance-coverage
 
+# Truncate once here, then let every test binary APPEND. The recorder is a no-op
+# when LAZILY_CONFORMANCE_MANIFEST is unset, so a bare `zig build test` (or
+# `mise run test`) is unaffected by any of this.
 test:
-	$(ZIG) build test
+	@mkdir -p $(dir $(CONFORMANCE_MANIFEST)) && : > $(CONFORMANCE_MANIFEST)
+	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) $(ZIG) build test
 
 # Verify the formal model (lazily-formal) builds cleanly. This is the
 # executable reference behind the state-chart and collection conformance
@@ -23,8 +33,9 @@ test:
 test-lean-formal:
 	cd "$(LEAN_DIR)" && $(LAKE) build
 
-# Conformance-coverage guard (#portconformancecoverage). Static: fails when the
-# canonical corpus grows a fixture no test in this repo even names. Naming is not
-# replaying — see the script header for what this does and does not prove.
+# Conformance-coverage guard (#portconformancecoverage). RUNTIME: fails when a
+# canonical fixture's bytes were never opened by the suite. Depends on `test`
+# having just run with the recorder attached — a missing manifest is missing
+# evidence and fails.
 conformance-coverage:
-	./scripts/check-conformance-coverage.sh
+	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) ./scripts/check-conformance-coverage.sh

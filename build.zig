@@ -385,6 +385,28 @@ pub fn build(b: *std.Build) void {
         b.addRunArtifact(reactive_graph_conformance_tests);
     run_test.dependOn(&run_reactive_graph_conformance_tests.step);
 
+    // --- runtime conformance manifest (`#lazilyupgradeconformance`) ---
+    // `scripts/check-conformance-coverage.sh` no longer greps the sources for
+    // fixture filenames; it reads the manifest of files the suite actually
+    // OPENED. The recorder (src/lazily/conformance_manifest.zig) is a no-op
+    // unless LAZILY_CONFORMANCE_MANIFEST is set, so this only engages under
+    // `make test`.
+    //
+    // Two things must be forced when it does engage. The variable is pushed
+    // into each test binary's environment explicitly rather than relied upon to
+    // be inherited; and `has_side_effects` disables Run-step caching, because a
+    // cached run skips the binary entirely and would leave the freshly
+    // truncated manifest empty — reported downstream as missing evidence, which
+    // is correct but useless. Collecting evidence requires actually running.
+    if (b.graph.environ_map.get("LAZILY_CONFORMANCE_MANIFEST")) |manifest_path| {
+        for (run_test.dependencies.items) |dep| {
+            if (dep.tag != .run) continue;
+            const run: *std.Build.Step.Run = @fieldParentPtr("step", dep);
+            run.setEnvironmentVariable("LAZILY_CONFORMANCE_MANIFEST", manifest_path);
+            run.has_side_effects = true;
+        }
+    }
+
     const install_test = b.step(
         "install_test",
         "Create test binaries for debugging",

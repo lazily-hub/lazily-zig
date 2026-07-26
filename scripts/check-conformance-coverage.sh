@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 # Conformance-coverage guard (#portconformancecoverage).
 #
-# Fails the build when the canonical corpus in ../lazily-spec/conformance/ grows a
-# fixture that no test in this repo even mentions. That is the drift this guard
-# exists for: a fixture lands upstream, every binding stays green, and nobody
-# learns that one of them is not replaying it.
+# Fails the build when a fixture in the canonical corpus (../lazily-spec/conformance/)
+# is not replayed by this repo. That is the drift this guard exists for: a fixture
+# lands upstream, every binding stays green, and nobody learns that one of them is
+# not replaying it.
 #
-# WHAT THIS CATCHES AND WHAT IT DOES NOT — read before trusting it.
+# This binding uses the RUNTIME manifest (#lazilyupgradeconformance), not the
+# static grep it started with. The test run records every file it actually reads
+# from the conformance corpus, so a fixture named in a comment and
+# hand-transcribed — the drift found in lazily-cpp's queue tests, and in
+# lazily-rs's own topic tests — is caught here. A source grep cannot see that
+# case at all: it counts the mention.
 #
-# This is a STATIC guard. It greps the test sources for each canonical fixture's
-# filename. So:
-#   * absent   -> caught. A fixture no test names cannot be being replayed.
-#   * present  -> NOT proof of replay. A test may name a fixture in a comment and
-#                 hand-transcribe its contents, which is exactly the drift found in
-#                 lazily-cpp's queue tests. Only a RUNTIME manifest proves the
-#                 bytes were opened, which is what lazily-kt and lazily-cpp do via
-#                 LAZILY_CONFORMANCE_MANIFEST.
+# The upgrade dropped this binding from 94 "named" to 72 "opened". The 22 that
+# fell out are listed in KNOWN_UNCOVERED below with what each one actually is.
 #
-# So a green run here means "no canonical fixture is unmentioned", not "every
-# canonical fixture is replayed". Upgrading this binding to the runtime manifest is
-# strictly better; this is the portable floor, not the ceiling.
+# A missing manifest is missing EVIDENCE and fails. It does not mean "no fixtures
+# were read"; it means the suite ran without the recorder attached, and passing in
+# that state is the vacuous green this guard exists to prevent.
+#
+# Reading is still not asserting. The manifest proves the bytes were opened; it
+# cannot prove the assertions replayed against them mean anything.
 set -euo pipefail
 
 SPEC_DIR="${LAZILY_SPEC_CONFORMANCE_DIR:-../lazily-spec/conformance}"
@@ -32,6 +34,7 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
+  # No runner at all in this binding.
   "agent-doc/delta_agent_doc_state.json"
   "agent-doc/snapshot_agent_doc_state.json"
   "collections/seqcrdt_convergence.json"
@@ -62,38 +65,48 @@ KNOWN_UNCOVERED=(
   "message-passing/terminal_conflict_fail_closed.json"
   "reliable-sync/coalesce_bounds_outbox.json"
   "reliable-sync/liveness_lease_eviction.json"
+
+  # Named in a comment, hand-transcribed inline, never opened
+  # (#lazilyupgradeconformance). These are what the static grep was counting as
+  # covered. The test that "mirrors" each of them asserts against values typed
+  # into the .zig source, so upstream can change the fixture and the mirror stays
+  # green. Each needs a real runner over the canonical JSON.
+  "collections/keyed_reconciliation_lis.json"   # src/lazily/reconcile.zig "mirror ..." tests
+  "collections/mergecell_algebra.json"          # src/lazily/merge.zig inline mirror
+  "collections/semtree_incremental.json"        # src/lazily/sem_tree.zig "mirror ... scenarios"
+  "collections/stableid_alignment.json"         # src/lazily/stable_id.zig "mirror ... scenarios"
+  "distributed/anti_entropy_converge.json"      # src/lazily/crdt_plane.zig "mirror ..." tests
+  "distributed/crdt_sync_frames.json"           # src/lazily/crdt_plane.zig + ipc.zig, inline wire shapes
+  "signaling/anti_spoof_session.json"           # src/lazily/signaling.zig inline wire shapes
+  "signaling/frames.json"                       # src/lazily/signaling.zig inline wire shapes
 )
 
-TEST_DIRS=("src" "tests")
-EXTS=(".zig")
+# ABSOLUTE by contract — test binaries may run from a working directory other
+# than the repo root, so the recorder cannot resolve a relative path the same way
+# this script would. The Makefile exports $(CURDIR)/...; the fallback here is for
+# running the script by hand right after `make test`.
+MANIFEST="${LAZILY_CONFORMANCE_MANIFEST:-build/conformance-fixtures-loaded.txt}"
 
-collect_sources() {
-  for d in "${TEST_DIRS[@]}"; do
-    [ -d "$d" ] || continue
-    for e in "${EXTS[@]}"; do
-      find "$d" -type f -name "*$e" -print0
-    done
-  done
-}
-
-SOURCES="$(collect_sources | xargs -0 cat 2>/dev/null || true)"
-if [ -z "$SOURCES" ]; then
-  echo "FAIL: read no test sources from ${TEST_DIRS[*]}; this check would be vacuous" >&2
+if [ ! -s "$MANIFEST" ]; then
+  echo "FAIL: no conformance manifest at $MANIFEST." >&2
+  echo "      Run the suite with LAZILY_CONFORMANCE_MANIFEST set to an ABSOLUTE" >&2
+  echo "      path (\`make test\` does) so the recorder attaches. An absent" >&2
+  echo "      manifest is missing evidence, not evidence of absence." >&2
   exit 1
 fi
+OPENED="$(sort -u "$MANIFEST")"
 
 missing=0
 total=0
 covered=0
 while IFS= read -r fixture; do
   total=$((total + 1))
-  name="$(basename "$fixture")"
   # Here-string, NOT a pipe. With `set -o pipefail`, `printf ... | grep -q` reports
   # FAILURE when grep matches: grep -q exits immediately on the first hit, printf
   # takes SIGPIPE writing the rest, and pipefail surfaces printf's death as the
   # pipeline's status. The check then inverts — every covered fixture is reported
   # missing. That is exactly how it behaved before this line changed.
-  if grep -qF "$name" <<< "$SOURCES"; then
+  if grep -qxF "$fixture" <<< "$OPENED"; then
     covered=$((covered + 1))
     continue
   fi
@@ -102,8 +115,10 @@ while IFS= read -r fixture; do
     if [ "$known" = "$fixture" ]; then excused=1; break; fi
   done
   if [ "$excused" -eq 0 ]; then
-    echo "ERROR: canonical fixture '$fixture' exists but no test in this repo names it." >&2
-    echo "       Write a runner that replays it, or add it to KNOWN_UNCOVERED with a reason." >&2
+    echo "ERROR: canonical fixture '$fixture' was NOT opened by the suite." >&2
+    echo "       A runner may still name it in source while no longer reading it —" >&2
+    echo "       that is the drift this manifest exists to catch. Replay it, or add" >&2
+    echo "       it to KNOWN_UNCOVERED with a reason." >&2
     missing=$((missing + 1))
   fi
 done < <(cd "$SPEC_DIR" && find . -name '*.json' | sed 's|^\./||' | sort)
@@ -122,5 +137,5 @@ if [ "$missing" -gt 0 ]; then
   exit 1
 fi
 
-echo "conformance coverage OK: $covered/$total canonical fixtures named by tests" \
-     "(${#KNOWN_UNCOVERED[@]} listed as known-uncovered; static check — naming is not replaying)"
+echo "conformance coverage OK: $covered/$total canonical fixtures OPENED by the suite" \
+     "(${#KNOWN_UNCOVERED[@]} listed as known-uncovered; runtime manifest — these bytes were really read)"

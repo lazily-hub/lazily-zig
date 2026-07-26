@@ -578,17 +578,10 @@ test "lazily/crdt_plane: family sync materializes remote keys on ingest" {
     try std.testing.expectEqual(@as(usize, 0), reapplied);
 }
 
-fn readFamilyFixture(path: []const u8) ![]u8 {
-    if (comptime builtin.zig_version.minor >= 16) {
-        return std.Io.Dir.cwd().readFileAlloc(
-            std.testing.io,
-            path,
-            std.testing.allocator,
-            .limited(1024 * 1024),
-        );
-    }
-    return std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024);
-}
+/// Reads through the runtime conformance manifest recorder
+/// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
+/// coverage guard is fed by observed reads rather than a source grep.
+const readFamilyFixture = @import("conformance_manifest.zig").specReadFile;
 
 test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
     const allocator = std.testing.allocator;
