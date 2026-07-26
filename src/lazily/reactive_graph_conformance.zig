@@ -78,6 +78,7 @@ const FIXTURES = [_][]const u8{
     "disposal_does_not_run_surviving_effects.json",
     "dispose_detaches_edges_both_directions.json",
     "dispose_signal_reverts_to_lazy.json",
+    "failed_compute_is_never_cached.json",
     "exact_fold_paths_stay_exact.json",
     "feedback_drain_bound_reports_exhaustion.json",
     "merge_cell_acquires_no_dependency_edge.json",
@@ -102,6 +103,9 @@ const SUPPORTED_OPS = [_][]const u8{
     "dispose_stale_handle",
     // Signal eagerness (`#lzsignaleager`).
     "signal",       "dispose_signal", "batch",
+    // Arms the next N computes of an existing node to fail, so a fixture can
+    // assert on `computes_of` that a failed compute is never cached.
+    "fail_next",
 };
 
 /// Assertion keys this runner can evaluate. An `expect` key outside this set
@@ -141,6 +145,56 @@ const EXPECTED_SKIPS = [_]struct { fixture: []const u8, op: []const u8 }{
     .{ .fixture = "merge_folds_synchronously_in_batch.json", .op = "merge_cell" },
     .{ .fixture = "merge_per_settled_cone_not_per_write.json", .op = "merge_cell" },
 };
+
+/// Fixtures one MODEL cannot replay, with the capability gap that blocks it.
+///
+/// Separate from `EXPECTED_SKIPS` because the gap is per-context, not per-
+/// binding: `ThreadSafeContext.ComputeFn(T)` returns a plain `T` with no error
+/// channel (a deliberate design choice — see `thread_safe_context.zig`, which
+/// degrades a dropped edge into permanent re-computation rather than widening
+/// the signature), so a compute that FAILS is inexpressible against that
+/// context. `Context` and `AsyncContext` both take `anyerror!V` and replay the
+/// fixture normally.
+///
+/// The alternative was to fake it: return a sentinel value and have the model's
+/// `read` report an error. That would cache the sentinel, so the node would not
+/// re-run on the next read, and the fixture would report a divergence that is an
+/// artifact of the runner rather than a finding against the binding. A named
+/// skip is honest; a synthesized failure is not.
+const EXPECTED_MODEL_SKIPS = [_]struct {
+    model: []const u8,
+    fixture: []const u8,
+    reason: []const u8,
+}{
+    .{
+        .model = "ThreadSafeContext",
+        .fixture = "failed_compute_is_never_cached.json",
+        .reason = "ComputeFn(T) returns a plain T — a compute cannot fail on this context",
+    },
+    .{
+        .model = "AsyncContext",
+        .fixture = "failed_compute_is_never_cached.json",
+        .reason = "no lazy mode for derived slots — setCell enqueues every dependent unconditionally, " ++
+            "so the armed run is consumed by the write instead of the read the fixture arms it for",
+    },
+};
+
+fn modelSkipReason(model: []const u8, fixture: []const u8) ?[]const u8 {
+    for (EXPECTED_MODEL_SKIPS) |e| {
+        if (std.mem.eql(u8, e.model, model) and std.mem.eql(u8, e.fixture, fixture)) {
+            return e.reason;
+        }
+    }
+    return null;
+}
+
+fn modelSkipCount(model: []const u8) usize {
+    var n: usize = 0;
+    for (EXPECTED_MODEL_SKIPS) |e| {
+        if (std.mem.eql(u8, e.model, model)) n += 1;
+    }
+    return n;
+}
 
 /// Divergences this binding currently exhibits, keyed
 /// `<model>/<fixture><label>#<step>:<key>`. See the module doc: findings, never
@@ -402,6 +456,19 @@ const MAX_DEPS = 4;
 /// it counts what actually ran rather than what the op stream implies.
 var compute_counts: [MAX_NODES]usize = @splat(0);
 
+/// How many upcoming compute bodies must fail, per node index (`fail_next`).
+/// Consumed from inside the compute body, AFTER `compute_counts` ticks, so an
+/// armed run is counted exactly like a successful one — which is what lets a
+/// fixture assert the retry on `computes_of` rather than on the error a caching
+/// binding also raises.
+var armed_failures: [MAX_NODES]usize = @splat(0);
+
+fn takeArmed(idx: usize) bool {
+    if (armed_failures[idx] == 0) return false;
+    armed_failures[idx] -= 1;
+    return true;
+}
+
 /// The per-index node definition, rewritten as a fixture replays. Shared by all
 /// three models: the synchronous model's comptime functions read it, and the
 /// other two use it only to know a node's kind and shape.
@@ -438,6 +505,7 @@ fn resetDefs() void {
     defs = @splat(.{});
     gens = @splat(0);
     compute_counts = @splat(0);
+    armed_failures = @splat(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +555,7 @@ fn SyncNodeFns(comptime i: usize) type {
 
         fn compute(c: *Compute) anyerror!V {
             compute_counts[i] += 1;
+            if (takeArmed(i)) return error.ComputeFailed;
             const d = defs[i];
             var acc: V = d.offset;
             for (d.depSlice()) |dep| acc += try syncReadTracked(c, dep);
@@ -931,6 +1000,7 @@ const AsyncModel = struct {
     fn compute(ptr: *anyopaque, cc: *ACtx.ComputeContext) anyerror!V {
         const d: *AsyncDesc = @ptrCast(@alignCast(ptr));
         compute_counts[d.idx] += 1;
+        if (takeArmed(d.idx)) return error.ComputeFailed;
         const def = defs[d.idx];
         var acc: V = def.offset;
         for (def.depSlice()) |dep| acc += try readDep(cc, d.model.ids[dep]);
@@ -1226,6 +1296,15 @@ fn Engine(comptime Model: type) type {
                 const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
                 const v = self.model.read(idx) catch return .{ .value = null, .errored = true };
                 return .{ .value = v, .errored = false };
+            } else if (std.mem.eql(u8, op_type, "fail_next")) {
+                // Arms the next N computes of an existing node to fail. It
+                // creates nothing and touches no dependency set.
+                const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
+                const n: usize = if (field(op, "count")) |c|
+                    @intCast(try asI64(c))
+                else
+                    1;
+                armed_failures[idx] += if (n > 0) n else 1;
             } else if (std.mem.eql(u8, op_type, "set_cell")) {
                 const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
                 try self.model.setCell(idx, try asI64(field(op, "value") orelse return error.MissingValue));
@@ -1434,9 +1513,14 @@ fn Engine(comptime Model: type) type {
                     };
                     self.check("value", got, want);
                 } else if (std.mem.eql(u8, key, "error")) {
+                    // Any non-null error code means "this op must fail"; null
+                    // means "must not". The runner does not model error
+                    // identity — the fixtures carry the code so the contract is
+                    // legible, and this binding's own tests pin which error it
+                    // raises.
                     const want_error = switch (raw) {
                         .null => false,
-                        .string => |s| std.mem.eql(u8, s, "read_after_dispose"),
+                        .string => true,
                         else => return error.MalformedErrorAssertion,
                     };
                     self.check("error", op_errored, want_error);
@@ -1796,6 +1880,16 @@ fn runCorpus(comptime Model: type) !void {
         defer parsed.deinit();
         const fx = parsed.value;
 
+        if (modelSkipReason(name, fixture_name)) |reason| {
+            // Loud, named, per-model skip. Silent skipping is the anti-pattern.
+            std.debug.print(
+                "SKIP reactive-graph[{s}] {s}: {s}\n",
+                .{ name, fixture_name, reason },
+            );
+            skipped += 1;
+            continue;
+        }
+
         if (try firstUnsupported(fx)) |blocking| {
             // Loud, named skip. Silent skipping is the anti-pattern.
             std.debug.print(
@@ -1861,7 +1955,7 @@ fn runCorpus(comptime Model: type) !void {
     try std.testing.expect(replayed > 0);
     try std.testing.expect(total.ops > 0);
     try std.testing.expect(total.checks > 0);
-    try std.testing.expectEqual(EXPECTED_SKIPS.len, skipped);
+    try std.testing.expectEqual(EXPECTED_SKIPS.len + modelSkipCount(name), skipped);
     try std.testing.expectEqual(FIXTURES.len, replayed + skipped);
 
     // ---- Divergence ledger, asserted in both directions ----
