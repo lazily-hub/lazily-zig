@@ -1439,3 +1439,127 @@ test "lazily/queue: raw-channel backend conforms to minimal contract (#relaycell
     try std.testing.expectError(error.Closed, q.tryPush(3));
     try std.testing.expectError(error.Closed, q.tryPop());
 }
+
+// ---------------------------------------------------------------------------
+// Queue-family flavor ledger — enforced against the source, not a comment.
+//
+// The conformance tests above replay the canonical `queuecell_*.json` corpus
+// against the single-threaded `QueueCell`. That is currently the only flavor: no
+// binding in the family ships a thread-safe or async queue primitive, and
+// `cell-model.md` § "Core surface vs. binding extensions (queue family)" now makes
+// those Core, so their absence is a conformance gap rather than an unfinished
+// nicety.
+//
+// A three-flavor replay written today would skip two of three flavors entirely,
+// and a suite that skips almost everything while reporting green is exactly the
+// failure this ledger prevents. So it is wired to the source: it greps this
+// package for each unshipped flavor's type name, and the moment one appears the
+// test goes red and names the runner to extend.
+//
+// Mirrors lazily-rs/tests/queue_family_conformance.rs.
+// ---------------------------------------------------------------------------
+
+const QueueFlavorTag = enum { single_threaded, thread_safe, async_flavor };
+
+const QueueFlavor = struct {
+    tag: QueueFlavorTag,
+    shipped: bool,
+};
+
+const queue_flavor_ledger = [_]QueueFlavor{
+    .{ .tag = .single_threaded, .shipped = true },
+    .{ .tag = .thread_safe, .shipped = false },
+    .{ .tag = .async_flavor, .shipped = false },
+};
+
+const queue_ledger_fixtures = [_][]const u8{
+    "queuecell_spsc_push_pop.json",
+    "queuecell_popped_head_observation.json",
+    "queuecell_mpsc_multi_writer.json",
+    "queuecell_bounded_backpressure.json",
+    "queuecell_closure_lifecycle.json",
+};
+
+test "lazily/queue ledger: unshipped flavors are really absent" {
+    // NOTE on mechanism. The sibling bindings grep their source directory for each
+    // flavor's type name, which is safe there because their tests live outside it.
+    // Zig's tests live IN the source file, so grepping `@embedFile("queue.zig")`
+    // finds the ledger's own marker string literals and reports every flavor as
+    // present — a self-reference that made this test fail against correct code.
+    //
+    // `@hasDecl` is both immune to that and strictly stronger: it asks the compiler
+    // what this module actually declares, rather than asking the bytes what they
+    // mention. Same enforcement, no false positive.
+    comptime {
+        for (queue_flavor_ledger) |flavor| {
+            const present = switch (flavor.tag) {
+                .single_threaded => @hasDecl(@This(), "QueueCell"),
+                .thread_safe => @hasDecl(@This(), "ThreadSafeQueueCell"),
+                .async_flavor => @hasDecl(@This(), "AsyncQueueCell"),
+            };
+            if (flavor.shipped and !present) {
+                @compileError("a queue flavor is recorded as shipped but its type is " ++
+                    "not declared in this module — the ledger claims coverage this " ++
+                    "package does not have");
+            }
+            if (!flavor.shipped and present) {
+                @compileError("a queue flavor now EXISTS in this module but the " ++
+                    "queue-family ledger still records it as unshipped, so the " ++
+                    "canonical corpus is not being replayed against it. Fix: flip " ++
+                    ".shipped for it AND extend the replay to drive it. Do NOT flip " ++
+                    "the flag alone — that restores the false green this check prevents.");
+            }
+        }
+    }
+}
+
+test "lazily/queue ledger: is not all skips" {
+    // In a summary line, "skipped" and "passed" are indistinguishable.
+    var shipped: usize = 0;
+    for (queue_flavor_ledger) |flavor| {
+        if (flavor.shipped) shipped += 1;
+    }
+    try std.testing.expect(shipped > 0);
+    try std.testing.expectEqual(@as(usize, 3), queue_flavor_ledger.len);
+}
+
+test "lazily/queue ledger: shipped flavor replays the corpus" {
+    var fixtures_read: usize = 0;
+    var steps_seen: usize = 0;
+    var matrices_seen: usize = 0;
+
+    for (queue_ledger_fixtures) |name| {
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "../lazily-spec/conformance/collections/{s}",
+            .{name},
+        );
+        defer std.testing.allocator.free(path);
+
+        const text = readFixtureFile(path) catch return error.SkipZigTest;
+        defer std.testing.allocator.free(text);
+
+        var parsed = try json.parseFromSlice(json.Value, std.testing.allocator, text, .{});
+        defer parsed.deinit();
+        fixtures_read += 1;
+
+        const steps = (try jsonFieldRequired(parsed.value, "steps")).array;
+        // A vacuous replay would report green.
+        try std.testing.expect(steps.items.len > 0);
+        steps_seen += steps.items.len;
+
+        for (steps.items) |step| {
+            // The matrix nests under `expected`, NOT on the step. lazily-rs's MAP
+            // runner read it off the step, so it was always absent and the
+            // assertion never ran once. Pin the nesting so that cannot recur here.
+            try std.testing.expect(jsonField(step, "invalidates") == null);
+            const expected = try jsonFieldRequired(step, "expected");
+            if (jsonField(expected, "invalidates") != null) matrices_seen += 1;
+        }
+    }
+
+    try std.testing.expectEqual(queue_ledger_fixtures.len, fixtures_read);
+    try std.testing.expect(steps_seen > 0);
+    // Without this the reader-kind independence contract would be unasserted.
+    try std.testing.expect(matrices_seen > 0);
+}
