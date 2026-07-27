@@ -252,11 +252,11 @@ pub fn removeEagerHooks(slot_ptr: *Slot) void {
 }
 
 /// Deprecated convenience for an **eager** `Computed` — `computed(...).eager()`.
-/// The standalone `Signal` handle is retired (`#lzcellkernel`); this returns a
-/// `*Computed(T)` already made eager, matching lazily-rs `Context::signal ->
-/// Computed<T>`. `.eager()` reserves the `pending_recompute` entry and installs
-/// the same `on_invalidate_hook`/`makeRecomputeFn` puller this module owns.
-/// Prefer `computed(...).eager()` directly.
+/// Deprecated: prefer `computed(...).eager()` directly. The standalone `Signal`
+/// handle is retired (`#lzcellkernel`); this returns a `*Computed(T)` already
+/// made eager, matching lazily-rs `Context::signal -> Computed<T>`. `.eager()`
+/// reserves the `pending_recompute` entry and installs the same
+/// `on_invalidate_hook`/`makeRecomputeFn` puller this module owns.
 pub fn signal(
     comptime T: type,
     ctx: *Context,

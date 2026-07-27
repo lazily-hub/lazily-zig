@@ -79,14 +79,15 @@ pub const expectEventLog = @import("./lazily/test.zig").expectEventLog;
 pub const StateMachine = @import("./lazily/state_machine.zig").StateMachine;
 pub const StateChart = @import("./lazily/statechart.zig").StateChart;
 pub const ChartDef = @import("./lazily/statechart.zig").ChartDef;
-// The standalone `Signal` handle type is retired (`#lzcellkernel`); eager
-// construction is now `computed(...).eager()`. `signal`/`signalKeyed` survive as
-// deprecated convenience constructors returning an eager `*Computed(T)`
-// (mirroring lazily-rs `Context::signal -> Computed<T>`).
+/// Deprecated: use `computed(...).eager()`. The standalone `Signal` handle type
+/// is retired (`#lzcellkernel`); this compatibility constructor already returns
+/// an eager `*Computed(T)`.
 pub const signal = @import("./lazily/signal.zig").signal;
 /// Compile-time build flags (see build.zig). Exposed so audit harnesses can
 /// report which arm they were compiled as (`#lzspecedgeindex`).
 pub const build_options = @import("build_options");
+/// Deprecated: use `computedKeyed(...).eager()`. This compatibility constructor
+/// already returns an eager `*Computed(T)`.
 pub const signalKeyed = @import("./lazily/signal.zig").signalKeyed;
 pub const Effect = @import("./lazily/effect.zig").Effect;
 pub const effect = @import("./lazily/effect.zig").effect;
