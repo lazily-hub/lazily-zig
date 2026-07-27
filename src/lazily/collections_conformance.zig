@@ -162,12 +162,12 @@ test "collections conformance: keyed_reconciliation_lis.json" {
     {
         const ctx = try Context.init(allocator);
         defer ctx.deinit();
-        var map = reactive_map.SourceMap([]const u8, V).init(ctx);
+        var map = try reactive_map.SourceMap([]const u8, V).init(ctx);
         defer map.deinit();
         for (prior) |kv| try map.set(kv.key, kv.value);
         try applyOps(&map, ops);
 
-        const keys = map.keys();
+        const keys = map.keys().get();
         try testing.expectEqual(result_order.len, keys.len);
         for (result_order, keys) |want, got| {
             try testing.expectEqualStrings(try cj.asStr(want), got);
@@ -179,7 +179,7 @@ test "collections conformance: keyed_reconciliation_lis.json" {
         const stable = try cj.arrayOr(expected, "stable_keys_not_invalidated");
         const ctx = try Context.init(allocator);
         defer ctx.deinit();
-        var map = reactive_map.SourceMap([]const u8, V).init(ctx);
+        var map = try reactive_map.SourceMap([]const u8, V).init(ctx);
         defer map.deinit();
         for (prior) |kv| try map.set(kv.key, kv.value);
 

@@ -105,7 +105,8 @@ const Versions = struct {
 // The three models
 // ---------------------------------------------------------------------------
 
-/// Single-threaded. Entries are cached values with their own version stamp.
+/// Single-threaded. Cached collection storage is surfaced through real
+/// per-entry, membership, and order graph nodes.
 const SyncModel = struct {
     ctx: *Context,
     map: reactive_map.SourceMap([]const u8, V),
@@ -115,7 +116,7 @@ const SyncModel = struct {
 
     fn init(allocator: std.mem.Allocator) !Self {
         const ctx = try Context.init(allocator);
-        return .{ .ctx = ctx, .map = reactive_map.SourceMap([]const u8, V).init(ctx) };
+        return .{ .ctx = ctx, .map = try reactive_map.SourceMap([]const u8, V).init(ctx) };
     }
     fn deinit(self: *Self) void {
         self.map.deinit();
@@ -137,13 +138,13 @@ const SyncModel = struct {
         _ = self.map.moveAfter(key, anchor);
     }
     fn keys(self: *Self) []const []const u8 {
-        return self.map.keys();
+        return self.map.keys().get();
     }
     fn value(self: *Self, key: []const u8) ?V {
         return self.map.get(key);
     }
     fn contains(self: *Self, key: []const u8) bool {
-        return self.map.contains(key);
+        return self.map.contains(key).get();
     }
     fn valueVersion(self: *Self, key: []const u8) ?u64 {
         return self.map.valueVersion(key);

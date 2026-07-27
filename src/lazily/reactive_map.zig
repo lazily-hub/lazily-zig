@@ -6,8 +6,9 @@
 //! **reactive membership + order** and abstracts over the entry's **handle kind**
 //! (`ReactiveMap<K, V, H>` in Rust). Zig has no runtime closures and keys its
 //! reactive slots by comptime function pointer, so this port fixes the handle-kind
-//! axis with a comptime [`EntryKind`] parameter and models each entry as a cached
-//! value in a present-set map plus an authoritative order list.
+//! axis with a comptime [`EntryKind`] parameter. Cached collection storage is
+//! exposed through graph-backed reader handles: every entry has its own value
+//! node, while membership and order have independent nodes.
 //!
 //! # One primitive, two specializations
 //!
@@ -28,8 +29,8 @@
 //!
 //! # Three reader-class signals
 //!
-//! Like the Rust reference, a `ReactiveMap` exposes three independent version
-//! counters (`conformance/collections/cellmap_independence.json`):
+//! Like the Rust reference, a `ReactiveMap` exposes three independent graph
+//! reader kinds (`conformance/collections/cellmap_independence.json`):
 //! - **value**: per-entry — a value write invalidates only that entry's readers.
 //! - **membership**: bumped on add/remove only (`len` / `contains` readers).
 //! - **order**: bumped on add/remove **and** move/reorder (`keys` readers).
@@ -41,10 +42,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
+const Compute = @import("context.zig").Compute;
+const Slot = @import("context.zig").Slot;
+const cell = @import("cell.zig");
 const keyed_order = @import("keyed_order.zig");
 const KeyedOrder = keyed_order.KeyedOrder;
-const Mutation = keyed_order.Mutation;
 const Move = keyed_order.Move;
+const ReaderKind = @import("reader_kind.zig").ReaderKind;
 
 /// Which kind of reactive node a [`ReactiveMap`] entry is — the handle-kind axis
 /// the map fixes at comptime.
@@ -130,54 +134,28 @@ pub fn Factory(comptime K: type, comptime V: type) type {
     };
 }
 
-/// What identifies an entry on the single-threaded map.
-///
-/// The Core surface requires `handle(key)` so the atomic-move law ("a reorder
-/// keeps the entry's same handle") is assertable. This flavor is not
-/// graph-backed — entries are cached values, not nodes — so there is no node id
-/// to hand back; identity here is the entry's value version, which a write bumps
-/// and a reorder must not. Strictly weaker than a node handle, and the reason
-/// this binding scores partial rather than green on the Core row.
-pub const EntryHandle = struct {
-    /// Monotonic birth id, assigned once when the entry is minted. Stable across
-    /// value writes and reorders; a removed-and-re-minted key gets a fresh one.
-    /// This is the identity the atomic-move law is stated over.
-    id: u64,
-};
-
 /// The unified keyed reactive map (`#reactivemap`): keys `K` map to per-entry
 /// reactive nodes of the comptime-fixed [`EntryKind`], with reactive membership +
 /// order. See the module docs and the [`SourceMap`] / [`ComputedMap`] specializations.
 pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: EntryKind) type {
     return struct {
-        /// One entry's payload. The cached value plus its **own** version, so a
-        /// value write is observable independently of membership and order —
-        /// the third reader class the fixtures assert. Without it, `set` on an
-        /// existing key changed nothing any reader could see.
+        /// One entry's cached storage plus its graph identity. `ValueReader`
+        /// demand-derives the value from this storage while subscribing through
+        /// `reader.slot()`, exactly like QueueCell's graph-backed readers.
         pub const Entry = struct {
             value: V,
-            /// Bumped only by a write to this entry — the value reader class.
-            version: u64 = 0,
-            /// Birth id. Never changes for the life of the entry, which is what
-            /// makes it an identity rather than a change counter.
-            id: u64,
+            reader: ReaderKind,
         };
 
         ctx: *Context,
         /// Present set + authoritative order + the move algebra, shared verbatim
-        /// with the thread-safe and async flavors. The payload is the cached
-        /// value: this flavor is not graph-backed (see the module docs).
+        /// with the thread-safe and async flavors.
         core: KeyedOrder(K, Entry),
-        /// Membership version — bumped on add/remove only. `len` / `contains`
-        /// readers subscribe here.
-        membership_version: u64 = 0,
-        /// Monotonic source of entry birth ids. Never reused within a map, so a
-        /// remove-then-re-mint is distinguishable from a reorder.
-        next_entry_id: u64 = 0,
-        /// Order version — bumped on add/remove **and** move/reorder. `keys`
-        /// readers subscribe here so an atomic move invalidates order readers
-        /// without disturbing set-identity readers.
-        order_version: u64 = 0,
+        /// Add/remove only. `len` / `contains` readers subscribe here.
+        membership_reader: ReaderKind,
+        /// Add/remove and move/reorder. `keys` / `position` readers subscribe
+        /// here without disturbing membership or per-entry readers.
+        order_reader: ReaderKind,
         allocator: std.mem.Allocator,
 
         const Self = @This();
@@ -185,29 +163,41 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         /// This map's entry kind (comptime).
         pub const kind: EntryKind = entry_kind;
 
-        /// Create an empty map bound to `ctx`.
-        pub fn init(ctx: *Context) Self {
+        /// Create an empty map bound to `ctx`, including the independent
+        /// membership and order graph nodes.
+        pub fn init(ctx: *Context) !Self {
+            const membership_reader = try ReaderKind.init(ctx);
+            errdefer membership_reader.dispose();
+            const order_reader = try ReaderKind.init(ctx);
             return .{
                 .ctx = ctx,
                 .core = KeyedOrder(K, Entry).init(ctx.allocator),
+                .membership_reader = membership_reader,
+                .order_reader = order_reader,
                 .allocator = ctx.allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            var entries = self.core.present.valueIterator();
+            while (entries.next()) |payload| payload.reader.dispose();
+            self.membership_reader.dispose();
+            self.order_reader.dispose();
             self.core.deinit();
         }
 
         /// Mint the entry for `key` with `value` (assumes `key` is absent),
         /// recording membership + order. Bumps both the membership and order
-        /// versions: a new key changes the set identity and the ordered key list.
+        /// nodes: a new key changes the set identity and the ordered key list.
         fn mint(self: *Self, key: K, value: V) !void {
-            const id = self.next_entry_id;
-            self.next_entry_id += 1;
-            const res = try self.core.insert(key, .{ .value = value, .id = id });
+            const reader = try ReaderKind.init(self.ctx);
+            errdefer reader.dispose();
+            const res = try self.core.insert(key, .{ .value = value, .reader = reader });
             if (res.mutation == .changed) {
-                self.membership_version += 1;
-                self.order_version += 1;
+                var changed = [_]ReaderKind{ self.membership_reader, self.order_reader };
+                ReaderKind.bumpMany(self.ctx, &changed);
+            } else {
+                reader.dispose();
             }
         }
 
@@ -223,31 +213,42 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             return value;
         }
 
-        /// Read the value at `key` if present, else `null`. Non-minting.
+        /// Non-reactive value snapshot at `key`, or `null`. Use [`handle`] and
+        /// `Compute.get` to register a per-entry dependency edge.
         pub fn get(self: *const Self, key: K) ?V {
             const e = self.core.get(key) orelse return null;
             return e.value;
         }
 
-        /// The entry's identity for `key`, or `null` if absent.
+        /// A graph-backed per-entry value handle. `Compute.get(handle)` reads
+        /// the current cached value and registers `entry -> computation`.
         ///
-        /// The Core-surface `handle`. This flavor is not graph-backed, so there
-        /// is no node id to return; identity here is the entry's **birth id**,
-        /// which survives value writes and reorders and changes only on a
-        /// remove-then-re-mint. That is exactly what the atomic-move law is
-        /// stated over, so `handle_stable` is assertable — but it carries no
-        /// dependents and no lineage, which is why this binding is marked
-        /// partial on the Core row rather than green.
-        pub fn handle(self: *const Self, key: K) ?EntryHandle {
+        /// `id` is the actual graph-node id. Reorders and writes keep it stable;
+        /// remove disposes it and a later re-mint receives a fresh id.
+        pub const ValueReader = struct {
+            owner: *const Self,
+            key: K,
+            slot: *Slot,
+            id: u64,
+
+            pub fn get(reader: @This()) ?V {
+                const payload = reader.owner.core.get(reader.key) orelse return null;
+                return payload.value;
+            }
+        };
+
+        pub fn handle(self: *const Self, key: K) ?ValueReader {
             const e = self.core.get(key) orelse return null;
-            return .{ .id = e.id };
+            const slot = e.reader.slot();
+            return .{ .owner = self, .key = key, .slot = slot, .id = slot.id.raw };
         }
 
         /// The value version for `key`, or `null` if absent. Bumped only by a
-        /// write to that entry — never by membership or order changes.
+        /// write to that entry — never by membership or order changes. This is
+        /// a conformance snapshot of the real graph node, not the reactive API.
         pub fn valueVersion(self: *const Self, key: K) ?u64 {
             const e = self.core.get(key) orelse return null;
-            return e.version;
+            return e.reader.version();
         }
 
         /// Remove `key`'s entry. Bumps membership + order. Returns whether the key
@@ -255,19 +256,29 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
         pub fn remove(self: *Self, key: K) bool {
             const res = self.core.remove(key);
             if (res.mutation == .unchanged) return false;
-            self.membership_version += 1;
-            self.order_version += 1;
+            res.handle.?.reader.dispose();
+            var changed = [_]ReaderKind{ self.membership_reader, self.order_reader };
+            ReaderKind.bumpMany(self.ctx, &changed);
             return true;
         }
 
-        /// Reactive snapshot of the keys in their current order — order readers
-        /// (add/remove **and** move/reorder), not per-entry value changes.
-        pub fn keys(self: *const Self) []const K {
-            return self.core.keys();
+        pub const KeysReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) []const K {
+                return reader.owner.core.keys();
+            }
+        };
+
+        /// Reactive ordered-key reader. `Compute.get(map.keys())` subscribes to
+        /// add/remove and move/reorder, never per-entry value writes.
+        pub fn keys(self: *const Self) KeysReader {
+            return .{ .owner = self, .slot = self.order_reader.slot() };
         }
 
         /// The currently-materialized (present) keys, in first-materialization
-        /// order. Alias for [`keys`].
+        /// order. Non-reactive snapshot access.
         pub fn presentKeys(self: *const Self) []const K {
             return self.core.keys();
         }
@@ -282,34 +293,72 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             return self.core.contains(key);
         }
 
-        /// Current 0-based position of `key` in the order, or `null` if absent.
-        pub fn position(self: *const Self, key: K) ?usize {
-            return self.core.position(key);
+        pub const PositionReader = struct {
+            owner: *const Self,
+            key: K,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) ?usize {
+                return reader.owner.core.position(reader.key);
+            }
+        };
+
+        /// Reactive 0-based position reader for `key`.
+        pub fn position(self: *const Self, key: K) PositionReader {
+            return .{ .owner = self, .key = key, .slot = self.order_reader.slot() };
         }
 
-        /// Reactive entry count. Membership readers subscribe here.
-        pub fn len(self: *const Self) usize {
-            return self.core.len();
+        pub const LenReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) usize {
+                return reader.owner.core.len();
+            }
+        };
+
+        /// Reactive entry-count reader.
+        pub fn len(self: *const Self) LenReader {
+            return .{ .owner = self, .slot = self.membership_reader.slot() };
         }
 
-        /// Reactive emptiness check.
-        pub fn isEmpty(self: *const Self) bool {
-            return self.core.len() == 0;
+        pub const EmptyReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) bool {
+                return reader.owner.core.len() == 0;
+            }
+        };
+
+        /// Reactive emptiness reader.
+        pub fn isEmpty(self: *const Self) EmptyReader {
+            return .{ .owner = self, .slot = self.membership_reader.slot() };
         }
 
-        /// Reactive membership test for `key`.
-        pub fn contains(self: *const Self, key: K) bool {
-            return self.core.contains(key);
+        pub const ContainsReader = struct {
+            owner: *const Self,
+            key: K,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) bool {
+                return reader.owner.core.contains(reader.key);
+            }
+        };
+
+        /// Reactive membership reader for `key`.
+        pub fn contains(self: *const Self, key: K) ContainsReader {
+            return .{ .owner = self, .key = key, .slot = self.membership_reader.slot() };
         }
 
-        /// Current membership version (bumped on add/remove).
+        /// Current membership graph-node version (bumped on add/remove).
         pub fn membershipVersion(self: *const Self) u64 {
-            return self.membership_version;
+            return self.membership_reader.version();
         }
 
-        /// Current order version (bumped on add/remove and reorder).
+        /// Current order graph-node version (bumped on add/remove and reorder).
         pub fn orderVersion(self: *const Self) u64 {
-            return self.order_version;
+            return self.order_reader.version();
         }
 
         /// This map's entry kind ([`EntryKind.source`] for a [`SourceMap`],
@@ -341,10 +390,10 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             return self.settleMove(self.core.moveAfter(key, after_key));
         }
 
-        /// Bump the order version iff the order actually changed, and report
+        /// Bump the order graph node iff the order actually changed, and report
         /// whether the move could be expressed. Shared by all three `move*`.
         fn settleMove(self: *Self, outcome: Move) bool {
-            if (outcome.changed()) self.order_version += 1;
+            if (outcome.changed()) self.order_reader.bump();
             return outcome.isPresent();
         }
 
@@ -391,9 +440,9 @@ pub fn ReactiveMap(comptime K: type, comptime V: type, comptime entry_kind: Entr
             if (self.core.getPtr(key)) |ep| {
                 if (std.meta.eql(ep.value, value)) return; // PartialEq guard.
                 // Value axis only — membership/order untouched. The per-entry
-                // version bump is what makes that observable to a reader.
+                // graph node carries the invalidation to its dependents.
                 ep.value = value;
-                ep.version +%= 1;
+                ep.reader.bump();
                 return;
             }
             try self.mint(key, value);
@@ -478,20 +527,20 @@ test "lazily/reactive_map: entry caches one value per key" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap([]const u8, i32).init(ctx);
+    var map = try SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(i32, 1), try map.entry("a", 1));
     // Same key -> cached value; the second default is ignored.
     try testing.expectEqual(@as(i32, 1), try map.entry("a", 999));
-    try testing.expectEqual(@as(usize, 1), map.len());
+    try testing.expectEqual(@as(usize, 1), map.len().get());
 }
 
 test "lazily/reactive_map: set inserts then updates in place" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap([]const u8, i32).init(ctx);
+    var map = try SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
 
     try map.set("a", 1);
@@ -514,7 +563,7 @@ test "lazily/reactive_map: PartialEq guard on equal set is a no-op" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap([]const u8, i32).init(ctx);
+    var map = try SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
 
     try map.set("a", 1);
@@ -529,31 +578,136 @@ test "lazily/reactive_map: membership vs value independence" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap([]const u8, i32).init(ctx);
+    var map = try SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
     _ = try map.entry("a", 1);
     _ = try map.entry("b", 2);
-    try testing.expectEqual(@as(usize, 2), map.len());
+    try testing.expectEqual(@as(usize, 2), map.len().get());
 
     const mv = map.membershipVersion();
     // Mutating an existing entry must NOT change membership.
     try map.set("a", 100);
     try testing.expectEqual(mv, map.membershipVersion());
-    try testing.expectEqual(@as(usize, 2), map.len());
+    try testing.expectEqual(@as(usize, 2), map.len().get());
 
     // Adding and removing keys DO change membership.
     _ = try map.entry("c", 3);
     try testing.expect(map.membershipVersion() > mv);
     try testing.expect(map.remove("b"));
-    try testing.expect(!map.contains("b"));
-    try testing.expectEqualSlices([]const u8, &.{ "a", "c" }, map.keys());
+    try testing.expect(!map.contains("b").get());
+    try testing.expectEqualSlices([]const u8, &.{ "a", "c" }, map.keys().get());
+}
+
+test "lazily/reactive_map: graph readers invalidate only their dependency class" {
+    const Map = SourceMap(u32, u32);
+    const Probe = struct {
+        var map: *Map = undefined;
+        var value_runs: usize = 0;
+        var len_runs: usize = 0;
+        var contains_runs: usize = 0;
+        var first_key_runs: usize = 0;
+
+        fn value(c: *Compute) !u32 {
+            value_runs += 1;
+            return c.get(map.handle(1).?) orelse unreachable;
+        }
+
+        fn len(c: *Compute) !usize {
+            len_runs += 1;
+            return c.get(map.len());
+        }
+
+        fn containsThree(c: *Compute) !bool {
+            contains_runs += 1;
+            return c.get(map.contains(3));
+        }
+
+        fn firstKey(c: *Compute) !u32 {
+            first_key_runs += 1;
+            return c.get(map.keys())[0];
+        }
+    };
+
+    const ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    var map = try Map.init(ctx);
+    defer map.deinit();
+    Probe.map = &map;
+    Probe.value_runs = 0;
+    Probe.len_runs = 0;
+    Probe.contains_runs = 0;
+    Probe.first_key_runs = 0;
+
+    try map.set(1, 10);
+    try map.set(2, 20);
+    const stable = map.handle(1).?;
+
+    const value = try cell.computed(u32, ctx, Probe.value, null);
+    defer ctx.allocator.destroy(value);
+    defer value.dispose();
+    const len = try cell.computed(usize, ctx, Probe.len, null);
+    defer ctx.allocator.destroy(len);
+    defer len.dispose();
+    const contains_three = try cell.computed(bool, ctx, Probe.containsThree, null);
+    defer ctx.allocator.destroy(contains_three);
+    defer contains_three.dispose();
+    const first_key = try cell.computed(u32, ctx, Probe.firstKey, null);
+    defer ctx.allocator.destroy(first_key);
+    defer first_key.dispose();
+
+    try testing.expectEqual(@as(u32, 10), value.get().*);
+    try testing.expectEqual(@as(usize, 2), len.get().*);
+    try testing.expect(!contains_three.get().*);
+    try testing.expectEqual(@as(u32, 1), first_key.get().*);
+    try testing.expectEqual(@as(usize, 1), Probe.value_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.len_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.contains_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.first_key_runs);
+
+    // Equal writes are inert; a real write dirties only this entry's node.
+    try map.set(1, 10);
+    try testing.expectEqual(@as(u32, 10), value.get().*);
+    try testing.expectEqual(@as(usize, 1), Probe.value_runs);
+    try map.set(1, 11);
+    try testing.expectEqual(@as(u32, 11), value.get().*);
+    try testing.expectEqual(@as(usize, 2), Probe.value_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.len_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.contains_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.first_key_runs);
+
+    // Reorder dirties order only and preserves the actual graph handle.
+    try testing.expect(map.moveTo(2, 0));
+    const after_move = map.handle(1).?;
+    try testing.expect(stable.slot == after_move.slot);
+    try testing.expectEqual(stable.id, after_move.id);
+    try testing.expectEqual(@as(u32, 2), first_key.get().*);
+    try testing.expectEqual(@as(usize, 2), Probe.first_key_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.len_runs);
+    try testing.expectEqual(@as(usize, 1), Probe.contains_runs);
+
+    // Add/remove dirties membership and order, never the existing value node.
+    try map.set(3, 30);
+    try testing.expectEqual(@as(usize, 3), len.get().*);
+    try testing.expect(contains_three.get().*);
+    try testing.expectEqual(@as(usize, 2), Probe.len_runs);
+    try testing.expectEqual(@as(usize, 2), Probe.contains_runs);
+    try testing.expectEqual(@as(u32, 2), first_key.get().*);
+    try testing.expectEqual(@as(usize, 3), Probe.first_key_runs);
+    try testing.expectEqual(@as(usize, 2), Probe.value_runs);
+
+    try testing.expect(map.remove(3));
+    try testing.expectEqual(@as(usize, 2), len.get().*);
+    try testing.expect(!contains_three.get().*);
+    try testing.expectEqual(@as(usize, 3), Probe.len_runs);
+    try testing.expectEqual(@as(usize, 3), Probe.contains_runs);
+    try testing.expectEqual(@as(usize, 2), Probe.value_runs);
 }
 
 test "lazily/reactive_map: getOrInsertWith mints once then returns existing" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = ComputedMap(u32, u32).init(ctx);
+    var map = try ComputedMap(u32, u32).init(ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(u32, 14), try map.getOrInsertWith(7, Factory(u32, u32).pure(timesTwo)));
@@ -568,7 +722,7 @@ test "lazily/reactive_map: ComputedMap materializeAll is eager" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = ComputedMap(u32, u32).init(ctx);
+    var map = try ComputedMap(u32, u32).init(ctx);
     defer map.deinit();
     try map.materializeAll(&.{ 0, 1, 2, 5, 9 }, Factory(u32, u32).pure(timesThree));
     try testing.expectEqual(@as(usize, 5), map.presentCount());
@@ -581,11 +735,11 @@ test "lazily/reactive_map: ComputedMap lazy vs eager observe identically" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var eager_map = ComputedMap(u32, u32).init(ctx);
+    var eager_map = try ComputedMap(u32, u32).init(ctx);
     defer eager_map.deinit();
     try eager_map.materializeAll(&.{ 0, 1, 2, 5, 9 }, Factory(u32, u32).pure(timesThree));
 
-    var lazy_map = ComputedMap(u32, u32).init(ctx);
+    var lazy_map = try ComputedMap(u32, u32).init(ctx);
     defer lazy_map.deinit();
     for ([_]u32{ 0, 1, 2, 5, 9 }) |k| {
         try testing.expectEqual(eager_map.get(k).?, try lazy_map.getOrInsertWith(k, Factory(u32, u32).pure(timesThree)));
@@ -596,7 +750,7 @@ test "lazily/reactive_map: present set is monotone across reads" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = ComputedMap(u32, u32).init(ctx);
+    var map = try ComputedMap(u32, u32).init(ctx);
     defer map.deinit();
 
     var sizes: [4]usize = undefined;
@@ -614,7 +768,7 @@ test "lazily/reactive_map: cell entries are writable inputs" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap(u32, u32).init(ctx);
+    var map = try SourceMap(u32, u32).init(ctx);
     defer map.deinit();
 
     try testing.expectEqual(@as(u32, 7), try map.entry(7, 7));
@@ -629,7 +783,7 @@ test "lazily/reactive_map: cell map materialized on entry in any use" {
     defer ctx.deinit();
 
     const cell_keys = [_][]const u8{ "a", "b", "c" };
-    var map = SourceMap([]const u8, u32).init(ctx);
+    var map = try SourceMap([]const u8, u32).init(ctx);
     defer map.deinit();
     for (cell_keys) |k| _ = try map.entry(k, 0);
     try testing.expectEqual(EntryKind.source, map.entryKind());
@@ -640,20 +794,20 @@ test "lazily/reactive_map: atomic move bumps order only, preserves membership + 
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap([]const u8, i32).init(ctx);
+    var map = try SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
     _ = try map.entry("a", 1);
     _ = try map.entry("b", 2);
     _ = try map.entry("c", 3);
     _ = try map.entry("d", 4);
-    try testing.expectEqualSlices([]const u8, &.{ "a", "b", "c", "d" }, map.keys());
+    try testing.expectEqualSlices([]const u8, &.{ "a", "b", "c", "d" }, map.keys().get());
 
     const mv0 = map.membershipVersion();
     const ov0 = map.orderVersion();
 
     // moveTo: "c" -> front.
     try testing.expect(map.moveTo("c", 0));
-    try testing.expectEqualSlices([]const u8, &.{ "c", "a", "b", "d" }, map.keys());
+    try testing.expectEqualSlices([]const u8, &.{ "c", "a", "b", "d" }, map.keys().get());
     // Order changed; membership did NOT.
     try testing.expectEqual(ov0 + 1, map.orderVersion());
     try testing.expectEqual(mv0, map.membershipVersion());
@@ -662,14 +816,14 @@ test "lazily/reactive_map: atomic move bumps order only, preserves membership + 
 
     // Absent key -> false, no reorder.
     try testing.expect(!map.moveTo("z", 0));
-    try testing.expectEqualSlices([]const u8, &.{ "c", "a", "b", "d" }, map.keys());
+    try testing.expectEqualSlices([]const u8, &.{ "c", "a", "b", "d" }, map.keys().get());
 }
 
 test "lazily/reactive_map: no-op move does not bump order" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap([]const u8, i32).init(ctx);
+    var map = try SourceMap([]const u8, i32).init(ctx);
     defer map.deinit();
     _ = try map.entry("a", 1);
     _ = try map.entry("b", 2);
@@ -680,25 +834,25 @@ test "lazily/reactive_map: no-op move does not bump order" {
     try testing.expectEqual(ov0, map.orderVersion());
     // Index past the end clamps to last position.
     try testing.expect(map.moveTo("a", 99));
-    try testing.expectEqualSlices([]const u8, &.{ "b", "a" }, map.keys());
+    try testing.expectEqualSlices([]const u8, &.{ "b", "a" }, map.keys().get());
 }
 
 test "lazily/reactive_map: moveBefore / moveAfter place relative to anchor" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    var map = SourceMap(i32, i32).init(ctx);
+    var map = try SourceMap(i32, i32).init(ctx);
     defer map.deinit();
     for ([_]i32{ 0, 1, 2, 3 }) |k| _ = try map.entry(k, k * 10);
-    try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, map.keys());
+    try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, map.keys().get());
 
     // moveBefore: 3 before 1.
     try testing.expect(map.moveBefore(3, 1));
-    try testing.expectEqualSlices(i32, &.{ 0, 3, 1, 2 }, map.keys());
+    try testing.expectEqualSlices(i32, &.{ 0, 3, 1, 2 }, map.keys().get());
 
     // moveAfter: 0 after 2.
     try testing.expect(map.moveAfter(0, 2));
-    try testing.expectEqualSlices(i32, &.{ 3, 1, 2, 0 }, map.keys());
+    try testing.expectEqualSlices(i32, &.{ 3, 1, 2, 0 }, map.keys().get());
 
     // Unknown anchor / key -> false.
     try testing.expect(!map.moveBefore(3, 99));
@@ -856,10 +1010,10 @@ fn checkValFixture(ctx: *Context, name: []const u8) !void {
     }
 
     // Eager = pre-mint loop; lazy = empty, mint-on-access.
-    var eager_map = Slots.init(ctx);
+    var eager_map = try Slots.init(ctx);
     defer eager_map.deinit();
     try eager_map.materializeAll(keys.items, lookup.factory());
-    var lazy_map = Slots.init(ctx);
+    var lazy_map = try Slots.init(ctx);
     defer lazy_map.deinit();
 
     // eager_materializes_all / lazy_defers_slots
@@ -909,7 +1063,7 @@ test "lazily/reactive_map conformance: observational_transparency" {
         try keys.append(testing.allocator, entry.key_ptr.*);
     }
 
-    var lazy_map = Slots.init(ctx);
+    var lazy_map = try Slots.init(ctx);
     defer lazy_map.deinit();
     for (try arrayItems(try jsonFieldRequired(fixture, "reads"))) |r| {
         _ = try lazy_map.getOrInsertWith(try jsonAsString(r), lookup.factory());
@@ -944,7 +1098,7 @@ test "lazily/reactive_map conformance: deferral_not_deallocation" {
         try keys.append(testing.allocator, entry.key_ptr.*);
     }
 
-    var lazy_map = Slots.init(ctx);
+    var lazy_map = try Slots.init(ctx);
     defer lazy_map.deinit();
 
     // present_after_each_read: cumulative present-set size, monotone and
@@ -1015,10 +1169,10 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     }
 
     // Eager build: every entry present (cells via entry, slots via materializeAll).
-    var eager_cells = Cells.init(ctx);
+    var eager_cells = try Cells.init(ctx);
     defer eager_cells.deinit();
     for (cell_keys.items) |k| _ = try eager_cells.entry(k, lookup.map.get(k).?);
-    var eager_slots = Slots.init(ctx);
+    var eager_slots = try Slots.init(ctx);
     defer eager_slots.deinit();
     try eager_slots.materializeAll(slot_keys.items, lookup.factory());
     try testing.expectEqual(EntryKind.source, eager_cells.entryKind());
@@ -1029,10 +1183,10 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     );
 
     // Lazy build: cells present at build (input cells always materialized), slots deferred.
-    var lazy_cells = Cells.init(ctx);
+    var lazy_cells = try Cells.init(ctx);
     defer lazy_cells.deinit();
     for (cell_keys.items) |k| _ = try lazy_cells.entry(k, lookup.map.get(k).?);
-    var lazy_slots = Slots.init(ctx);
+    var lazy_slots = try Slots.init(ctx);
     defer lazy_slots.deinit();
     try testing.expectEqual(@as(usize, 0), lazy_slots.presentCount());
     try expectSameKeySet(try arrayItems(try jsonFieldRequired(expected, "lazy_present_at_build")), lazy_cells.presentKeys());
@@ -1103,4 +1257,3 @@ test "lazily/reactive_map: EntryKind.fromWireName accepts both spellings, reject
     try testing.expectEqual(EntryKind.source, try EntryKind.fromWireName(EntryKind.source.wireName()));
     try testing.expectEqual(EntryKind.computed, try EntryKind.fromWireName(EntryKind.computed.wireName()));
 }
-
