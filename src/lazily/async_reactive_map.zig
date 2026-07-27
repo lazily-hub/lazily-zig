@@ -3,11 +3,11 @@
 //!
 //! Keys `K` map to per-entry async reactive nodes **allocated in a real
 //! [`AsyncContext`]**:
-//! - a **cell** entry is an [`AsyncContext.cell`] — always resolved;
-//! - a **slot** entry is an [`AsyncContext.computedAsyncClosure`] — a genuine
-//!   async slot that is **pending** until driven ([`drive`], the analog of
+//! - a **source** entry is an [`AsyncContext.source`] — always resolved;
+//! - a **computed** entry is an [`AsyncContext.computedClosure`] — a genuine
+//!   async computed that is **pending** until driven ([`drive`], the analog of
 //!   `AsyncContext.get_async` / `settle`), then **resolved**. The per-key value
-//!   is recovered by the slot's closure via a map-owned `slot_id → value` map,
+//!   is recovered by the computed's closure via a map-owned `id → value` map,
 //!   the capability the generic `AsyncContext` closure-userdata unlocks.
 //!
 //! There is **no eager/lazy mode flag** — eager = pre-mint loop
@@ -24,6 +24,8 @@
 const std = @import("std");
 const async_context = @import("async_context.zig");
 const AsyncContext = async_context.AsyncContext;
+const AsyncComputed = async_context.AsyncComputed;
+const AsyncSource = async_context.AsyncSource;
 const reactive_map = @import("reactive_map.zig");
 const keyed_order = @import("keyed_order.zig");
 const KeyedOrder = keyed_order.KeyedOrder;
@@ -45,10 +47,9 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// The shared async reactive context every entry lives in.
         actx: *AsyncContext(V),
         /// Present set + authoritative order + the move algebra, shared verbatim
-        /// with the single-threaded and thread-safe flavors. The payload is the
-        /// entry's node id in `actx`.
-        core: KeyedOrder(K, u64),
-        /// For slot maps: slot node id → the canonical value its async compute
+        /// with the single-threaded and thread-safe flavors.
+        core: KeyedOrder(K, EntryHandle),
+        /// For computed maps: node id → the canonical value its async compute
         /// resolves to (recovered by the closure via `cc.slot_id`).
         /// **Heap-allocated** so its address is stable across the by-value map
         /// move — the slot closure captures *this map*, never the reactive map,
@@ -61,6 +62,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         order_version: u64 = 0,
 
         const Self = @This();
+        const EntryHandle = if (entry_kind == .source) AsyncSource(V) else AsyncComputed(V);
         const SlotValues = std.AutoHashMap(u64, V);
 
         pub const kind: EntryKind = entry_kind;
@@ -79,7 +81,7 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
             values.* = SlotValues.init(actx.allocator);
             return Self{
                 .actx = actx,
-                .core = KeyedOrder(K, u64).init(actx.allocator),
+                .core = KeyedOrder(K, EntryHandle).init(actx.allocator),
                 .slot_values = values,
                 .allocator = actx.allocator,
             };
@@ -92,19 +94,18 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         }
 
         /// Allocate `key` if absent (present-set grows) with canonical `value`,
-        /// returning its node id. A cell entry is an always-resolved async cell;
-        /// a slot entry is a genuine async slot (pending until driven). Warm key →
-        /// cached id.
-        fn mint(self: *Self, key: K, value: V) !u64 {
-            if (self.core.get(key)) |id| return id; // warm.
-            const id = if (entry_kind == .source)
-                try self.actx.cell(value)
-            else id: {
-                const sid = try self.actx.computedAsyncClosure(self.slot_values, slotCompute);
-                try self.slot_values.put(sid, value);
-                break :id sid;
+        /// returning its canonical handle. A source is always resolved; a
+        /// computed is pending until driven. Warm key → cached handle.
+        fn mint(self: *Self, key: K, value: V) !EntryHandle {
+            if (self.core.get(key)) |entry_handle| return entry_handle; // warm.
+            const entry_handle: EntryHandle = if (entry_kind == .source)
+                try self.actx.source(value)
+            else computed: {
+                const derived = try self.actx.computedClosure(self.slot_values, slotCompute);
+                try self.slot_values.put(derived.id, value);
+                break :computed derived;
             };
-            const res = try self.core.insert(key, id);
+            const res = try self.core.insert(key, entry_handle);
             if (res.mutation == .changed) {
                 self.membership_version += 1;
                 self.order_version += 1;
@@ -115,8 +116,8 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// Allocate `key`'s node via `factory(key)` on first access (mint-on-access
         /// / lazy pull), returning its node id. A slot starts pending; drive it
         /// with [`drive`]. Warm key → cached id (factory not re-run).
-        pub fn getOrInsertHandle(self: *Self, key: K, factory: Factory(K, V)) !u64 {
-            if (self.core.get(key)) |id| return id; // warm.
+        pub fn getOrInsertHandle(self: *Self, key: K, factory: Factory(K, V)) !EntryHandle {
+            if (self.core.get(key)) |entry_handle| return entry_handle; // warm.
             return self.mint(key, factory.call(key));
         }
 
@@ -124,9 +125,9 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// current non-blocking observation: `null` while a freshly-allocated slot
         /// is pending, else the resolved `value`. A cell resolves at allocation.
         pub fn getOrInsertWith(self: *Self, key: K, factory: Factory(K, V)) !?V {
-            const id = try self.getOrInsertHandle(key, factory);
-            if (entry_kind == .source) return self.actx.getCell(id);
-            return self.actx.get(id);
+            const entry_handle = try self.getOrInsertHandle(key, factory);
+            if (entry_kind == .source) return try self.actx.getSource(entry_handle);
+            return try self.actx.getComputed(entry_handle);
         }
 
         /// Drive `key` to resolution — the analog of `get_async`: settle its async
@@ -134,25 +135,25 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// eventual-transparency completion. `key` must already be present
         /// (allocate first via [`getOrInsertHandle`] / [`materializeAll`] / `set`).
         pub fn drive(self: *Self, key: K) !V {
-            const id = self.core.get(key).?;
-            if (entry_kind == .source) return self.actx.getCell(id).?;
-            return self.actx.awaitResolved(id);
+            const entry_handle = self.core.get(key).?;
+            if (entry_kind == .source) return self.actx.getSource(entry_handle);
+            return self.actx.awaitComputed(entry_handle);
         }
 
         /// Non-blocking observe: `value` once resolved, `null` while pending or
         /// absent (`observe_pending_is_none`). Does not mint.
         pub fn observe(self: *Self, key: K) ?V {
-            const id = self.core.get(key) orelse return null;
-            if (entry_kind == .source) return self.actx.getCell(id);
-            return self.actx.get(id);
+            const entry_handle = self.core.get(key) orelse return null;
+            if (entry_kind == .source) return self.actx.getSource(entry_handle) catch null;
+            return self.actx.getComputed(entry_handle) catch null;
         }
 
         /// Overwrite an input **cell** entry (cells are writable, always
         /// resolved). Allocates the entry if absent. Compile error on a slot map.
         pub fn set(self: *Self, key: K, value: V) !void {
             if (entry_kind != .source) @compileError("AsyncReactiveMap.set is only valid on cell (input) maps");
-            const id = try self.mint(key, value);
-            try self.actx.setCell(id, value);
+            const entry_handle = try self.mint(key, value);
+            try self.actx.setSource(entry_handle, value);
         }
 
         /// **Eager materialization**: pre-mint a derived slot for every key in
@@ -170,9 +171,9 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// Whether `key` is allocated **and resolved** (a non-blocking observe
         /// would return a value).
         pub fn isResolved(self: *Self, key: K) bool {
-            const id = self.core.get(key) orelse return false;
+            const entry_handle = self.core.get(key) orelse return false;
             if (entry_kind == .source) return true;
-            return self.actx.get(id) != null;
+            return (self.actx.getComputed(entry_handle) catch null) != null;
         }
 
         /// Number of currently-allocated entries.
@@ -200,11 +201,11 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
             return self.core.contains(key);
         }
 
-        /// The entry's node id for `key`, or `null`. Non-minting.
+        /// The entry's canonical handle for `key`, or `null`. Non-minting.
         ///
         /// Core surface: the atomic-move law is stated in terms of handle
         /// stability, so it is unassertable without this.
-        pub fn handle(self: *const Self, key: K) ?u64 {
+        pub fn handle(self: *const Self, key: K) ?EntryHandle {
             return self.core.get(key);
         }
 
@@ -216,9 +217,13 @@ pub fn AsyncReactiveMap(comptime K: type, comptime V: type, comptime entry_kind:
         /// Remove `key`'s entry, disposing its node. Bumps membership + order.
         pub fn remove(self: *Self, key: K) bool {
             const res = self.core.remove(key);
-            const id = res.handle orelse return false;
-            self.actx.disposeNode(id);
-            if (entry_kind == .computed) _ = self.slot_values.remove(id);
+            const handle_value = res.handle orelse return false;
+            if (entry_kind == .source) {
+                self.actx.disposeSource(handle_value) catch return false;
+            } else {
+                self.actx.disposeComputed(handle_value) catch return false;
+                _ = self.slot_values.remove(handle_value.id);
+            }
             self.membership_version += 1;
             self.order_version += 1;
             return true;

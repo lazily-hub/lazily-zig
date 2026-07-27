@@ -367,7 +367,12 @@ pub const async_context = @import("./lazily/async_context.zig");
 /// Generic async reactive context: `AsyncContext(V)` per value type. Nested
 /// `AsyncContext(V).ComputeContext` replaces the old top-level `AsyncComputeContext`.
 pub const AsyncContext = async_context.AsyncContext;
+pub const AsyncComputed = async_context.AsyncComputed;
+pub const AsyncComputedState = async_context.AsyncComputedState;
+pub const AsyncSource = async_context.AsyncSource;
+/// Deprecated: use `AsyncComputedState`.
 pub const AsyncSlotState = async_context.AsyncSlotState;
+/// Deprecated: use `AsyncComputed`.
 pub const AsyncSlotHandle = async_context.AsyncSlotHandle;
 pub const lossless_tree = @import("./lazily/lossless_tree.zig");
 pub const LosslessTreeCrdt = lossless_tree.LosslessTreeCrdt;

@@ -22,13 +22,17 @@ const std = @import("std");
 /// so a per-key family entry can compute a value that depends on its runtime
 /// key — the missing capability that lets an `AsyncReactiveMap` ride real
 /// async slots instead of a private value-cache.
+/// Public value-oriented projection of the async computed state machine. The
+/// formal model keeps the storage-oriented `AsyncSlotState` theorem name.
+pub const AsyncComputedState = enum { empty, computing, resolved, err };
 
-pub const AsyncSlotState = enum { empty, computing, resolved, err };
+/// Deprecated: use `AsyncComputedState`. Kept as a source-compatible alias.
+pub const AsyncSlotState = AsyncComputedState;
 
 pub const AsyncContextId = u64;
 
-/// A handle to an async slot. Copy + lightweight (carries an id + generation).
-pub fn AsyncSlotHandle(comptime T: type) type {
+/// A mutable input handle over the generation-checked source registry.
+pub fn AsyncSource(comptime T: type) type {
     _ = T;
     return struct {
         id: u64,
@@ -41,6 +45,23 @@ pub fn AsyncSlotHandle(comptime T: type) type {
     };
 }
 
+/// A computed async value handle. Copy + lightweight (id + generation).
+pub fn AsyncComputed(comptime T: type) type {
+    _ = T;
+    return struct {
+        id: u64,
+        generation: u64,
+
+        const Self = @This();
+        pub fn eq(a: Self, b: Self) bool {
+            return a.id == b.id and a.generation == b.generation;
+        }
+    };
+}
+
+/// Deprecated: use `AsyncComputed`. Kept as a source-compatible type alias.
+pub const AsyncSlotHandle = AsyncComputed;
+
 /// The async reactive context, generic over its value type `V`. Owns a registry
 /// of slots + cells, a pending-compute queue, and a generation counter for safe
 /// handle disposal (`#lzasyncdispose2`: a recycled id must not be aliased by a
@@ -52,7 +73,7 @@ pub fn AsyncContext(comptime V: type) type {
         /// A slot compute expressed as userdata pointer + call fn (Zig closure
         /// emulation). `ptr` is opaque state the compute captures (e.g. the
         /// owning reactive family + this entry's key); pure computes pass an
-        /// unused pointer via [`computedAsync`].
+        /// unused pointer via [`computed`].
         pub const ComputeFn = *const fn (ptr: *anyopaque, cc: *ComputeContext) anyerror!V;
 
         /// The compute context passed to a slot's compute fn. Dependency edges
@@ -99,7 +120,7 @@ pub fn AsyncContext(comptime V: type) type {
         /// load-bearing `Computing → Computing (stale)` transition that discards
         /// superseded results.
         pub const SlotNode = struct {
-            state: AsyncSlotState = .empty,
+            state: AsyncComputedState = .empty,
             value: ?V = null,
             err_value: ?anyerror = null,
             /// Bumped on every invalidate/clear. A completing compute records the
@@ -198,25 +219,66 @@ pub fn AsyncContext(comptime V: type) type {
             self.slots.deinit();
         }
 
-        // --- cells ---
+        // --- sources ---
 
-        pub fn cell(self: *Self, value: V) !u64 {
+        fn registerGeneration(self: *Self, id: u64) !u64 {
+            const generation = (self.generations.get(id) orelse 0) + 1;
+            try self.generations.put(id, generation);
+            return generation;
+        }
+
+        fn validateGeneration(self: *Self, id: u64, generation: u64) !void {
+            const current = self.generations.get(id) orelse return error.StaleHandle;
+            if (current != generation) return error.StaleHandle;
+        }
+
+        fn createSourceId(self: *Self, value: V) !u64 {
             const id = self.next_id;
             self.next_id += 1;
+            _ = try self.registerGeneration(id);
+            errdefer _ = self.generations.remove(id);
             try self.cells.put(id, value);
+            errdefer _ = self.cells.remove(id);
             try self.reserveTeardown();
             return id;
         }
 
-        pub fn getCell(self: *Self, id: u64) ?V {
+        /// Create a canonical mutable async source handle.
+        pub fn source(self: *Self, value: V) !AsyncSource(V) {
+            const id = try self.createSourceId(value);
+            return .{ .id = id, .generation = self.generations.get(id).? };
+        }
+
+        /// Deprecated raw-id source constructor. Use `source`.
+        pub fn cell(self: *Self, value: V) !u64 {
+            return self.createSourceId(value);
+        }
+
+        fn getSourceId(self: *Self, id: u64) ?V {
             return self.cells.get(id);
         }
 
-        /// The checked cell read. See `Cell(T).tryGet` in the sync binding: a
+        /// Read a canonical source handle.
+        pub fn getSource(self: *Self, handle: AsyncSource(V)) !V {
+            try self.validateGeneration(handle.id, handle.generation);
+            return self.tryGetSourceId(handle.id);
+        }
+
+        /// Deprecated raw-id source read. Use `getSource`.
+        pub fn getCell(self: *Self, id: u64) ?V {
+            return self.getSourceId(id);
+        }
+
+        /// The checked source read. See `Cell(T).tryGet` in the sync binding: a
         /// disposed node reads as an error, never as a stale or default value.
-        pub fn tryGetCell(self: *Self, id: u64) error{ NodeDisposed, MissingCell }!V {
+        fn tryGetSourceId(self: *Self, id: u64) error{ NodeDisposed, MissingCell }!V {
             if (self.disposed_cells.contains(id)) return error.NodeDisposed;
             return self.cells.get(id) orelse error.MissingCell;
+        }
+
+        /// Deprecated raw-id checked source read. Use `getSource`.
+        pub fn tryGetCell(self: *Self, id: u64) error{ NodeDisposed, MissingCell }!V {
+            return self.tryGetSourceId(id);
         }
 
         /// Pay for teardown up front (`#lzspecedgeindex`).
@@ -240,7 +302,7 @@ pub fn AsyncContext(comptime V: type) type {
 
         /// Synchronous write. If not inside a settle, invalidates dependent slots
         /// immediately (queues their computes).
-        pub fn setCell(self: *Self, id: u64, value: V) !void {
+        fn setSourceId(self: *Self, id: u64, value: V) !void {
             if (self.cells.get(id)) |old| {
                 if (std.meta.eql(old, value)) return; // PartialEq guard
             }
@@ -252,13 +314,25 @@ pub fn AsyncContext(comptime V: type) type {
             }
         }
 
-        // --- slots ---
+        /// Update a canonical source handle.
+        pub fn setSource(self: *Self, handle: AsyncSource(V), value: V) !void {
+            try self.validateGeneration(handle.id, handle.generation);
+            if (self.disposed_cells.contains(handle.id)) return error.NodeDisposed;
+            try self.setSourceId(handle.id, value);
+        }
 
-        /// A derived async slot whose `compute` is a **closure**: `ptr` is opaque
+        /// Deprecated raw-id source write. Use `setSource`.
+        pub fn setCell(self: *Self, id: u64, value: V) !void {
+            return self.setSourceId(id, value);
+        }
+
+        // --- computed values ---
+
+        /// A derived async computed whose `compute` is a **closure**: `ptr` is opaque
         /// captured state (e.g. a family + key) handed back to `compute` on every
         /// run. This is what lets a per-key family entry resolve a key-dependent
         /// value on a no-closure engine.
-        pub fn computedAsyncClosure(self: *Self, ptr: *anyopaque, compute: ComputeFn) !u64 {
+        fn createComputedId(self: *Self, ptr: *anyopaque, compute: ComputeFn) !u64 {
             const id = self.next_id;
             self.next_id += 1;
             var node = SlotNode.init();
@@ -266,9 +340,36 @@ pub fn AsyncContext(comptime V: type) type {
             node.compute_fn = compute;
             node.state = .computing;
             try self.slots.put(id, node);
+            errdefer {
+                if (self.slots.fetchRemove(id)) |removed| {
+                    var removed_node = removed.value;
+                    removed_node.deinit(self.allocator);
+                }
+            }
+            _ = try self.registerGeneration(id);
+            errdefer _ = self.generations.remove(id);
             try self.reserveTeardown();
             try self.enqueueCompute(id);
             return id;
+        }
+
+        /// Create a canonical computed handle from a closure-emulation pair.
+        pub fn computedClosure(
+            self: *Self,
+            ptr: *anyopaque,
+            compute_fn: ComputeFn,
+        ) !AsyncComputed(V) {
+            const id = try self.createComputedId(ptr, compute_fn);
+            return .{ .id = id, .generation = self.generations.get(id).? };
+        }
+
+        /// Deprecated raw-id computed constructor. Use `computedClosure`.
+        pub fn computedAsyncClosure(
+            self: *Self,
+            ptr: *anyopaque,
+            compute_fn: ComputeFn,
+        ) !u64 {
+            return self.createComputedId(ptr, compute_fn);
         }
 
         /// A side effect rather than a value: same node machinery, but flagged
@@ -281,7 +382,7 @@ pub fn AsyncContext(comptime V: type) type {
             cleanup_ptr: ?*anyopaque,
             cleanup_fn: ?*const fn (*anyopaque) void,
         ) !u64 {
-            const id = try self.computedAsyncClosure(ptr, compute);
+            const id = try self.createComputedId(ptr, compute);
             const n = self.slots.getPtr(id).?;
             n.is_effect = true;
             n.cleanup_ptr = cleanup_ptr;
@@ -289,29 +390,53 @@ pub fn AsyncContext(comptime V: type) type {
             return id;
         }
 
-        /// A derived async slot from a **pure** compute (no captured state) — the
+        /// A derived async computed from a **pure** compute (no captured state) — the
         /// common case. Adapts to the closure form with an unused userdata ptr.
-        pub fn computedAsync(self: *Self, compute: *const fn (*ComputeContext) anyerror!V) !u64 {
+        pub fn computed(
+            self: *Self,
+            compute_fn: *const fn (*ComputeContext) anyerror!V,
+        ) !AsyncComputed(V) {
             const Wrap = struct {
                 fn call(ptr: *anyopaque, cc: *ComputeContext) anyerror!V {
                     const f: *const fn (*ComputeContext) anyerror!V = @ptrCast(@alignCast(ptr));
                     return f(cc);
                 }
             };
-            return self.computedAsyncClosure(@constCast(@ptrCast(compute)), Wrap.call);
+            return self.computedClosure(@ptrCast(@constCast(compute_fn)), Wrap.call);
+        }
+
+        /// Deprecated raw-id computed constructor. Use `computed`.
+        pub fn computedAsync(
+            self: *Self,
+            compute_fn: *const fn (*ComputeContext) anyerror!V,
+        ) !u64 {
+            const handle = try self.computed(compute_fn);
+            return handle.id;
         }
 
         /// Synchronous fast-path read. Returns the value iff state == Resolved.
-        pub fn get(self: *Self, id: u64) ?V {
+        fn getComputedId(self: *Self, id: u64) ?V {
             if (self.slots.get(id)) |node| {
                 if (node.state == .resolved) return node.value;
             }
             return null;
         }
 
-        /// Resolve a slot, blocking-style: drains pending computes until the slot
+        /// Synchronous fast-path read through a canonical computed handle.
+        pub fn getComputed(self: *Self, handle: AsyncComputed(V)) !?V {
+            try self.validateGeneration(handle.id, handle.generation);
+            if (self.isDisposed(handle.id)) return error.NodeDisposed;
+            return self.getComputedId(handle.id);
+        }
+
+        /// Deprecated raw-id computed read. Use `getComputed`.
+        pub fn get(self: *Self, id: u64) ?V {
+            return self.getComputedId(id);
+        }
+
+        /// Resolve a computed, blocking-style: drains pending computes until it
         /// is Resolved (or Error). The Zig analog of `await get_async(handle)`.
-        pub fn awaitResolved(self: *Self, id: u64) !V {
+        fn awaitComputedId(self: *Self, id: u64) !V {
             // Error -> Computing (docs/async.md § Async slot state machine;
             // LazilyFormal.AsyncSlotState SlotEvent.retry). A slot in `.err`
             // holds no cached result: the caller of the failed attempt already
@@ -333,7 +458,7 @@ pub fn AsyncContext(comptime V: type) type {
                 }
             }
             while (true) {
-                if (self.get(id)) |v| return v;
+                if (self.getComputedId(id)) |v| return v;
                 if (self.slots.get(id)) |node| {
                     if (node.state == .err) return node.err_value.?;
                 }
@@ -345,6 +470,18 @@ pub fn AsyncContext(comptime V: type) type {
                     return error.AsyncUnresolved;
                 }
             }
+        }
+
+        /// Resolve a canonical computed handle.
+        pub fn awaitComputed(self: *Self, handle: AsyncComputed(V)) !V {
+            try self.validateGeneration(handle.id, handle.generation);
+            if (self.isDisposed(handle.id)) return error.NodeDisposed;
+            return self.awaitComputedId(handle.id);
+        }
+
+        /// Deprecated raw-id computed resolve. Use `awaitComputed`.
+        pub fn awaitResolved(self: *Self, id: u64) !V {
+            return self.awaitComputedId(id);
         }
 
         /// Drain the pending-compute queue to quiescence. Returns the number of
@@ -592,6 +729,18 @@ pub fn AsyncContext(comptime V: type) type {
             }
         }
 
+        /// Dispose a canonical source handle.
+        pub fn disposeSource(self: *Self, handle: AsyncSource(V)) !void {
+            try self.validateGeneration(handle.id, handle.generation);
+            self.disposeNode(handle.id);
+        }
+
+        /// Dispose a canonical computed handle.
+        pub fn disposeComputed(self: *Self, handle: AsyncComputed(V)) !void {
+            try self.validateGeneration(handle.id, handle.generation);
+            self.disposeNode(handle.id);
+        }
+
         pub fn scope(self: *Self) TeardownScope {
             return .{ .ctx = self, .owned = .empty };
         }
@@ -679,6 +828,40 @@ fn readACompute(_: *CC) anyerror!u32 {
 fn readATimesTwo(cc: *CC) anyerror!u32 {
     try cc.readCell(AsyncTestState.cell_a);
     return 84;
+}
+
+test "lazily/async_context: v2 handles and factories are canonical" {
+    comptime {
+        if (AsyncSlotHandle(u32) != AsyncComputed(u32)) {
+            @compileError("AsyncSlotHandle must alias AsyncComputed");
+        }
+        if (AsyncSlotState != AsyncComputedState) {
+            @compileError("AsyncSlotState must alias AsyncComputedState");
+        }
+    }
+
+    const allocator = std.testing.allocator;
+    var ctx = ACtx.init(allocator);
+    defer ctx.deinit();
+
+    const source_handle: AsyncSource(u32) = try ctx.source(2);
+    try std.testing.expectEqual(@as(u32, 2), try ctx.getSource(source_handle));
+    try ctx.setSource(source_handle, 3);
+    try std.testing.expectEqual(@as(u32, 3), try ctx.getSource(source_handle));
+
+    const computed_handle: AsyncComputed(u32) = try ctx.computed(readACompute);
+    // Compatibility proof: the deprecated spelling is the same type.
+    const legacy_handle: AsyncSlotHandle(u32) = computed_handle;
+    try std.testing.expect(legacy_handle.eq(computed_handle));
+    try std.testing.expectEqual(@as(u32, 42), try ctx.awaitComputed(computed_handle));
+    try std.testing.expectEqual(AsyncComputedState.resolved, ctx.slots.get(computed_handle.id).?.state);
+
+    var stale_source = source_handle;
+    stale_source.generation += 1;
+    try std.testing.expectError(error.StaleHandle, ctx.getSource(stale_source));
+
+    try ctx.disposeSource(source_handle);
+    try std.testing.expectError(error.NodeDisposed, ctx.getSource(source_handle));
 }
 
 test "lazily/async_context: settle resolves a queued compute" {

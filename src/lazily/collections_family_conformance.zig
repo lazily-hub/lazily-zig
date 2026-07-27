@@ -286,7 +286,8 @@ const AsyncModel = struct {
         return self.map.orderVersion();
     }
     fn handleStamp(self: *Self, key: []const u8) ?u64 {
-        return self.map.handle(key);
+        const handle = self.map.handle(key) orelse return null;
+        return handle.id;
     }
 };
 
