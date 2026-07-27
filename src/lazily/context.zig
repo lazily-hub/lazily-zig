@@ -133,6 +133,12 @@ pub const Context = struct {
     arena: SlotArena,
     // Function pointer -> cached result
     cache: std.AutoHashMap(usize, *Slot),
+    // Runtime-minted graph nodes (collection reader kinds, keyed families,
+    // etc.) need identities that cannot alias one another merely because they
+    // share one comptime value function. Allocate those keys monotonically
+    // from the top of usize; cacheLookup below still guards the sparse key
+    // namespace against an explicitly-keyed node that is already present.
+    next_dynamic_cache_key: usize = std.math.maxInt(usize),
     // Optional dense direct-indexed cache for the keyed (runtime-integer-key)
     // path. When non-null, `cacheLookup`/`cachePublish`/`cacheRemove` consult it
     // first, turning a hot keyed read into a single indexed load instead of a
@@ -316,6 +322,23 @@ pub const Context = struct {
         }
         const gop = try self.cache.getOrPut(key);
         gop.value_ptr.* = slot;
+    }
+
+    /// Reserve a process-local cache key for a runtime-minted graph node.
+    ///
+    /// The reservation is monotonic for the Context lifetime, so a disposed
+    /// node's identity is never silently reused. The graph lock makes
+    /// concurrent reservations distinct.
+    pub fn reserveDynamicCacheKey(self: *Context) error{CacheKeyExhausted}!usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (true) {
+            const key = self.next_dynamic_cache_key;
+            if (key == 0) return error.CacheKeyExhausted;
+            self.next_dynamic_cache_key = key - 1;
+            if (self.cacheLookup(key) == null) return key;
+        }
     }
 
     pub fn deinit(self: *Context) void {

@@ -407,6 +407,28 @@ pub fn sourceKeyed(
     return Source(T).initKeyed(ctx, cache_key, valueFn, deinitFn);
 }
 
+/// Advance several `u64` source nodes as one graph write.
+///
+/// Queue-family operations can change more than one independent reader kind.
+/// Holding the graph lock until every source value and invalidation frontier is
+/// published prevents an eager dependent from observing only a prefix of that
+/// operation. The eager queue drains once, after the full changed-kind set is
+/// visible.
+pub fn bumpSources(ctx: *Context, sources: []const *Source(u64)) void {
+    if (sources.len == 0) return;
+
+    ctx.mutex.lock();
+    for (sources) |source_cell| {
+        std.debug.assert(source_cell.ctx == ctx);
+        source_cell.value += 1;
+        source_cell.slot.emitChangeUnlocked();
+    }
+    const should_drain = !ctx.isBatching() and ctx.pending_recompute.items.len > 0;
+    ctx.mutex.unlock();
+
+    if (should_drain) ctx.drainPendingRecompute();
+}
+
 /// Construct a `Computed(T)` — a guarded, lazy derived value. `.eager()` it
 /// for eager materialization. Built over the backing storage `Slot` (§5.0), the
 /// same node `slot()` returns as a raw value; `computed` is the handle form that

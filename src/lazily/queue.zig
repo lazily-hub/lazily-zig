@@ -15,10 +15,13 @@
 //!
 //! ## Shell vs storage
 //!
-//! The reactive shell owns the reader-kind version counters (`head` / `len` /
+//! The reactive shell owns one graph node per reader kind (`head` / `len` /
 //! `is_empty` / `is_full` / `closed`) and the invalidation logic; it is
-//! storage-agnostic. The storage backend owns the actual FIFO data structure and
-//! is pluggable via the [`QueueStorage`] comptime contract. The default
+//! storage-agnostic. `Compute.get(queue.head())` registers a real dependency
+//! edge, while `queue.head().get()` is an explicit untracked read. Reader values
+//! remain demand-derived from storage rather than being materialized on writes.
+//! The storage backend owns the actual FIFO data structure and is pluggable via
+//! the [`QueueStorage`] comptime contract. The default
 //! [`VecDequeStorage`] is an unbounded ring buffer; a bounded variant exposes
 //! reactive backpressure via `is_full`. A distributed backend
 //! (`RaftQueueStorage`, future work per the distributed-queue PRD) or an
@@ -34,16 +37,10 @@
 //! capacity). The head reader observes the *current* head value — after a pop,
 //! the head reader sees the next element (or `null`), not a stale value.
 //!
-//! This reader-kind independence is implemented for free by the `PartialEq`
-//! guard: after each op the shell re-derives each reader-kind value from the
-//! storage and bumps that reader-kind's version counter **only** when the value
-//! genuinely changed — a cell whose value did not change is not invalidated.
-//! This mirrors the single-threaded `Context` kernel's `setCell_equal_preserves`
-//! theorem (`lazily-formal/LazilyFormal/Reactive.lean`), the same law the Rust
-//! shell gets from `Context::set_cell`'s `PartialEq` guard. The Zig port's
-//! map (`reactive_map.zig`) expresses the analogous independence via
-//! `membership_version` / `order_version`; the queue uses five per-reader-kind
-//! counters.
+//! The transition `(op, len_before, len_after)` selects the exact changed-kind
+//! set without reading any reader value. Those nodes advance under one graph
+//! lock and eager dependents drain only after the whole operation is visible.
+//! A node whose projected value did not change is not invalidated.
 //!
 //! ## Closure, bounded backpressure, ordering
 //!
@@ -62,6 +59,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
+const Compute = @import("context.zig").Compute;
+const ReaderKind = @import("reader_kind.zig").ReaderKind;
+const Slot = @import("context.zig").Slot;
+const cell = @import("cell.zig");
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -296,17 +297,13 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         // `capacity` decl.
         cap: ?usize = null,
 
-        // Reader-kind version counters — bumped ONLY when the corresponding
-        // reader value provably changes on an op, computed from the transition
-        // (op + pre-op len), NOT by deriving the value. This is the reader-kind
-        // independence law: a push to non-empty does not bump head; a pop always
-        // does; close only bumps closed. Reads derive live from storage on
-        // demand — nothing is materialized eagerly (§5 demand-driven).
-        head_version: u64 = 0,
-        len_version: u64 = 0,
-        is_empty_version: u64 = 0,
-        is_full_version: u64 = 0,
-        closed_version: u64 = 0,
+        // Real graph identities for the five independently-invalidated reader
+        // kinds. Values remain demand-derived from storage by the handles below.
+        head_reader: ReaderKind,
+        len_reader: ReaderKind,
+        is_empty_reader: ReaderKind,
+        is_full_reader: ReaderKind,
+        closed_reader: ReaderKind,
 
         const Self = @This();
 
@@ -318,9 +315,27 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
 
         /// Build a queue over an arbitrary `QueueStorage` backend. Caches the
         /// (fixed) bound; reader values are derived on demand, not at init.
-        pub fn init(ctx: *Context, storage: S) Self {
+        pub fn init(ctx: *Context, storage: S) !Self {
             const cap = if (has_capacity) storage.capacity() else null;
-            return Self{ .ctx = ctx, .storage = storage, .cap = cap };
+            const head_reader = try ReaderKind.init(ctx);
+            errdefer head_reader.dispose();
+            const len_reader = try ReaderKind.init(ctx);
+            errdefer len_reader.dispose();
+            const is_empty_reader = try ReaderKind.init(ctx);
+            errdefer is_empty_reader.dispose();
+            const is_full_reader = try ReaderKind.init(ctx);
+            errdefer is_full_reader.dispose();
+            const closed_reader = try ReaderKind.init(ctx);
+            return .{
+                .ctx = ctx,
+                .storage = storage,
+                .cap = cap,
+                .head_reader = head_reader,
+                .len_reader = len_reader,
+                .is_empty_reader = is_empty_reader,
+                .is_full_reader = is_full_reader,
+                .closed_reader = closed_reader,
+            };
         }
 
         /// Bump the version of exactly the reader-kinds whose value provably
@@ -332,12 +347,25 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// it only from empty). `closed` is never touched here; only
         /// [`close`](Self.close) bumps it.
         fn invalidateReaders(self: *Self, len_before: usize, len_after: usize, head_changed: bool) void {
-            self.len_version += 1; // len always changes on a successful op
-            if ((len_before == 0) != (len_after == 0)) self.is_empty_version += 1;
-            if (self.cap) |c| {
-                if ((len_before >= c) != (len_after >= c)) self.is_full_version += 1;
+            var changed: [4]ReaderKind = undefined;
+            var count: usize = 0;
+            changed[count] = self.len_reader;
+            count += 1;
+            if ((len_before == 0) != (len_after == 0)) {
+                changed[count] = self.is_empty_reader;
+                count += 1;
             }
-            if (head_changed) self.head_version += 1;
+            if (self.cap) |c| {
+                if ((len_before >= c) != (len_after >= c)) {
+                    changed[count] = self.is_full_reader;
+                    count += 1;
+                }
+            }
+            if (head_changed) {
+                changed[count] = self.head_reader;
+                count += 1;
+            }
+            ReaderKind.bumpMany(self.ctx, changed[0..count]);
         }
 
         // -- mutating ops --
@@ -386,29 +414,75 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         pub fn close(self: *Self) void {
             if (self.storage.isClosed()) return;
             self.storage.close();
-            self.closed_version += 1;
+            self.closed_reader.bump();
         }
 
         // -- reactive reader-kind reads --
 
+        pub const HeadReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) ?T {
+                if (has_peek) return reader.owner.storage.peek();
+                return null;
+            }
+        };
+
+        pub const LenReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) usize {
+                return reader.owner.storage.len();
+            }
+        };
+
+        pub const EmptyReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) bool {
+                return reader.owner.storage.len() == 0;
+            }
+        };
+
+        pub const FullReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) bool {
+                if (reader.owner.cap) |c| return reader.owner.storage.len() >= c;
+                return false;
+            }
+        };
+
+        pub const ClosedReader = struct {
+            owner: *const Self,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) bool {
+                return reader.owner.storage.isClosed();
+            }
+        };
+
         /// Reactive read of the current head value. `null` when the queue is
         /// empty. A reader is invalidated when the head value *changes* — every
         /// pop, and a push only when transitioning from empty.
-        pub fn head(self: *const Self) ?T {
-            if (has_peek) return self.storage.peek();
-            return null; // no peek capability → no head reader
+        pub fn head(self: *const Self) HeadReader {
+            return .{ .owner = self, .slot = self.head_reader.slot() };
         }
 
         /// Reactive read of the number of buffered elements. Invalidated
         /// whenever the count changes (every successful push/pop).
-        pub fn len(self: *const Self) usize {
-            return self.storage.len();
+        pub fn len(self: *const Self) LenReader {
+            return .{ .owner = self, .slot = self.len_reader.slot() };
         }
 
         /// Reactive emptiness check. Invalidated only on the empty ↔ non-empty
         /// transition.
-        pub fn isEmpty(self: *const Self) bool {
-            return self.storage.len() == 0;
+        pub fn isEmpty(self: *const Self) EmptyReader {
+            return .{ .owner = self, .slot = self.is_empty_reader.slot() };
         }
 
         /// Reactive fullness check (only meaningful when the backend is
@@ -417,15 +491,14 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// consumer's pop that transitions full → not-full bumps the `is_full`
         /// version and the producer observes capacity recovery. For an unbounded
         /// backend this is always `false` and never invalidates.
-        pub fn isFull(self: *const Self) bool {
-            if (self.cap) |c| return self.storage.len() >= c;
-            return false;
+        pub fn isFull(self: *const Self) FullReader {
+            return .{ .owner = self, .slot = self.is_full_reader.slot() };
         }
 
         /// Reactive read of the closed flag. Invalidated only on the open →
         /// closed transition.
-        pub fn isClosed(self: *const Self) bool {
-            return self.storage.isClosed();
+        pub fn isClosed(self: *const Self) ClosedReader {
+            return .{ .owner = self, .slot = self.closed_reader.slot() };
         }
 
         // -- reader-kind version counters (conformance observation) --
@@ -434,28 +507,28 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// across an op to observe exactly which reader kinds it invalidated.
         pub fn versions(self: *const Self) QueueVersions {
             return .{
-                .head = self.head_version,
-                .len = self.len_version,
-                .is_empty = self.is_empty_version,
-                .is_full = self.is_full_version,
-                .closed = self.closed_version,
+                .head = self.head_reader.version(),
+                .len = self.len_reader.version(),
+                .is_empty = self.is_empty_reader.version(),
+                .is_full = self.is_full_reader.version(),
+                .closed = self.closed_reader.version(),
             };
         }
 
         pub fn headVersion(self: *const Self) u64 {
-            return self.head_version;
+            return self.head_reader.version();
         }
         pub fn lenVersion(self: *const Self) u64 {
-            return self.len_version;
+            return self.len_reader.version();
         }
         pub fn isEmptyVersion(self: *const Self) u64 {
-            return self.is_empty_version;
+            return self.is_empty_reader.version();
         }
         pub fn isFullVersion(self: *const Self) u64 {
-            return self.is_full_version;
+            return self.is_full_reader.version();
         }
         pub fn closedVersion(self: *const Self) u64 {
-            return self.closed_version;
+            return self.closed_reader.version();
         }
 
         // -- non-reactive storage access --
@@ -474,8 +547,8 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
 
 /// Create an unbounded `QueueCell(T, VecDequeStorage(T))` (the default reference
 /// backend) and return it by value.
-pub fn newUnbounded(comptime T: type, ctx: *Context) QueueCell(T, VecDequeStorage(T)) {
-    return QueueCell(T, VecDequeStorage(T)).init(
+pub fn newUnbounded(comptime T: type, ctx: *Context) !QueueCell(T, VecDequeStorage(T)) {
+    return try QueueCell(T, VecDequeStorage(T)).init(
         ctx,
         VecDequeStorage(T).initUnbounded(ctx.allocator),
     );
@@ -483,8 +556,8 @@ pub fn newUnbounded(comptime T: type, ctx: *Context) QueueCell(T, VecDequeStorag
 
 /// Create a bounded `QueueCell(T, VecDequeStorage(T))` with `capacity`. Asserts
 /// `capacity > 0`.
-pub fn newBounded(comptime T: type, ctx: *Context, capacity: usize) QueueCell(T, VecDequeStorage(T)) {
-    return QueueCell(T, VecDequeStorage(T)).init(
+pub fn newBounded(comptime T: type, ctx: *Context, capacity: usize) !QueueCell(T, VecDequeStorage(T)) {
+    return try QueueCell(T, VecDequeStorage(T)).init(
         ctx,
         VecDequeStorage(T).initBounded(ctx.allocator, capacity),
     );
@@ -528,7 +601,7 @@ const TopicSubscription = struct {
     cursor: usize,
     durability: TopicDurability,
     connected: bool,
-    reader_version: u64,
+    reader: ReaderKind,
 };
 
 /// Broadcast topic whose stable subscribers own independent absolute cursors.
@@ -537,6 +610,7 @@ const TopicSubscription = struct {
 /// so it never increments any subscriber reader version.
 pub fn TopicCell(comptime T: type) type {
     return struct {
+        ctx: *Context,
         allocator: std.mem.Allocator,
         base_offset: usize = 0,
         elements: std.ArrayList(T) = .empty,
@@ -544,15 +618,17 @@ pub fn TopicCell(comptime T: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator) Self {
+        pub fn init(ctx: *Context) Self {
             return .{
-                .allocator = allocator,
-                .subscriptions = std.StringHashMap(TopicSubscription).init(allocator),
+                .ctx = ctx,
+                .allocator = ctx.allocator,
+                .subscriptions = std.StringHashMap(TopicSubscription).init(ctx.allocator),
             };
         }
 
-        pub fn initFromSnapshot(allocator: std.mem.Allocator, saved: TopicSnapshot(T)) !Self {
-            var self = Self.init(allocator);
+        pub fn initFromSnapshot(ctx: *Context, saved: TopicSnapshot(T)) !Self {
+            const allocator = ctx.allocator;
+            var self = Self.init(ctx);
             errdefer self.deinit();
             self.base_offset = saved.base_offset;
             try self.elements.appendSlice(allocator, saved.elements);
@@ -566,19 +642,24 @@ pub fn TopicCell(comptime T: type) type {
                 }
                 const owned_id = try allocator.dupe(u8, saved_sub.subscriber_id);
                 errdefer allocator.free(owned_id);
+                const reader = try ReaderKind.init(ctx);
+                errdefer reader.dispose();
                 try self.subscriptions.put(owned_id, .{
                     .cursor = saved_sub.cursor,
                     .durability = saved_sub.durability,
                     .connected = saved_sub.connected,
-                    .reader_version = 0,
+                    .reader = reader,
                 });
             }
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            var iterator = self.subscriptions.keyIterator();
-            while (iterator.next()) |subscriber_id| self.allocator.free(subscriber_id.*);
+            var iterator = self.subscriptions.iterator();
+            while (iterator.next()) |entry| {
+                entry.value_ptr.reader.dispose();
+                self.allocator.free(entry.key_ptr.*);
+            }
             self.subscriptions.deinit();
             self.elements.deinit(self.allocator);
         }
@@ -589,17 +670,20 @@ pub fn TopicCell(comptime T: type) type {
                 if (sub.connected) return .already_subscribed;
                 if (sub.durability != .durable) return error.EphemeralCannotReconnect;
                 sub.connected = true;
-                sub.reader_version += 1;
+                sub.reader.bump();
                 return .reconnected;
             }
             const owned_id = try self.allocator.dupe(u8, subscriber_id);
             errdefer self.allocator.free(owned_id);
+            const reader = try ReaderKind.init(self.ctx);
+            errdefer reader.dispose();
             try self.subscriptions.put(owned_id, .{
                 .cursor = self.tailOffset(),
                 .durability = durability,
                 .connected = true,
-                .reader_version = 1,
+                .reader = reader,
             });
+            reader.bump();
             return .subscribed;
         }
 
@@ -608,7 +692,7 @@ pub fn TopicCell(comptime T: type) type {
             if (sub.durability != .durable) return error.EphemeralCannotReconnect;
             if (!sub.connected) {
                 sub.connected = true;
-                sub.reader_version += 1;
+                sub.reader.bump();
             }
         }
 
@@ -617,21 +701,27 @@ pub fn TopicCell(comptime T: type) type {
             if (!sub.connected) return;
             if (sub.durability == .ephemeral) {
                 const removed = self.subscriptions.fetchRemove(subscriber_id).?;
+                removed.value.reader.dispose();
                 self.allocator.free(removed.key);
                 return;
             }
             sub.connected = false;
-            sub.reader_version += 1;
+            sub.reader.bump();
         }
 
         /// Append a value and invalidate every connected reader independently.
         pub fn publish(self: *Self, value: T) !usize {
+            var changed: std.ArrayList(*cell.Source(u64)) = .empty;
+            defer changed.deinit(self.allocator);
+            try changed.ensureTotalCapacity(self.allocator, self.subscriptions.count());
+            var readers = self.subscriptions.valueIterator();
+            while (readers.next()) |sub| {
+                if (sub.connected) changed.appendAssumeCapacity(sub.reader.source);
+            }
+
             const offset = self.tailOffset();
             try self.elements.append(self.allocator, value);
-            var iterator = self.subscriptions.valueIterator();
-            while (iterator.next()) |sub| {
-                if (sub.connected) sub.reader_version += 1;
-            }
+            cell.bumpSources(self.ctx, changed.items);
             return offset;
         }
 
@@ -642,9 +732,29 @@ pub fn TopicCell(comptime T: type) type {
             return self.elements.items[sub.cursor - self.base_offset ..];
         }
 
-        pub fn read(self: *const Self, subscriber_id: []const u8) !?T {
+        fn readValue(self: *const Self, subscriber_id: []const u8) !?T {
             const stream = try self.readStream(subscriber_id);
             return if (stream.len == 0) null else stream[0];
+        }
+
+        pub const Reader = struct {
+            owner: *const Self,
+            subscriber_id: []const u8,
+            slot: *Slot,
+
+            pub fn get(reader: @This()) !?T {
+                if (reader.slot.disposed) return error.NodeDisposed;
+                return reader.owner.readValue(reader.subscriber_id);
+            }
+        };
+
+        pub fn read(self: *const Self, subscriber_id: []const u8) !Reader {
+            const entry = self.subscriptions.getEntry(subscriber_id) orelse return error.SubscriptionNotFound;
+            return .{
+                .owner = self,
+                .subscriber_id = entry.key_ptr.*,
+                .slot = entry.value_ptr.reader.slot(),
+            };
         }
 
         /// Advance only the named subscriber and its reader version.
@@ -654,7 +764,7 @@ pub fn TopicCell(comptime T: type) type {
             if (count > self.tailOffset() - sub.cursor) return error.AdvancePastTail;
             if (count != 0) {
                 sub.cursor += count;
-                sub.reader_version += 1;
+                sub.reader.bump();
             }
             return sub.cursor;
         }
@@ -703,7 +813,7 @@ pub fn TopicCell(comptime T: type) type {
 
         pub fn readerVersion(self: *const Self, subscriber_id: []const u8) ?u64 {
             const found = self.subscriptions.get(subscriber_id) orelse return null;
-            return found.reader_version;
+            return found.reader.version();
         }
 
         pub fn snapshot(self: *const Self, allocator: std.mem.Allocator) !TopicSnapshot(T) {
@@ -746,7 +856,9 @@ pub fn TopicCell(comptime T: type) type {
 // parity layer — asserting the exact reader-kind `invalidates` matrix.
 
 test "lazily/topic: broadcast cursors are independent" {
-    var topic = TopicCell([]const u8).init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    var topic = TopicCell([]const u8).init(ctx);
     defer topic.deinit();
     try std.testing.expectEqual(TopicSubscribeOutcome.subscribed, try topic.subscribe("alice", .durable));
     _ = try topic.subscribe("bob", .durable);
@@ -759,7 +871,9 @@ test "lazily/topic: broadcast cursors are independent" {
 
 test "lazily/topic: durable replay and safe GC" {
     const allocator = std.testing.allocator;
-    var topic = TopicCell([]const u8).init(allocator);
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    var topic = TopicCell([]const u8).init(ctx);
     defer topic.deinit();
     _ = try topic.subscribe("fast", .durable);
     _ = try topic.subscribe("slow", .durable);
@@ -775,14 +889,16 @@ test "lazily/topic: durable replay and safe GC" {
 
     var saved = try topic.snapshot(allocator);
     defer saved.deinit();
-    var restored = try TopicCell([]const u8).initFromSnapshot(allocator, saved);
+    var restored = try TopicCell([]const u8).initFromSnapshot(ctx, saved);
     defer restored.deinit();
     try std.testing.expectEqual(topic.baseOffset(), restored.baseOffset());
     try std.testing.expectEqualSlices([]const u8, topic.items(), restored.items());
 }
 
 test "lazily/topic: ephemeral disconnect does not hold GC" {
-    var topic = TopicCell([]const u8).init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    var topic = TopicCell([]const u8).init(ctx);
     defer topic.deinit();
     _ = try topic.subscribe("durable", .durable);
     _ = try topic.subscribe("viewer", .ephemeral);
@@ -796,7 +912,9 @@ test "lazily/topic: ephemeral disconnect does not hold GC" {
 }
 
 test "lazily/topic: tail and offline advance are no-ops" {
-    var topic = TopicCell([]const u8).init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    var topic = TopicCell([]const u8).init(ctx);
     defer topic.deinit();
     _ = try topic.subscribe("worker", .durable);
     _ = try topic.publish("a");
@@ -816,7 +934,44 @@ test "lazily/topic: tail and offline advance are no-ops" {
     try std.testing.expectEqual(@as(usize, 1), topic.subscription("worker").?.cursor);
 }
 
+test "lazily/topic: subscriber readers form real graph edges" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    var topic = TopicCell([]const u8).init(ctx);
+    defer topic.deinit();
+    _ = try topic.subscribe("alice", .durable);
+
+    const Derived = struct {
+        var owner: *TopicCell([]const u8) = undefined;
+        var runs: usize = 0;
+
+        fn hasUnread(view: *Compute) !bool {
+            runs += 1;
+            const reader = try owner.read("alice");
+            return (try view.get(reader)) != null;
+        }
+    };
+    Derived.owner = &topic;
+    Derived.runs = 0;
+
+    const has_unread = try cell.computed(bool, ctx, Derived.hasUnread, null);
+    defer ctx.allocator.destroy(has_unread);
+    try std.testing.expect(!has_unread.get().*);
+
+    const before_publish = Derived.runs;
+    _ = try topic.publish("message");
+    try std.testing.expect(has_unread.get().*);
+    try std.testing.expectEqual(before_publish + 1, Derived.runs);
+
+    const before_advance = Derived.runs;
+    _ = try topic.advance("alice", 1);
+    try std.testing.expect(!has_unread.get().*);
+    try std.testing.expectEqual(before_advance + 1, Derived.runs);
+}
+
 test "lazily/topic: snapshot rejects disconnected ephemeral subscription" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
     const invalid = TopicSnapshot([]const u8){
         .allocator = std.testing.allocator,
         .base_offset = 0,
@@ -830,7 +985,7 @@ test "lazily/topic: snapshot rejects disconnected ephemeral subscription" {
     };
     try std.testing.expectError(
         error.DisconnectedEphemeralSubscription,
-        TopicCell([]const u8).initFromSnapshot(std.testing.allocator, invalid),
+        TopicCell([]const u8).initFromSnapshot(ctx, invalid),
     );
 }
 
@@ -839,18 +994,18 @@ test "lazily/queue: SPSC FIFO basic" {
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = newUnbounded(i32, ctx);
+    var q = try newUnbounded(i32, ctx);
     defer q.storage.deinit();
 
-    try std.testing.expect(q.isEmpty());
-    try std.testing.expectEqual(@as(?i32, null), q.head());
+    try std.testing.expect(q.isEmpty().get());
+    try std.testing.expectEqual(@as(?i32, null), q.head().get());
 
     try q.tryPush(1);
     try q.tryPush(2);
     try q.tryPush(3);
 
-    try std.testing.expectEqual(@as(usize, 3), q.len());
-    try std.testing.expectEqual(@as(?i32, 1), q.head());
+    try std.testing.expectEqual(@as(usize, 3), q.len().get());
+    try std.testing.expectEqual(@as(?i32, 1), q.head().get());
     try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, q.storage.items());
 
     try std.testing.expectEqual(@as(i32, 1), try q.tryPop());
@@ -864,22 +1019,22 @@ test "lazily/queue: bounded rejects at capacity (reactive backpressure)" {
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = newBounded(i32, ctx, 2);
+    var q = try newBounded(i32, ctx, 2);
     defer q.storage.deinit();
 
     try std.testing.expectEqual(@as(?usize, 2), q.capacity());
-    try std.testing.expect(!q.isFull());
+    try std.testing.expect(!q.isFull().get());
 
     try q.tryPush(1);
     try q.tryPush(2);
-    try std.testing.expect(q.isFull());
+    try std.testing.expect(q.isFull().get());
     try std.testing.expectError(error.Full, q.tryPush(3));
 
     // pop frees a slot → is_full flips → reactive backpressure signal.
     try std.testing.expectEqual(@as(i32, 1), try q.tryPop());
-    try std.testing.expect(!q.isFull());
+    try std.testing.expect(!q.isFull().get());
     try q.tryPush(3);
-    try std.testing.expect(q.isFull());
+    try std.testing.expect(q.isFull().get());
 }
 
 test "lazily/queue: closure lifecycle" {
@@ -887,14 +1042,14 @@ test "lazily/queue: closure lifecycle" {
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = newUnbounded([]const u8, ctx);
+    var q = try newUnbounded([]const u8, ctx);
     defer q.storage.deinit();
 
     try q.tryPush("a");
     try q.tryPush("b");
 
     q.close();
-    try std.testing.expect(q.isClosed());
+    try std.testing.expect(q.isClosed().get());
 
     // push on closed is an error.
     try std.testing.expectError(error.Closed, q.tryPush("c"));
@@ -909,7 +1064,7 @@ test "lazily/queue: closure lifecycle" {
     // idempotent close — no-op, no invalidation.
     const closed_before = q.closedVersion();
     q.close();
-    try std.testing.expect(q.isClosed());
+    try std.testing.expect(q.isClosed().get());
     try std.testing.expectEqual(closed_before, q.closedVersion());
 }
 
@@ -918,26 +1073,75 @@ test "lazily/queue: reader-kind independence — head not invalidated on push to
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = newUnbounded(i32, ctx);
+    var q = try newUnbounded(i32, ctx);
     defer q.storage.deinit();
 
-    try std.testing.expectEqual(@as(?i32, null), q.head());
+    try std.testing.expectEqual(@as(?i32, null), q.head().get());
 
     try q.tryPush(1);
     // push to empty changes head → invalidated.
-    try std.testing.expectEqual(@as(?i32, 1), q.head());
+    try std.testing.expectEqual(@as(?i32, 1), q.head().get());
     const head_after_first = q.headVersion();
 
     try q.tryPush(2);
     try q.tryPush(3);
     // head reader still cached (head unchanged) — reader-kind independence.
     try std.testing.expectEqual(head_after_first, q.headVersion());
-    try std.testing.expectEqual(@as(?i32, 1), q.head());
+    try std.testing.expectEqual(@as(?i32, 1), q.head().get());
 
     _ = try q.tryPop();
     // pop changes head → invalidated.
     try std.testing.expect(q.headVersion() > head_after_first);
-    try std.testing.expectEqual(@as(?i32, 2), q.head());
+    try std.testing.expectEqual(@as(?i32, 2), q.head().get());
+}
+
+test "lazily/queue: reader handles form real graph edges" {
+    const allocator = std.testing.allocator;
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    var q = try newUnbounded(i32, ctx);
+    defer q.storage.deinit();
+
+    const Derived = struct {
+        var queue: *QueueCell(i32, VecDequeStorage(i32)) = undefined;
+        var head_runs: usize = 0;
+        var len_runs: usize = 0;
+
+        fn head(view: *Compute) !?i32 {
+            head_runs += 1;
+            return view.get(queue.head());
+        }
+
+        fn len(view: *Compute) !usize {
+            len_runs += 1;
+            return view.get(queue.len());
+        }
+    };
+    Derived.queue = &q;
+    Derived.head_runs = 0;
+    Derived.len_runs = 0;
+
+    const derived_head = try cell.computed(?i32, ctx, Derived.head, null);
+    defer ctx.allocator.destroy(derived_head);
+    const derived_len = try cell.computed(usize, ctx, Derived.len, null);
+    defer ctx.allocator.destroy(derived_len);
+    try std.testing.expectEqual(@as(?i32, null), derived_head.get().*);
+    try std.testing.expectEqual(@as(usize, 0), derived_len.get().*);
+
+    try q.tryPush(1);
+    try std.testing.expectEqual(@as(?i32, 1), derived_head.get().*);
+    try std.testing.expectEqual(@as(usize, 1), derived_len.get().*);
+
+    // A push to non-empty changes len but not head. The downstream head
+    // computation must remain warm while len recomputes.
+    try q.tryPush(2);
+    const head_runs = Derived.head_runs;
+    const len_runs = Derived.len_runs;
+    try std.testing.expectEqual(@as(?i32, 1), derived_head.get().*);
+    try std.testing.expectEqual(@as(usize, 2), derived_len.get().*);
+    try std.testing.expectEqual(head_runs, Derived.head_runs);
+    try std.testing.expectEqual(len_runs + 1, Derived.len_runs);
 }
 
 test "lazily/queue: MPSC via batch is one observable transition" {
@@ -945,10 +1149,10 @@ test "lazily/queue: MPSC via batch is one observable transition" {
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = newUnbounded(i32, ctx);
+    var q = try newUnbounded(i32, ctx);
     defer q.storage.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), q.len());
+    try std.testing.expectEqual(@as(usize, 0), q.len().get());
 
     // Multiple producers push inside one batch() boundary. Each push bumps the
     // len counter; the fixture asserts len *changed*, not how many times.
@@ -965,7 +1169,7 @@ test "lazily/queue: MPSC via batch is one observable transition" {
     MPSC.q_ptr = &q;
     ctx.batch(MPSC.run);
 
-    try std.testing.expectEqual(@as(usize, 3), q.len());
+    try std.testing.expectEqual(@as(usize, 3), q.len().get());
     try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, q.storage.items());
 }
 
@@ -974,7 +1178,7 @@ test "lazily/queue: same shell, shared by reference (producer/consumer)" {
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = newUnbounded(i32, ctx);
+    var q = try newUnbounded(i32, ctx);
     defer q.storage.deinit();
 
     // A producer borrows the shell by pointer and pushes.
@@ -1031,17 +1235,17 @@ test "lazily/queue: pluggable storage — custom bounded ring backend" {
     defer ctx.deinit();
 
     const storage = Ring.init(ctx.allocator, 2);
-    var q = QueueCell(i32, Ring).init(ctx, storage);
+    var q = try QueueCell(i32, Ring).init(ctx, storage);
     defer q.storage.deinit();
 
     try q.tryPush(1);
     try q.tryPush(2);
-    try std.testing.expect(q.isFull());
+    try std.testing.expect(q.isFull().get());
     try std.testing.expectError(error.Full, q.tryPush(3));
     try std.testing.expectEqual(@as(i32, 1), try q.tryPop());
-    try std.testing.expect(!q.isFull());
-    try std.testing.expectEqual(@as(usize, 1), q.len());
-    try std.testing.expectEqual(@as(?i32, 2), q.head());
+    try std.testing.expect(!q.isFull().get());
+    try std.testing.expectEqual(@as(usize, 1), q.len().get());
+    try std.testing.expectEqual(@as(?i32, 2), q.head().get());
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1306,10 @@ fn buildInitial(ctx: *Context, initial: json.Value) !Q {
         .null => null,
         else => try jsonAsU64(c),
     } else null;
-    var q = if (cap) |c| newBounded([]const u8, ctx, @intCast(c)) else newUnbounded([]const u8, ctx);
+    var q = if (cap) |c|
+        try newBounded([]const u8, ctx, @intCast(c))
+    else
+        try newUnbounded([]const u8, ctx);
     if (jsonField(initial, "elements")) |elems| {
         switch (elems) {
             .array => |arr| {
@@ -1164,19 +1371,19 @@ fn assertState(q: *Q, expected: json.Value) !void {
             .null => null,
             else => try jsonAsString(head_val),
         };
-        try expectEqualStringsOpt(want, q.head());
+        try expectEqualStringsOpt(want, q.head().get());
     }
     if (jsonField(expected, "len")) |l| {
-        try std.testing.expectEqual(@as(usize, @intCast(try jsonAsU64(l))), q.len());
+        try std.testing.expectEqual(@as(usize, @intCast(try jsonAsU64(l))), q.len().get());
     }
     if (jsonField(expected, "is_empty")) |b| {
-        try std.testing.expectEqual(try jsonAsBool(b), q.isEmpty());
+        try std.testing.expectEqual(try jsonAsBool(b), q.isEmpty().get());
     }
     if (jsonField(expected, "is_full")) |b| {
-        try std.testing.expectEqual(try jsonAsBool(b), q.isFull());
+        try std.testing.expectEqual(try jsonAsBool(b), q.isFull().get());
     }
     if (jsonField(expected, "closed")) |b| {
-        try std.testing.expectEqual(try jsonAsBool(b), q.isClosed());
+        try std.testing.expectEqual(try jsonAsBool(b), q.isClosed().get());
     }
 }
 
@@ -1405,30 +1612,30 @@ test "lazily/queue: raw-channel backend conforms to minimal contract (#relaycell
     const ctx = try Context.init(allocator);
     defer ctx.deinit();
 
-    var q = QueueCell(i32, MinimalFifoI32).init(ctx, MinimalFifoI32.init(allocator));
+    var q = try QueueCell(i32, MinimalFifoI32).init(ctx, MinimalFifoI32.init(allocator));
     defer q.storage.deinit();
 
-    try std.testing.expect(q.isEmpty());
+    try std.testing.expect(q.isEmpty().get());
 
     const len_before = q.lenVersion();
     try q.tryPush(1);
     try q.tryPush(2);
-    try std.testing.expectEqual(@as(usize, 2), q.len());
+    try std.testing.expectEqual(@as(usize, 2), q.len().get());
     try std.testing.expect(q.lenVersion() > len_before); // reader stays reactive
 
     // No peek → no head reader (null); no capacity → never full.
-    try std.testing.expectEqual(@as(?i32, null), q.head());
-    try std.testing.expect(!q.isFull());
+    try std.testing.expectEqual(@as(?i32, null), q.head().get());
+    try std.testing.expect(!q.isFull().get());
     try std.testing.expectEqual(@as(?usize, null), q.capacity());
 
     // FIFO drain from tryPop alone.
     try std.testing.expectEqual(@as(i32, 1), try q.tryPop());
     try std.testing.expectEqual(@as(i32, 2), try q.tryPop());
-    try std.testing.expect(q.isEmpty());
+    try std.testing.expect(q.isEmpty().get());
 
     // Closure lifecycle: Closed distinct from Empty; push-after-close rejected.
     q.close();
-    try std.testing.expect(q.isClosed());
+    try std.testing.expect(q.isClosed().get());
     try std.testing.expectError(error.Closed, q.tryPush(3));
     try std.testing.expectError(error.Closed, q.tryPop());
 }
