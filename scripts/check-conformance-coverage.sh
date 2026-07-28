@@ -69,6 +69,10 @@ KNOWN_UNCOVERED=(
   "message-passing/terminal_conflict_fail_closed.json"
   "reliable-sync/coalesce_bounds_outbox.json"
   "reliable-sync/liveness_lease_eviction.json"
+  # Portable stdlib APIs and their production fixture runners are staged.
+  "stdlib/revision_barrier.json"
+  "stdlib/timeout.json"
+  "stdlib/timer.json"
 )
 
 # The eight inline-mirror fixtures this list used to carry are GONE from it: they
