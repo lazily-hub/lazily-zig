@@ -68,9 +68,11 @@ pub fn asI64(value: Value) !i64 {
 }
 
 pub fn asU64(value: Value) !u64 {
-    const n = try asI64(value);
-    if (n < 0) return error.ExpectedUnsigned;
-    return @intCast(n);
+    return switch (value) {
+        .integer => |n| if (n < 0) error.ExpectedUnsigned else @intCast(n),
+        .number_string => |s| try std.fmt.parseInt(u64, s, 10),
+        else => error.ExpectedInteger,
+    };
 }
 
 pub fn asUsize(value: Value) !usize {

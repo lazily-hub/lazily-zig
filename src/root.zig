@@ -32,6 +32,7 @@ pub const ParkingMutex = @import("./lazily/parking_mutex.zig").ParkingMutex;
 pub const ReentrantMutex = @import("./lazily/parking_mutex.zig").ReentrantMutex;
 pub const RwLock = @import("./lazily/parking_mutex.zig").RwLock;
 pub const ipc = @import("./lazily/ipc.zig");
+pub const stdlib = @import("./lazily/stdlib.zig");
 pub const CapabilityHandshake = ipc.CapabilityHandshake;
 pub const Codec = ipc.Codec;
 pub const Delta = ipc.Delta;
@@ -108,6 +109,7 @@ pub const collections_family_conformance = @import("./lazily/collections_family_
 // mirrors (`#lazilyzigconformance`). Referenced here so `refAllDecls` pulls
 // their tests into the root test binary.
 pub const conformance_json = @import("./lazily/conformance_json.zig");
+pub const stdlib_conformance = @import("./lazily/stdlib_conformance.zig");
 pub const collections_conformance = @import("./lazily/collections_conformance.zig");
 pub const distributed_conformance = @import("./lazily/distributed_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
