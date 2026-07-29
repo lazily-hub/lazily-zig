@@ -554,6 +554,7 @@ fn u64Field(value: std.json.Value, name: []const u8) !u64 {
     return switch (try objectField(value, name)) {
         .integer => |integer| std.math.cast(u64, integer) orelse error.ExpectedU64,
         .number_string => |string| try std.fmt.parseInt(u64, string, 10),
+        .string => |string| try std.fmt.parseInt(u64, string, 10),
         else => error.ExpectedU64,
     };
 }
@@ -583,6 +584,7 @@ fn optionalU64Field(value: std.json.Value, name: []const u8) !?u64 {
         .null => null,
         .integer => |integer| std.math.cast(u64, integer) orelse error.ExpectedU64,
         .number_string => |string| try std.fmt.parseInt(u64, string, 10),
+        .string => |string| try std.fmt.parseInt(u64, string, 10),
         else => error.ExpectedU64,
     };
 }

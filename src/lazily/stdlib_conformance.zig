@@ -139,6 +139,16 @@ fn cancellationAdapter(context: *CancellationContext) portable.CancellationAdapt
     return .{ .context = context, .run_fn = CancellationContext.run };
 }
 
+const ReentrantCancellationContext = struct {
+    barrier: *portable.RevisionBarrier,
+
+    fn run(raw: *anyopaque) portable.Cancellation {
+        const self: *ReentrantCancellationContext = @ptrCast(@alignCast(raw));
+        _ = self.barrier.dispose();
+        return .cancelled;
+    }
+};
+
 fn timeoutOutcome(outcome: portable.TimeoutOutcome) []const u8 {
     return switch (outcome) {
         .pending => "pending",
@@ -287,4 +297,16 @@ test "canonical portable stdlib fixtures" {
         "stdlib/timeout.json",
         "stdlib/revision_barrier.json",
     }) |fixture| try replayFixture(fixture);
+}
+
+test "revision barrier preserves a reentrant terminal result" {
+    var barrier = portable.RevisionBarrier.init(0, 1, null);
+    var cancellation = ReentrantCancellationContext{ .barrier = &barrier };
+
+    const observation = barrier.observe(0, false, .{
+        .context = &cancellation,
+        .run_fn = ReentrantCancellationContext.run,
+    });
+
+    try std.testing.expectEqual(portable.BarrierOutcome.disposed, observation.outcome);
 }

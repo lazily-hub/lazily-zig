@@ -146,6 +146,7 @@ pub const RevisionBarrier = struct {
     required_revision: u64,
     generation: u64 = 0,
     deadline: ?u64,
+    last_now: ?u64 = null,
     terminal: ?BarrierOutcome = null,
     terminal_reason: ?[]const u8 = null,
 
@@ -164,15 +165,35 @@ pub const RevisionBarrier = struct {
         cancellation_adapter: CancellationAdapter,
     ) BarrierObservation {
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.terminal != null) return self.snapshot();
+        if (self.terminal != null) {
+            const observation = self.snapshot();
+            self.mutex.unlock();
+            return observation;
+        }
+        if (!self.acceptNow(now)) {
+            const observation = self.latch(.unavailable, "clock_regression");
+            self.mutex.unlock();
+            return observation;
+        }
         if (self.deadline) |deadline| {
-            if (now >= deadline) return self.latch(.timed_out, null);
+            if (now >= deadline) {
+                const observation = self.latch(.timed_out, null);
+                self.mutex.unlock();
+                return observation;
+            }
         }
         if (predicate and self.revision >= self.required_revision) {
-            return self.latch(.satisfied, null);
+            const observation = self.latch(.satisfied, null);
+            self.mutex.unlock();
+            return observation;
         }
-        return switch (cancellation_adapter.run()) {
+        self.mutex.unlock();
+
+        const cancellation = cancellation_adapter.run();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.terminal != null) return self.snapshot();
+        return switch (cancellation) {
             .cancelled => self.latch(.cancelled, null),
             .unavailable => self.latch(.unavailable, "cancellation_unavailable"),
             .pending => self.snapshot(),
@@ -188,6 +209,9 @@ pub const RevisionBarrier = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.terminal != null) return self.snapshot();
+        if (!self.acceptNow(now)) {
+            return self.latch(.unavailable, "clock_regression");
+        }
         if (self.deadline) |deadline| {
             if (now >= deadline) return self.latch(.timed_out, null);
         }
@@ -227,6 +251,14 @@ pub const RevisionBarrier = struct {
             self.revision = revision;
             self.generation += 1;
         }
+    }
+
+    fn acceptNow(self: *RevisionBarrier, now: u64) bool {
+        if (self.last_now) |last_now| {
+            if (now < last_now) return false;
+        }
+        self.last_now = now;
+        return true;
     }
 
     fn latch(
