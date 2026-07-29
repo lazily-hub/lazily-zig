@@ -110,7 +110,7 @@ const Peer = struct {
         return stringifyAlloc(self.arena.allocator(), .{
             .ok = true,
             .binding = "lazily-zig",
-            .version = "0.31.1",
+            .version = "0.33.0",
             .protocol_version = PROTOCOL_VERSION,
             .features = [_][]const u8{
                 "distributed_crdt",
