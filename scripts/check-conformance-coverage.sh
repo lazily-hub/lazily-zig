@@ -134,11 +134,32 @@ while IFS= read -r id; do
   fi
 done <<< "$OPENED"
 
-# A stale allowlist is its own drift: an entry naming a fixture that no longer
-# exists means the corpus moved and nobody updated the excuse.
+# A stale allowlist is its own drift, in two directions.
+#
+#   1. An entry naming a fixture that no longer exists means the corpus moved and
+#      nobody updated the excuse.
+#   2. An entry naming a fixture the suite DOES open means the excuse outlived the
+#      gap it described. Nothing above catches this: the covered-check `continue`s
+#      on an opened fixture and never consults the allowlist, so a stale excuse
+#      costs nothing and accumulates silently. That understates the gap in the
+#      SAME direction as an under-counted ledger — the guard reports fewer
+#      fixtures covered than the suite actually replays, and each dead entry makes
+#      the remaining list less credible as "someone looked".
+#
+# The opened-set test below is byte-for-byte the covered-check's comparison
+# (`grep -qxF ... <<< "$OPENED"`) so the two can never disagree about what
+# "opened" means.
 for known in "${KNOWN_UNCOVERED[@]:-}"; do
   if [ ! -f "$SPEC_DIR/$known" ]; then
     echo "ERROR: KNOWN_UNCOVERED lists '$known', which is not in the canonical corpus." >&2
+    missing=$((missing + 1))
+    continue
+  fi
+  if grep -qxF "$known" <<< "$OPENED"; then
+    echo "ERROR: KNOWN_UNCOVERED lists '$known', but the suite DID open it." >&2
+    echo "       The excuse is stale — the gap it described has been closed. Delete" >&2
+    echo "       the entry from KNOWN_UNCOVERED. Leaving it there understates this" >&2
+    echo "       binding's real coverage and rots the list into noise." >&2
     missing=$((missing + 1))
   fi
 done
