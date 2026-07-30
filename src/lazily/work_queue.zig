@@ -1,25 +1,24 @@
+//! `WorkQueueCell` — the single-threaded flavor of the competing-consumer queue.
+//!
+//! The lease/redelivery/dead-letter algebra lives in
+//! [`WorkQueueCore`](queue_core.zig) and is shared verbatim with
+//! `ThreadSafeWorkQueueCell` and `AsyncWorkQueueCell`; this shell owns four graph
+//! identities and the publish path, nothing else.
+
 const std = @import("std");
 const Context = @import("context.zig").Context;
 const Compute = @import("context.zig").Compute;
 const Slot = @import("context.zig").Slot;
 const ReaderKind = @import("reader_kind.zig").ReaderKind;
 const cell = @import("cell.zig");
+const core_mod = @import("queue_core.zig");
 
-pub const WorkQueueDeadLetterReason = enum { nack, expired };
+pub const WorkQueueCore = core_mod.WorkQueueCore;
+pub const WorkQueueDeadLetterReason = core_mod.WorkQueueDeadLetterReason;
+pub const WorkQueueError = core_mod.WorkQueueError;
+pub const WorkQueueInvalidates = core_mod.WorkQueueInvalidates;
 
-pub const WorkQueueVersions = struct {
-    pending_len: u64,
-    is_empty: u64,
-    in_flight_len: u64,
-    dead_letter_len: u64,
-};
-
-pub const WorkQueueError = error{
-    InvalidConfiguration,
-    ItemIdExhausted,
-    DeliveryIdExhausted,
-    DeadlineOverflow,
-};
+pub const WorkQueueVersions = core_mod.WorkQueueVersions;
 
 /// Process-local competing-consumer queue with leased exclusive claims.
 ///
@@ -29,52 +28,28 @@ pub const WorkQueueError = error{
 /// Distributed/HA use requires a consensus-backed leader or adapter.
 pub fn WorkQueueCell(comptime T: type) type {
     return struct {
-        pub const Item = struct {
-            item_id: u64,
-            value: T,
-            attempts: u64,
-        };
+        const Self = @This();
 
-        pub const Delivery = struct {
-            delivery_id: u64,
-            item_id: u64,
-            value: T,
-            worker: []const u8,
-            attempt: u64,
-            deadline: u64,
-        };
-
-        pub const DeadLetter = struct {
-            item_id: u64,
-            value: T,
-            attempts: u64,
-            reason: WorkQueueDeadLetterReason,
-        };
+        pub const Core = core_mod.WorkQueueCore(T);
+        pub const Item = Core.Item;
+        pub const Delivery = Core.Delivery;
+        pub const DeadLetter = Core.DeadLetter;
 
         ctx: *Context,
         allocator: std.mem.Allocator,
-        visibility_timeout: u64,
-        max_deliveries: u64,
-        pending: std.ArrayList(Item) = .empty,
-        in_flight: std.AutoHashMap(u64, Delivery),
-        dead_letters: std.ArrayList(DeadLetter) = .empty,
-        next_item_id: u64 = 0,
-        next_delivery_id: u64 = 0,
+        core: Core,
         pending_reader: ReaderKind,
         empty_reader: ReaderKind,
         in_flight_reader: ReaderKind,
         dead_letter_reader: ReaderKind,
-
-        const Self = @This();
 
         pub fn init(
             ctx: *Context,
             visibility_timeout: u64,
             max_deliveries: u64,
         ) !Self {
-            if (visibility_timeout == 0 or max_deliveries == 0) {
-                return error.InvalidConfiguration;
-            }
+            var core = try Core.init(ctx.allocator, visibility_timeout, max_deliveries);
+            errdefer core.deinit();
             const pending_reader = try ReaderKind.init(ctx);
             errdefer pending_reader.dispose();
             const empty_reader = try ReaderKind.init(ctx);
@@ -85,9 +60,7 @@ pub fn WorkQueueCell(comptime T: type) type {
             return .{
                 .ctx = ctx,
                 .allocator = ctx.allocator,
-                .visibility_timeout = visibility_timeout,
-                .max_deliveries = max_deliveries,
-                .in_flight = std.AutoHashMap(u64, Delivery).init(ctx.allocator),
+                .core = core,
                 .pending_reader = pending_reader,
                 .empty_reader = empty_reader,
                 .in_flight_reader = in_flight_reader,
@@ -100,146 +73,63 @@ pub fn WorkQueueCell(comptime T: type) type {
             self.empty_reader.dispose();
             self.in_flight_reader.dispose();
             self.dead_letter_reader.dispose();
-            self.pending.deinit(self.allocator);
-            self.in_flight.deinit();
-            self.dead_letters.deinit(self.allocator);
+            self.core.deinit();
+        }
+
+        /// Publish exactly the reader kinds the core reported, in one frontier
+        /// walk: a consumer must never see `pending_len` decremented while
+        /// `is_empty` still reads stale.
+        fn publish(self: *Self, changed: WorkQueueInvalidates) void {
+            var readers: [4]ReaderKind = undefined;
+            var count: usize = 0;
+            if (changed.pending_len) {
+                readers[count] = self.pending_reader;
+                count += 1;
+            }
+            if (changed.in_flight_len) {
+                readers[count] = self.in_flight_reader;
+                count += 1;
+            }
+            if (changed.dead_letter_len) {
+                readers[count] = self.dead_letter_reader;
+                count += 1;
+            }
+            if (changed.is_empty) {
+                readers[count] = self.empty_reader;
+                count += 1;
+            }
+            if (count == 0) return;
+            ReaderKind.bumpMany(self.ctx, readers[0..count]);
         }
 
         pub fn push(self: *Self, value: T) !u64 {
-            if (self.next_item_id == std.math.maxInt(u64)) {
-                return error.ItemIdExhausted;
-            }
-            const was_empty = self.pending.items.len == 0;
-            const item_id = self.next_item_id;
-            try self.pending.append(self.allocator, .{
-                .item_id = item_id,
-                .value = value,
-                .attempts = 0,
-            });
-            self.next_item_id += 1;
-            var changed = [_]ReaderKind{ self.pending_reader, self.empty_reader };
-            ReaderKind.bumpMany(self.ctx, changed[0..if (was_empty) 2 else 1]);
-            return item_id;
+            const pushed = try self.core.push(value);
+            self.publish(pushed.invalidates);
+            return pushed.item_id;
         }
 
         pub fn claim(self: *Self, worker: []const u8, now: u64) !?Delivery {
-            if (self.pending.items.len == 0) return null;
-            if (self.next_delivery_id == std.math.maxInt(u64)) {
-                return error.DeliveryIdExhausted;
-            }
-            const deadline = std.math.add(u64, now, self.visibility_timeout) catch {
-                return error.DeadlineOverflow;
-            };
-            const item = self.pending.items[0];
-            const delivery: Delivery = .{
-                .delivery_id = self.next_delivery_id,
-                .item_id = item.item_id,
-                .value = item.value,
-                .worker = worker,
-                .attempt = item.attempts + 1,
-                .deadline = deadline,
-            };
-            try self.in_flight.put(delivery.delivery_id, delivery);
-            _ = self.pending.orderedRemove(0);
-            self.next_delivery_id += 1;
-            var changed = [_]ReaderKind{
-                self.pending_reader,
-                self.in_flight_reader,
-                self.empty_reader,
-            };
-            ReaderKind.bumpMany(self.ctx, changed[0..if (self.pending.items.len == 0) 3 else 2]);
-            return delivery;
+            const claimed = try self.core.claim(worker, now);
+            self.publish(claimed.invalidates);
+            return claimed.delivery;
         }
 
         pub fn ack(self: *Self, worker: []const u8, delivery_id: u64) bool {
-            const delivery = self.in_flight.get(delivery_id) orelse return false;
-            if (!std.mem.eql(u8, worker, delivery.worker)) return false;
-            _ = self.in_flight.remove(delivery_id);
-            self.in_flight_reader.bump();
-            return true;
-        }
-
-        const FailureTransition = struct {
-            requeued: bool,
-            became_non_empty: bool,
-        };
-
-        fn fail(self: *Self, delivery: Delivery, reason: WorkQueueDeadLetterReason) !FailureTransition {
-            if (delivery.attempt >= self.max_deliveries) {
-                try self.dead_letters.append(self.allocator, .{
-                    .item_id = delivery.item_id,
-                    .value = delivery.value,
-                    .attempts = delivery.attempt,
-                    .reason = reason,
-                });
-                return .{ .requeued = false, .became_non_empty = false };
-            } else {
-                const was_empty = self.pending.items.len == 0;
-                try self.pending.append(self.allocator, .{
-                    .item_id = delivery.item_id,
-                    .value = delivery.value,
-                    .attempts = delivery.attempt,
-                });
-                return .{ .requeued = true, .became_non_empty = was_empty };
-            }
+            const settled = self.core.ack(worker, delivery_id);
+            self.publish(settled.invalidates);
+            return settled.ok;
         }
 
         pub fn nack(self: *Self, worker: []const u8, delivery_id: u64) !bool {
-            const delivery = self.in_flight.get(delivery_id) orelse return false;
-            if (!std.mem.eql(u8, worker, delivery.worker)) return false;
-            const transition = try self.fail(delivery, .nack);
-            _ = self.in_flight.remove(delivery_id);
-            var changed: [3]ReaderKind = undefined;
-            changed[0] = self.in_flight_reader;
-            changed[1] = if (transition.requeued) self.pending_reader else self.dead_letter_reader;
-            const count: usize = if (transition.became_non_empty) blk: {
-                changed[2] = self.empty_reader;
-                break :blk 3;
-            } else 2;
-            ReaderKind.bumpMany(self.ctx, changed[0..count]);
-            return true;
+            const settled = try self.core.nack(worker, delivery_id);
+            self.publish(settled.invalidates);
+            return settled.ok;
         }
 
         pub fn reapExpired(self: *Self, now: u64) !usize {
-            var expired: std.ArrayList(u64) = .empty;
-            defer expired.deinit(self.allocator);
-            var iterator = self.in_flight.iterator();
-            while (iterator.next()) |entry| {
-                if (entry.value_ptr.deadline < now) {
-                    try expired.append(self.allocator, entry.key_ptr.*);
-                }
-            }
-            if (expired.items.len == 0) return 0;
-            std.mem.sort(u64, expired.items, {}, std.sort.asc(u64));
-            var requeued = false;
-            var dead_lettered = false;
-            var became_non_empty = false;
-            for (expired.items) |delivery_id| {
-                const delivery = self.in_flight.get(delivery_id).?;
-                const transition = try self.fail(delivery, .expired);
-                requeued = requeued or transition.requeued;
-                dead_lettered = dead_lettered or !transition.requeued;
-                became_non_empty = became_non_empty or transition.became_non_empty;
-                _ = self.in_flight.remove(delivery_id);
-            }
-            var changed: [4]ReaderKind = undefined;
-            var count: usize = 0;
-            changed[count] = self.in_flight_reader;
-            count += 1;
-            if (requeued) {
-                changed[count] = self.pending_reader;
-                count += 1;
-            }
-            if (dead_lettered) {
-                changed[count] = self.dead_letter_reader;
-                count += 1;
-            }
-            if (became_non_empty) {
-                changed[count] = self.empty_reader;
-                count += 1;
-            }
-            ReaderKind.bumpMany(self.ctx, changed[0..count]);
-            return expired.items.len;
+            const reaped = try self.core.reapExpired(now);
+            self.publish(reaped.invalidates);
+            return reaped.count;
         }
 
         pub const PendingLenReader = struct {
@@ -247,7 +137,7 @@ pub fn WorkQueueCell(comptime T: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) usize {
-                return reader.owner.pending.items.len;
+                return reader.owner.core.pendingLen();
             }
         };
 
@@ -256,7 +146,7 @@ pub fn WorkQueueCell(comptime T: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) bool {
-                return reader.owner.pending.items.len == 0;
+                return reader.owner.core.isEmpty();
             }
         };
 
@@ -265,7 +155,7 @@ pub fn WorkQueueCell(comptime T: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) usize {
-                return reader.owner.in_flight.count();
+                return reader.owner.core.inFlightLen();
             }
         };
 
@@ -274,7 +164,7 @@ pub fn WorkQueueCell(comptime T: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) usize {
-                return reader.owner.dead_letters.items.len;
+                return reader.owner.core.deadLetterLen();
             }
         };
 
@@ -304,29 +194,18 @@ pub fn WorkQueueCell(comptime T: type) type {
         }
 
         pub fn pendingItems(self: *const Self) []const Item {
-            return self.pending.items;
+            return self.core.pendingItems();
         }
 
         pub fn deadLetterItems(self: *const Self) []const DeadLetter {
-            return self.dead_letters.items;
+            return self.core.deadLetterItems();
         }
 
         pub fn inFlightDeliveries(
             self: *const Self,
             allocator: std.mem.Allocator,
         ) ![]Delivery {
-            var result = try allocator.alloc(Delivery, self.in_flight.count());
-            var index: usize = 0;
-            var iterator = self.in_flight.iterator();
-            while (iterator.next()) |entry| : (index += 1) {
-                result[index] = entry.value_ptr.*;
-            }
-            std.mem.sort(Delivery, result, {}, struct {
-                fn lessThan(_: void, left: Delivery, right: Delivery) bool {
-                    return left.delivery_id < right.delivery_id;
-                }
-            }.lessThan);
-            return result;
+            return self.core.inFlightDeliveries(allocator);
         }
     };
 }

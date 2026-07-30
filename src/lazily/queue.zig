@@ -63,38 +63,22 @@ const Compute = @import("context.zig").Compute;
 const ReaderKind = @import("reader_kind.zig").ReaderKind;
 const Slot = @import("context.zig").Slot;
 const cell = @import("cell.zig");
+const core_mod = @import("queue_core.zig");
 
 // ---------------------------------------------------------------------------
-// Errors
+// Errors and the shared algebra
 // ---------------------------------------------------------------------------
+//
+// The state machine moved to `queue_core.zig` when the thread-safe and async
+// flavors landed (`#lzqueuefamilyflavors`): three shells over one algebra, so
+// there is exactly one place a queue law is written down. Everything re-exported
+// here keeps `queue.QueuePushError`, `queue.TopicDurability`, … resolving as
+// before.
 
-/// Failure modes for [`QueueStorage.tryPush`] / [`QueueCell.tryPush`].
-///
-/// `Full` and `Closed` are the two observable rejection reasons distinguished by
-/// the shell's contract (`lazily-spec/cell-model.md` § "Storage backend
-/// contract"). Neither changes queue state, so neither invalidates any reader.
-pub const QueuePushError = error{
-    /// The backend is bounded and at capacity. The overflow policy (block /
-    /// drop-oldest / drop-newest / reject) is a backend property; the reference
-    /// [`VecDequeStorage`] rejects. Distinct from `Closed`.
-    Full,
-    /// The queue is closed; push is rejected regardless of capacity. Terminal —
-    /// once closed, a queue cannot be reopened.
-    Closed,
-};
-
-/// Failure modes for [`QueueStorage.tryPop`] / [`QueueCell.tryPop`].
-///
-/// `Empty` and `Closed` are distinct observable signals: `Empty` means "try
-/// again later," `Closed` means "the producer is done and the queue is drained."
-pub const QueuePopError = error{
-    /// The queue is open but contains no elements.
-    Empty,
-    /// The queue is closed and empty — the producer is done and all buffered
-    /// elements have been consumed. Pop on a closed *non-empty* queue still
-    /// drains (returns the next element); only closed+empty yields `Closed`.
-    Closed,
-};
+pub const QueueCore = core_mod.QueueCore;
+pub const QueueInvalidates = core_mod.QueueInvalidates;
+pub const QueuePushError = core_mod.QueuePushError;
+pub const QueuePopError = core_mod.QueuePopError;
 
 // ---------------------------------------------------------------------------
 // QueueStorage — pluggable FIFO storage backend (comptime contract)
@@ -261,17 +245,7 @@ pub fn VecDequeStorage(comptime T: type) type {
 // QueueCell — the reactive shell
 // ---------------------------------------------------------------------------
 
-/// A snapshot of all five reader-kind version counters. Two snapshots diffed
-/// across an op yield exactly which reader kinds the op invalidated — the
-/// `invalidates` matrix asserted by
-/// `lazily-spec/conformance/collections/queuecell_*.json`.
-pub const QueueVersions = struct {
-    head: u64,
-    len: u64,
-    is_empty: u64,
-    is_full: u64,
-    closed: u64,
-};
+pub const QueueVersions = core_mod.QueueVersions;
 
 /// A reactive FIFO queue — SPSC primitive with an MPSC usage rule
 /// (`#lzqueue`).
@@ -291,11 +265,10 @@ pub const QueueVersions = struct {
 pub fn QueueCell(comptime T: type, comptime S: type) type {
     return struct {
         ctx: *Context,
-        storage: S,
-        // Cached bound (Phase 0 #relaycell): capacity is an OPTIONAL, fixed
-        // backend capability; null when the backend is unbounded or has no
-        // `capacity` decl.
-        cap: ?usize = null,
+        /// The state and the transition algebra, shared verbatim with
+        /// `ThreadSafeQueueCell` and `AsyncQueueCell`. `core.storage` is the
+        /// backend.
+        core: Core,
 
         // Real graph identities for the five independently-invalidated reader
         // kinds. Values remain demand-derived from storage by the handles below.
@@ -307,16 +280,11 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
 
         const Self = @This();
 
-        // `peek` and `capacity` are OPTIONAL storage capabilities (Phase 0
-        // #relaycell): a raw-channel backend implements neither. A backend with
-        // no `peek` has no `head` reader (it is trivially null).
-        const has_peek = @hasDecl(S, "peek");
-        const has_capacity = @hasDecl(S, "capacity");
+        pub const Core = core_mod.QueueCore(T, S);
 
-        /// Build a queue over an arbitrary `QueueStorage` backend. Caches the
-        /// (fixed) bound; reader values are derived on demand, not at init.
+        /// Build a queue over an arbitrary `QueueStorage` backend. Reader values
+        /// are derived on demand, not at init.
         pub fn init(ctx: *Context, storage: S) !Self {
-            const cap = if (has_capacity) storage.capacity() else null;
             const head_reader = try ReaderKind.init(ctx);
             errdefer head_reader.dispose();
             const len_reader = try ReaderKind.init(ctx);
@@ -328,8 +296,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             const closed_reader = try ReaderKind.init(ctx);
             return .{
                 .ctx = ctx,
-                .storage = storage,
-                .cap = cap,
+                .core = Core.init(storage),
                 .head_reader = head_reader,
                 .len_reader = len_reader,
                 .is_empty_reader = is_empty_reader,
@@ -338,34 +305,38 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             };
         }
 
-        /// Bump the version of exactly the reader-kinds whose value provably
-        /// changed on a successful op that took the queue from `len_before` to
-        /// `len_after`. No reader value is derived here — the transition alone
-        /// decides which counters advance (exact for any FIFO), so no `peek` is
-        /// needed. `head_changed` is passed by the caller because head depends on
-        /// op direction, not just len (a pop always changes head; a push changes
-        /// it only from empty). `closed` is never touched here; only
-        /// [`close`](Self.close) bumps it.
-        fn invalidateReaders(self: *Self, len_before: usize, len_after: usize, head_changed: bool) void {
-            var changed: [4]ReaderKind = undefined;
+        pub fn deinit(self: *Self) void {
+            self.core.deinit();
+        }
+
+        /// Publish exactly the reader kinds the core reported. One
+        /// `bumpMany` — one frontier walk — so an eager dependent never observes
+        /// `len` decremented while `is_full` still reads stale.
+        fn publish(self: *Self, changed: core_mod.QueueInvalidates) void {
+            var readers: [5]ReaderKind = undefined;
             var count: usize = 0;
-            changed[count] = self.len_reader;
-            count += 1;
-            if ((len_before == 0) != (len_after == 0)) {
-                changed[count] = self.is_empty_reader;
+            if (changed.len) {
+                readers[count] = self.len_reader;
                 count += 1;
             }
-            if (self.cap) |c| {
-                if ((len_before >= c) != (len_after >= c)) {
-                    changed[count] = self.is_full_reader;
-                    count += 1;
-                }
-            }
-            if (head_changed) {
-                changed[count] = self.head_reader;
+            if (changed.is_empty) {
+                readers[count] = self.is_empty_reader;
                 count += 1;
             }
-            ReaderKind.bumpMany(self.ctx, changed[0..count]);
+            if (changed.is_full) {
+                readers[count] = self.is_full_reader;
+                count += 1;
+            }
+            if (changed.head) {
+                readers[count] = self.head_reader;
+                count += 1;
+            }
+            if (changed.closed) {
+                readers[count] = self.closed_reader;
+                count += 1;
+            }
+            if (count == 0) return;
+            ReaderKind.bumpMany(self.ctx, readers[0..count]);
         }
 
         // -- mutating ops --
@@ -381,10 +352,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// `is_empty` readers as appropriate; `is_full` when transitioning onto
         /// capacity. Does not touch `closed`.
         pub fn tryPush(self: *Self, value: T) QueuePushError!void {
-            const len_before = self.storage.len();
-            try self.storage.tryPush(value);
-            // Head changes on a push only when the queue was empty.
-            self.invalidateReaders(len_before, len_before + 1, len_before == 0);
+            self.publish(try self.core.tryPush(value));
         }
 
         /// Remove and return the head element.
@@ -397,11 +365,9 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// `is_empty` (when transitioning to empty) readers as appropriate;
         /// `is_full` when transitioning off capacity.
         pub fn tryPop(self: *Self) QueuePopError!T {
-            const len_before = self.storage.len();
-            const v = try self.storage.tryPop();
-            // A successful pop always advances head and decrements len.
-            self.invalidateReaders(len_before, len_before - 1, true);
-            return v;
+            const popped = try self.core.tryPop();
+            self.publish(popped.invalidates);
+            return popped.value;
         }
 
         /// Close the queue. Idempotent — closing an already-closed queue is a
@@ -412,9 +378,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         ///
         /// Invalidates the `closed` reader only on the false → true transition.
         pub fn close(self: *Self) void {
-            if (self.storage.isClosed()) return;
-            self.storage.close();
-            self.closed_reader.bump();
+            self.publish(self.core.close());
         }
 
         // -- reactive reader-kind reads --
@@ -424,8 +388,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) ?T {
-                if (has_peek) return reader.owner.storage.peek();
-                return null;
+                return reader.owner.core.peek();
             }
         };
 
@@ -434,7 +397,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) usize {
-                return reader.owner.storage.len();
+                return reader.owner.core.len();
             }
         };
 
@@ -443,7 +406,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) bool {
-                return reader.owner.storage.len() == 0;
+                return reader.owner.core.isEmpty();
             }
         };
 
@@ -452,8 +415,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) bool {
-                if (reader.owner.cap) |c| return reader.owner.storage.len() >= c;
-                return false;
+                return reader.owner.core.isFull();
             }
         };
 
@@ -462,7 +424,7 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
             slot: *Slot,
 
             pub fn get(reader: @This()) bool {
-                return reader.owner.storage.isClosed();
+                return reader.owner.core.isClosed();
             }
         };
 
@@ -536,7 +498,13 @@ pub fn QueueCell(comptime T: type, comptime S: type) type {
         /// The backend's capacity, or `null` if unbounded. Cached at
         /// construction (capacity is a fixed backend property).
         pub fn capacity(self: *const Self) ?usize {
-            return self.cap;
+            return self.core.capacity();
+        }
+
+        /// FIFO-ordered view of the buffered elements. Non-reactive — for
+        /// debugging, snapshot/serde, and conformance-fixture verification.
+        pub fn items(self: *const Self) []const T {
+            return self.core.items();
         }
     };
 }
@@ -567,174 +535,147 @@ pub fn newBounded(comptime T: type, ctx: *Context, capacity: usize) !QueueCell(T
 // TopicCell — broadcast log with independent absolute cursors (#lztopiccell)
 // ===========================================================================
 
-pub const TopicDurability = enum { durable, ephemeral };
-
-pub const TopicSubscribeOutcome = enum { subscribed, reconnected, already_subscribed };
-
-pub const TopicSubscriptionSnapshot = struct {
-    subscriber_id: []const u8,
-    cursor: usize,
-    durability: TopicDurability,
-    connected: bool,
-};
-
-pub fn TopicSnapshot(comptime T: type) type {
-    return struct {
-        allocator: std.mem.Allocator,
-        base_offset: usize,
-        elements: []T,
-        subscriptions: []TopicSubscriptionSnapshot,
-
-        const Self = @This();
-
-        pub fn deinit(self: *Self) void {
-            for (self.subscriptions) |subscription| {
-                self.allocator.free(subscription.subscriber_id);
-            }
-            self.allocator.free(self.subscriptions);
-            self.allocator.free(self.elements);
-        }
-    };
-}
-
-const TopicSubscription = struct {
-    cursor: usize,
-    durability: TopicDurability,
-    connected: bool,
-    reader: ReaderKind,
-};
+pub const TopicCore = core_mod.TopicCore;
+pub const TopicDurability = core_mod.TopicDurability;
+pub const TopicSubscribeOutcome = core_mod.TopicSubscribeOutcome;
+pub const TopicSubscriptionSnapshot = core_mod.TopicSubscriptionSnapshot;
+pub const TopicSnapshot = core_mod.TopicSnapshot;
+pub const TopicWake = core_mod.TopicWake;
 
 /// Broadcast topic whose stable subscribers own independent absolute cursors.
 /// Durable offline subscriptions retain data; ephemeral subscriptions disappear
 /// on disconnect. `gc` drops only the prefix below the slowest durable cursor,
 /// so it never increments any subscriber reader version.
+///
+/// The shell owns one graph identity per subscriber and nothing else: the log,
+/// the cursors and every transition live in [`TopicCore`](queue_core.zig), so
+/// the thread-safe and async topics are the same algebra with a different
+/// publish path.
 pub fn TopicCell(comptime T: type) type {
     return struct {
         ctx: *Context,
         allocator: std.mem.Allocator,
-        base_offset: usize = 0,
-        elements: std.ArrayList(T) = .empty,
-        subscriptions: std.StringHashMap(TopicSubscription),
+        core: Core,
+        /// Reader identity per subscriber, keyed by this map's OWN duped id so a
+        /// reader survives the core dropping its entry long enough to be
+        /// disposed.
+        readers: std.StringHashMap(ReaderKind),
 
         const Self = @This();
+
+        pub const Core = core_mod.TopicCore(T);
 
         pub fn init(ctx: *Context) Self {
             return .{
                 .ctx = ctx,
                 .allocator = ctx.allocator,
-                .subscriptions = std.StringHashMap(TopicSubscription).init(ctx.allocator),
+                .core = Core.init(ctx.allocator),
+                .readers = std.StringHashMap(ReaderKind).init(ctx.allocator),
             };
         }
 
         pub fn initFromSnapshot(ctx: *Context, saved: TopicSnapshot(T)) !Self {
-            const allocator = ctx.allocator;
-            var self = Self.init(ctx);
+            // Build the core FIRST: it validates cursor bounds and ephemeral
+            // connectivity before storing anything, so a rejected snapshot mints
+            // no reader and leaves nothing half-built to unwind.
+            const core = try Core.initFromSnapshot(ctx.allocator, saved);
+            var self = Self{
+                .ctx = ctx,
+                .allocator = ctx.allocator,
+                .core = core,
+                .readers = std.StringHashMap(ReaderKind).init(ctx.allocator),
+            };
             errdefer self.deinit();
-            self.base_offset = saved.base_offset;
-            try self.elements.appendSlice(allocator, saved.elements);
-            const tail = self.tailOffset();
             for (saved.subscriptions) |saved_sub| {
-                if (saved_sub.cursor < self.base_offset or saved_sub.cursor > tail) {
-                    return error.CursorOutsideRetainedLog;
-                }
-                if (saved_sub.durability == .ephemeral and !saved_sub.connected) {
-                    return error.DisconnectedEphemeralSubscription;
-                }
-                const owned_id = try allocator.dupe(u8, saved_sub.subscriber_id);
-                errdefer allocator.free(owned_id);
-                const reader = try ReaderKind.init(ctx);
-                errdefer reader.dispose();
-                try self.subscriptions.put(owned_id, .{
-                    .cursor = saved_sub.cursor,
-                    .durability = saved_sub.durability,
-                    .connected = saved_sub.connected,
-                    .reader = reader,
-                });
+                _ = try self.mintReader(saved_sub.subscriber_id);
             }
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            var iterator = self.subscriptions.iterator();
+            var iterator = self.readers.iterator();
             while (iterator.next()) |entry| {
-                entry.value_ptr.reader.dispose();
+                entry.value_ptr.dispose();
                 self.allocator.free(entry.key_ptr.*);
             }
-            self.subscriptions.deinit();
-            self.elements.deinit(self.allocator);
+            self.readers.deinit();
+            self.core.deinit();
         }
 
-        /// Start a cursor at the tail, or resume an offline durable subscriber.
-        pub fn subscribe(self: *Self, subscriber_id: []const u8, durability: TopicDurability) !TopicSubscribeOutcome {
-            if (self.subscriptions.getPtr(subscriber_id)) |sub| {
-                if (sub.connected) return .already_subscribed;
-                if (sub.durability != .durable) return error.EphemeralCannotReconnect;
-                sub.connected = true;
-                sub.reader.bump();
-                return .reconnected;
-            }
+        fn mintReader(self: *Self, subscriber_id: []const u8) !ReaderKind {
+            if (self.readers.get(subscriber_id)) |existing| return existing;
             const owned_id = try self.allocator.dupe(u8, subscriber_id);
             errdefer self.allocator.free(owned_id);
             const reader = try ReaderKind.init(self.ctx);
             errdefer reader.dispose();
-            try self.subscriptions.put(owned_id, .{
-                .cursor = self.tailOffset(),
-                .durability = durability,
-                .connected = true,
-                .reader = reader,
-            });
-            reader.bump();
-            return .subscribed;
+            try self.readers.put(owned_id, reader);
+            return reader;
+        }
+
+        fn dropReader(self: *Self, subscriber_id: []const u8) void {
+            const removed = self.readers.fetchRemove(subscriber_id) orelse return;
+            removed.value.dispose();
+            self.allocator.free(removed.key);
+        }
+
+        /// Resolve the core's wake set against THIS shell's reader table and bump
+        /// exactly those readers, in one frontier walk.
+        ///
+        /// The source array is heap-allocated rather than a fixed stack buffer:
+        /// `ReaderKind.bumpMany` caps at 16 readers and a broadcast topic's
+        /// subscriber count has no such bound.
+        fn wakeReaders(self: *Self, wake: TopicWake) !void {
+            if (wake == .none) return;
+            var changed: std.ArrayList(*cell.Source(u64)) = .empty;
+            defer changed.deinit(self.allocator);
+            try changed.ensureTotalCapacity(self.allocator, self.readers.count());
+            var iterator = self.readers.iterator();
+            while (iterator.next()) |entry| {
+                if (self.core.wakes(wake, entry.key_ptr.*)) {
+                    changed.appendAssumeCapacity(entry.value_ptr.source);
+                }
+            }
+            if (changed.items.len == 0) return;
+            cell.bumpSources(self.ctx, changed.items);
+        }
+
+        /// Start a cursor at the tail, or resume an offline durable subscriber.
+        pub fn subscribe(
+            self: *Self,
+            subscriber_id: []const u8,
+            durability: TopicDurability,
+        ) !TopicSubscribeOutcome {
+            const result = try self.core.subscribe(subscriber_id, durability);
+            if (result.change.minted) _ = try self.mintReader(subscriber_id);
+            try self.wakeReaders(result.change.wake);
+            return result.outcome;
         }
 
         pub fn reconnect(self: *Self, subscriber_id: []const u8) !void {
-            const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
-            if (sub.durability != .durable) return error.EphemeralCannotReconnect;
-            if (!sub.connected) {
-                sub.connected = true;
-                sub.reader.bump();
-            }
+            try self.wakeReaders((try self.core.reconnect(subscriber_id)).wake);
         }
 
         pub fn disconnect(self: *Self, subscriber_id: []const u8) !void {
-            const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
-            if (!sub.connected) return;
-            if (sub.durability == .ephemeral) {
-                const removed = self.subscriptions.fetchRemove(subscriber_id).?;
-                removed.value.reader.dispose();
-                self.allocator.free(removed.key);
+            const change = try self.core.disconnect(subscriber_id);
+            if (change.removed) {
+                // Disposal is a strictly stronger observation than a bump: every
+                // reader of a removed ephemeral becomes invalid, not merely stale.
+                self.dropReader(subscriber_id);
                 return;
             }
-            sub.connected = false;
-            sub.reader.bump();
+            try self.wakeReaders(change.wake);
         }
 
         /// Append a value and invalidate every connected reader independently.
         pub fn publish(self: *Self, value: T) !usize {
-            var changed: std.ArrayList(*cell.Source(u64)) = .empty;
-            defer changed.deinit(self.allocator);
-            try changed.ensureTotalCapacity(self.allocator, self.subscriptions.count());
-            var readers = self.subscriptions.valueIterator();
-            while (readers.next()) |sub| {
-                if (sub.connected) changed.appendAssumeCapacity(sub.reader.source);
-            }
-
-            const offset = self.tailOffset();
-            try self.elements.append(self.allocator, value);
-            cell.bumpSources(self.ctx, changed.items);
-            return offset;
+            const result = try self.core.publish(value);
+            try self.wakeReaders(result.change.wake);
+            return result.offset;
         }
 
         /// Read the retained suffix without advancing this subscriber's cursor.
         pub fn readStream(self: *const Self, subscriber_id: []const u8) ![]const T {
-            const sub = self.subscriptions.get(subscriber_id) orelse return error.SubscriptionNotFound;
-            if (!sub.connected) return self.elements.items[0..0];
-            return self.elements.items[sub.cursor - self.base_offset ..];
-        }
-
-        fn readValue(self: *const Self, subscriber_id: []const u8) !?T {
-            const stream = try self.readStream(subscriber_id);
-            return if (stream.len == 0) null else stream[0];
+            return self.core.readStream(subscriber_id);
         }
 
         pub const Reader = struct {
@@ -744,103 +685,66 @@ pub fn TopicCell(comptime T: type) type {
 
             pub fn get(reader: @This()) !?T {
                 if (reader.slot.disposed) return error.NodeDisposed;
-                return reader.owner.readValue(reader.subscriber_id);
+                return reader.owner.core.readValue(reader.subscriber_id);
             }
         };
 
         pub fn read(self: *const Self, subscriber_id: []const u8) !Reader {
-            const entry = self.subscriptions.getEntry(subscriber_id) orelse return error.SubscriptionNotFound;
+            const entry = self.readers.getEntry(subscriber_id) orelse
+                return error.SubscriptionNotFound;
             return .{
                 .owner = self,
                 .subscriber_id = entry.key_ptr.*,
-                .slot = entry.value_ptr.reader.slot(),
+                .slot = entry.value_ptr.slot(),
             };
         }
 
         /// Advance only the named subscriber and its reader version.
         pub fn advance(self: *Self, subscriber_id: []const u8, count: usize) !usize {
-            const sub = self.subscriptions.getPtr(subscriber_id) orelse return error.SubscriptionNotFound;
-            if (!sub.connected or sub.cursor == self.tailOffset()) return sub.cursor;
-            if (count > self.tailOffset() - sub.cursor) return error.AdvancePastTail;
-            if (count != 0) {
-                sub.cursor += count;
-                sub.reader.bump();
-            }
-            return sub.cursor;
+            const result = try self.core.advance(subscriber_id, count);
+            try self.wakeReaders(result.change.wake);
+            return result.cursor;
         }
 
         /// Drop the safe prefix. Cursor offsets stay absolute; no reader changes.
         pub fn gc(self: *Self) usize {
-            var frontier = self.tailOffset();
-            var iterator = self.subscriptions.valueIterator();
-            while (iterator.next()) |sub| {
-                if (sub.durability == .durable and sub.cursor < frontier) {
-                    frontier = sub.cursor;
-                }
-            }
-            const removed = frontier - self.base_offset;
-            var index: usize = 0;
-            while (index < removed) : (index += 1) _ = self.elements.orderedRemove(0);
-            self.base_offset = frontier;
-            return removed;
+            return self.core.gc();
         }
 
         pub fn restart(self: *Self) void {
-            _ = self;
+            _ = self.core.restart();
         }
 
         pub fn baseOffset(self: *const Self) usize {
-            return self.base_offset;
+            return self.core.baseOffset();
         }
 
         pub fn tailOffset(self: *const Self) usize {
-            return self.base_offset + self.elements.items.len;
+            return self.core.tailOffset();
         }
 
         pub fn items(self: *const Self) []const T {
-            return self.elements.items;
+            return self.core.items();
         }
 
-        pub fn subscription(self: *const Self, subscriber_id: []const u8) ?TopicSubscriptionSnapshot {
-            const found = self.subscriptions.get(subscriber_id) orelse return null;
-            return .{
-                .subscriber_id = subscriber_id,
-                .cursor = found.cursor,
-                .durability = found.durability,
-                .connected = found.connected,
-            };
+        pub fn subscriptionCount(self: *const Self) usize {
+            return self.core.subscriptionCount();
+        }
+
+        pub fn subscription(
+            self: *const Self,
+            subscriber_id: []const u8,
+        ) ?TopicSubscriptionSnapshot {
+            return self.core.subscription(subscriber_id);
         }
 
         pub fn readerVersion(self: *const Self, subscriber_id: []const u8) ?u64 {
-            const found = self.subscriptions.get(subscriber_id) orelse return null;
-            return found.reader.version();
+            const found = self.readers.get(subscriber_id) orelse return null;
+            return found.version();
         }
 
         pub fn snapshot(self: *const Self, allocator: std.mem.Allocator) !TopicSnapshot(T) {
-            const elements = try allocator.dupe(T, self.elements.items);
-            errdefer allocator.free(elements);
-            const subscriptions = try allocator.alloc(TopicSubscriptionSnapshot, self.subscriptions.count());
-            errdefer allocator.free(subscriptions);
-            var initialized: usize = 0;
-            errdefer for (subscriptions[0..initialized]) |saved_sub| allocator.free(saved_sub.subscriber_id);
-
-            var iterator = self.subscriptions.iterator();
-            while (iterator.next()) |entry| {
-                const subscriber_id = try allocator.dupe(u8, entry.key_ptr.*);
-                subscriptions[initialized] = .{
-                    .subscriber_id = subscriber_id,
-                    .cursor = entry.value_ptr.cursor,
-                    .durability = entry.value_ptr.durability,
-                    .connected = entry.value_ptr.connected,
-                };
-                initialized += 1;
-            }
-            return .{
-                .allocator = allocator,
-                .base_offset = self.base_offset,
-                .elements = elements,
-                .subscriptions = subscriptions,
-            };
+            return self.core.snapshot(allocator);
         }
     };
 }
@@ -995,7 +899,7 @@ test "lazily/queue: SPSC FIFO basic" {
     defer ctx.deinit();
 
     var q = try newUnbounded(i32, ctx);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try std.testing.expect(q.isEmpty().get());
     try std.testing.expectEqual(@as(?i32, null), q.head().get());
@@ -1006,7 +910,7 @@ test "lazily/queue: SPSC FIFO basic" {
 
     try std.testing.expectEqual(@as(usize, 3), q.len().get());
     try std.testing.expectEqual(@as(?i32, 1), q.head().get());
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, q.storage.items());
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, q.items());
 
     try std.testing.expectEqual(@as(i32, 1), try q.tryPop());
     try std.testing.expectEqual(@as(i32, 2), try q.tryPop());
@@ -1020,7 +924,7 @@ test "lazily/queue: bounded rejects at capacity (reactive backpressure)" {
     defer ctx.deinit();
 
     var q = try newBounded(i32, ctx, 2);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try std.testing.expectEqual(@as(?usize, 2), q.capacity());
     try std.testing.expect(!q.isFull().get());
@@ -1043,7 +947,7 @@ test "lazily/queue: closure lifecycle" {
     defer ctx.deinit();
 
     var q = try newUnbounded([]const u8, ctx);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try q.tryPush("a");
     try q.tryPush("b");
@@ -1074,7 +978,7 @@ test "lazily/queue: reader-kind independence — head not invalidated on push to
     defer ctx.deinit();
 
     var q = try newUnbounded(i32, ctx);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try std.testing.expectEqual(@as(?i32, null), q.head().get());
 
@@ -1101,7 +1005,7 @@ test "lazily/queue: reader handles form real graph edges" {
     defer ctx.deinit();
 
     var q = try newUnbounded(i32, ctx);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     const Derived = struct {
         var queue: *QueueCell(i32, VecDequeStorage(i32)) = undefined;
@@ -1150,7 +1054,7 @@ test "lazily/queue: MPSC via batch is one observable transition" {
     defer ctx.deinit();
 
     var q = try newUnbounded(i32, ctx);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), q.len().get());
 
@@ -1170,7 +1074,7 @@ test "lazily/queue: MPSC via batch is one observable transition" {
     ctx.batch(MPSC.run);
 
     try std.testing.expectEqual(@as(usize, 3), q.len().get());
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, q.storage.items());
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, q.items());
 }
 
 test "lazily/queue: same shell, shared by reference (producer/consumer)" {
@@ -1179,7 +1083,7 @@ test "lazily/queue: same shell, shared by reference (producer/consumer)" {
     defer ctx.deinit();
 
     var q = try newUnbounded(i32, ctx);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     // A producer borrows the shell by pointer and pushes.
     const producer = &q;
@@ -1199,7 +1103,7 @@ test "lazily/queue: pluggable storage — custom bounded ring backend" {
         fn init(allocator: std.mem.Allocator, c: usize) @This() {
             return .{ .buf = .empty, .cap = c, .closed = false, .allocator = allocator };
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.buf.deinit(self.allocator);
         }
         pub fn tryPush(self: *@This(), v: i32) QueuePushError!void {
@@ -1236,7 +1140,7 @@ test "lazily/queue: pluggable storage — custom bounded ring backend" {
 
     const storage = Ring.init(ctx.allocator, 2);
     var q = try QueueCell(i32, Ring).init(ctx, storage);
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try q.tryPush(1);
     try q.tryPush(2);
@@ -1249,326 +1153,15 @@ test "lazily/queue: pluggable storage — custom bounded ring backend" {
 }
 
 // ---------------------------------------------------------------------------
-// lazily-spec conformance fixture replay
+// Canonical-corpus replay lives in `queue_family_conformance.zig`
 // ---------------------------------------------------------------------------
-
-const json = std.json;
-
-/// Reads through the runtime conformance manifest recorder
-/// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
-/// coverage guard is fed by observed reads rather than a source grep.
-const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
-
-fn jsonField(value: json.Value, name: []const u8) ?json.Value {
-    return switch (value) {
-        .object => |object| object.get(name),
-        else => null,
-    };
-}
-
-fn jsonFieldRequired(value: json.Value, name: []const u8) !json.Value {
-    return jsonField(value, name) orelse error.MissingField;
-}
-
-fn jsonAsString(value: json.Value) ![]const u8 {
-    return switch (value) {
-        .string => |s| s,
-        else => error.ExpectedString,
-    };
-}
-
-fn jsonAsU64(value: json.Value) !u64 {
-    return switch (value) {
-        .integer => |n| if (n >= 0) @as(u64, @intCast(n)) else error.ExpectedUnsignedInteger,
-        .number_string => |s| try std.fmt.parseInt(u64, s, 10),
-        else => error.ExpectedUnsignedInteger,
-    };
-}
-
-fn jsonAsBool(value: json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        else => error.ExpectedBool,
-    };
-}
-
-const Q = QueueCell([]const u8, VecDequeStorage([]const u8));
-
-fn specFixturesPresent() bool {
-    const path = "../lazily-spec/conformance/collections/queuecell_spsc_push_pop.json";
-    const raw = readFixtureFile(path) catch return false;
-    std.testing.allocator.free(raw);
-    return true;
-}
-
-fn buildInitial(ctx: *Context, initial: json.Value) !Q {
-    const cap: ?u64 = if (jsonField(initial, "capacity")) |c| switch (c) {
-        .null => null,
-        else => try jsonAsU64(c),
-    } else null;
-    var q = if (cap) |c|
-        try newBounded([]const u8, ctx, @intCast(c))
-    else
-        try newUnbounded([]const u8, ctx);
-    if (jsonField(initial, "elements")) |elems| {
-        switch (elems) {
-            .array => |arr| {
-                for (arr.items) |e| try q.tryPush(try jsonAsString(e));
-            },
-            else => {},
-        }
-    }
-    // `closed` in initial is rare but supported: honor it.
-    if (jsonField(initial, "closed")) |c| {
-        if (try jsonAsBool(c)) q.close();
-    }
-    return q;
-}
-
-/// Assert the per-reader-kind invalidation matrix for one step. Only reader
-/// kinds the fixture explicitly declares are asserted (mirrors lazily-rs
-/// `assert_invalidation`); an absent kind means "don't check."
-fn assertInvalidation(
-    q: *Q,
-    pre: QueueVersions,
-    invalidates: ?json.Value,
-) !void {
-    const node = invalidates orelse return;
-    const check = struct {
-        fn ok(name: []const u8, before: u64, after: u64, inv_obj: json.Value) !void {
-            const present = jsonField(inv_obj, name) orelse return;
-            const expected_inv = try jsonAsBool(present);
-            const changed = after != before;
-            if (expected_inv) {
-                try std.testing.expect(changed);
-            } else {
-                try std.testing.expect(!changed);
-            }
-        }
-    };
-    const post = q.versions();
-    try check.ok("head", pre.head, post.head, node);
-    try check.ok("len", pre.len, post.len, node);
-    try check.ok("is_empty", pre.is_empty, post.is_empty, node);
-    try check.ok("is_full", pre.is_full, post.is_full, node);
-    try check.ok("closed", pre.closed, post.closed, node);
-}
-
-fn assertState(q: *Q, expected: json.Value) !void {
-    if (jsonField(expected, "elements")) |elems| {
-        switch (elems) {
-            .array => |arr| {
-                try std.testing.expectEqual(arr.items.len, q.storage.items().len);
-                for (arr.items, q.storage.items()) |want, got| {
-                    try std.testing.expectEqualStrings(try jsonAsString(want), got);
-                }
-            },
-            else => {},
-        }
-    }
-    if (jsonField(expected, "head")) |head_val| {
-        const want: ?[]const u8 = switch (head_val) {
-            .null => null,
-            else => try jsonAsString(head_val),
-        };
-        try expectEqualStringsOpt(want, q.head().get());
-    }
-    if (jsonField(expected, "len")) |l| {
-        try std.testing.expectEqual(@as(usize, @intCast(try jsonAsU64(l))), q.len().get());
-    }
-    if (jsonField(expected, "is_empty")) |b| {
-        try std.testing.expectEqual(try jsonAsBool(b), q.isEmpty().get());
-    }
-    if (jsonField(expected, "is_full")) |b| {
-        try std.testing.expectEqual(try jsonAsBool(b), q.isFull().get());
-    }
-    if (jsonField(expected, "closed")) |b| {
-        try std.testing.expectEqual(try jsonAsBool(b), q.isClosed().get());
-    }
-}
-
-/// expectEqualStringsOpt: compare two optional strings.
-fn expectEqualStringsOpt(expected: ?[]const u8, actual: ?[]const u8) !void {
-    if (expected == null and actual == null) return;
-    try std.testing.expect(expected != null);
-    try std.testing.expect(actual != null);
-    try std.testing.expectEqualStrings(expected.?, actual.?);
-}
-
-/// Returns label for an op (an element string, or an error label) — `null` when
-/// the fixture declares no `returns`.
-fn returnsLabel(step: json.Value) ?[]const u8 {
-    const r = jsonField(step, "returns") orelse return null;
-    return switch (r) {
-        .null => null,
-        else => jsonAsString(r) catch null,
-    };
-}
-
-fn runFixture(ctx: *Context, fixture: json.Value) !void {
-    var q = try buildInitial(ctx, try jsonFieldRequired(fixture, "initial"));
-    defer q.storage.deinit();
-
-    const steps = switch (try jsonFieldRequired(fixture, "steps")) {
-        .array => |a| a.items,
-        else => return error.ExpectedArray,
-    };
-
-    for (steps, 0..) |step, i| {
-        const op = try jsonFieldRequired(step, "op");
-        const op_type = try jsonAsString(try jsonFieldRequired(op, "type"));
-        const expected = jsonField(step, "expected") orelse json.Value.null;
-        const invalidates = jsonField(expected, "invalidates");
-
-        const pre = q.versions();
-
-        var got_label: ?[]const u8 = null;
-        if (std.mem.eql(u8, op_type, "push")) {
-            const val = try jsonAsString(try jsonFieldRequired(op, "value"));
-            try q.tryPush(val);
-        } else if (std.mem.eql(u8, op_type, "try_push")) {
-            const val = try jsonAsString(try jsonFieldRequired(op, "value"));
-            q.tryPush(val) catch |err| {
-                got_label = switch (err) {
-                    error.Full => "Full",
-                    error.Closed => "Closed",
-                };
-            };
-        } else if (std.mem.eql(u8, op_type, "pop") or std.mem.eql(u8, op_type, "try_pop")) {
-            got_label = q.tryPop() catch |err| switch (err) {
-                error.Empty => "Empty",
-                error.Closed => "Closed",
-            };
-        } else if (std.mem.eql(u8, op_type, "close")) {
-            q.close();
-        } else if (std.mem.eql(u8, op_type, "batch")) {
-            // MPSC: per-producer pushes inside one batch() boundary. In the
-            // version-counter model the per-op bumps already coalesce into a
-            // single observable transition (the fixture asserts changed-or-not,
-            // not how many times), so sequential replay yields the exact
-            // `invalidates` matrix. Wrap in ctx.batch to honor the boundary.
-            const Batch = struct {
-                var q_ptr: *Q = undefined;
-                var ops_ptr: []const json.Value = undefined;
-                fn run(c: *Context) void {
-                    _ = c;
-                    for (ops_ptr) |inner| {
-                        const ty = jsonAsString(jsonFieldRequired(inner, "type") catch json.Value.null) catch return;
-                        if (!std.mem.eql(u8, ty, "push")) continue;
-                        const val = jsonAsString(jsonFieldRequired(inner, "value") catch json.Value.null) catch return;
-                        q_ptr.tryPush(val) catch {};
-                    }
-                }
-            };
-            Batch.q_ptr = &q;
-            Batch.ops_ptr = switch (try jsonFieldRequired(op, "ops")) {
-                .array => |a| a.items,
-                else => return error.ExpectedArray,
-            };
-            ctx.batch(Batch.run);
-        } else {
-            std.debug.print("unknown queue op type: {s}\n", .{op_type});
-            return error.UnknownOpType;
-        }
-
-        try assertState(&q, expected);
-
-        if (returnsLabel(step)) |want| {
-            try std.testing.expect(want.len > 0);
-            const got = got_label orelse "";
-            try std.testing.expectEqualStrings(want, got);
-        }
-
-        try assertInvalidation(&q, pre, invalidates);
-
-        _ = i;
-    }
-}
-
-test "lazily/queue conformance: queuecell_spsc_push_pop" {
-    if (!specFixturesPresent()) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const ctx = try Context.init(allocator);
-    defer ctx.deinit();
-
-    const raw = try readFixtureFile(
-        "../lazily-spec/conformance/collections/queuecell_spsc_push_pop.json",
-    );
-    defer allocator.free(raw);
-
-    var parsed = try json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try runFixture(ctx, parsed.value);
-}
-
-test "lazily/queue conformance: queuecell_popped_head_observation" {
-    if (!specFixturesPresent()) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const ctx = try Context.init(allocator);
-    defer ctx.deinit();
-
-    const raw = try readFixtureFile(
-        "../lazily-spec/conformance/collections/queuecell_popped_head_observation.json",
-    );
-    defer allocator.free(raw);
-
-    var parsed = try json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try runFixture(ctx, parsed.value);
-}
-
-test "lazily/queue conformance: queuecell_mpsc_multi_writer" {
-    if (!specFixturesPresent()) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const ctx = try Context.init(allocator);
-    defer ctx.deinit();
-
-    const raw = try readFixtureFile(
-        "../lazily-spec/conformance/collections/queuecell_mpsc_multi_writer.json",
-    );
-    defer allocator.free(raw);
-
-    var parsed = try json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try runFixture(ctx, parsed.value);
-}
-
-test "lazily/queue conformance: queuecell_bounded_backpressure" {
-    if (!specFixturesPresent()) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const ctx = try Context.init(allocator);
-    defer ctx.deinit();
-
-    const raw = try readFixtureFile(
-        "../lazily-spec/conformance/collections/queuecell_bounded_backpressure.json",
-    );
-    defer allocator.free(raw);
-
-    var parsed = try json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try runFixture(ctx, parsed.value);
-}
-
-test "lazily/queue conformance: queuecell_closure_lifecycle" {
-    if (!specFixturesPresent()) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const ctx = try Context.init(allocator);
-    defer ctx.deinit();
-
-    const raw = try readFixtureFile(
-        "../lazily-spec/conformance/collections/queuecell_closure_lifecycle.json",
-    );
-    defer allocator.free(raw);
-
-    var parsed = try json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try runFixture(ctx, parsed.value);
-}
+//
+// The five `queuecell_*.json` fixtures used to be replayed here, against this
+// one flavor, alongside a ledger recording the thread-safe and async flavors as
+// unshipped. Both moved to `queue_family_conformance.zig` when those flavors
+// landed (`#lzqueuefamilyflavors`): the corpus now runs 3 primitives x 3
+// flavors from one runner, and a per-flavor copy of the replay here would be a
+// second place for the matrix to drift.
 
 // A raw-channel-style backend implementing ONLY the required contract —
 // tryPush / tryPop / len / isClosed / close, no peek, no capacity. It proves the
@@ -1613,7 +1206,7 @@ test "lazily/queue: raw-channel backend conforms to minimal contract (#relaycell
     defer ctx.deinit();
 
     var q = try QueueCell(i32, MinimalFifoI32).init(ctx, MinimalFifoI32.init(allocator));
-    defer q.storage.deinit();
+    defer q.deinit();
 
     try std.testing.expect(q.isEmpty().get());
 
@@ -1638,128 +1231,4 @@ test "lazily/queue: raw-channel backend conforms to minimal contract (#relaycell
     try std.testing.expect(q.isClosed().get());
     try std.testing.expectError(error.Closed, q.tryPush(3));
     try std.testing.expectError(error.Closed, q.tryPop());
-}
-
-// ---------------------------------------------------------------------------
-// Queue-family flavor ledger — enforced against the source, not a comment.
-//
-// The conformance tests above replay the canonical `queuecell_*.json` corpus
-// against the single-threaded `QueueCell`. That is currently the only flavor: no
-// binding in the family ships a thread-safe or async queue primitive, and
-// `cell-model.md` § "Core surface vs. binding extensions (queue family)" now makes
-// those Core, so their absence is a conformance gap rather than an unfinished
-// nicety.
-//
-// A three-flavor replay written today would skip two of three flavors entirely,
-// and a suite that skips almost everything while reporting green is exactly the
-// failure this ledger prevents. So it is wired to the source: it greps this
-// package for each unshipped flavor's type name, and the moment one appears the
-// test goes red and names the runner to extend.
-//
-// Mirrors lazily-rs/tests/queue_family_conformance.rs.
-// ---------------------------------------------------------------------------
-
-const QueueFlavorTag = enum { single_threaded, thread_safe, async_flavor };
-
-const QueueFlavor = struct {
-    tag: QueueFlavorTag,
-    shipped: bool,
-};
-
-const queue_flavor_ledger = [_]QueueFlavor{
-    .{ .tag = .single_threaded, .shipped = true },
-    .{ .tag = .thread_safe, .shipped = false },
-    .{ .tag = .async_flavor, .shipped = false },
-};
-
-const queue_ledger_fixtures = [_][]const u8{
-    "queuecell_spsc_push_pop.json",
-    "queuecell_popped_head_observation.json",
-    "queuecell_mpsc_multi_writer.json",
-    "queuecell_bounded_backpressure.json",
-    "queuecell_closure_lifecycle.json",
-};
-
-test "lazily/queue ledger: unshipped flavors are really absent" {
-    // NOTE on mechanism. The sibling bindings grep their source directory for each
-    // flavor's type name, which is safe there because their tests live outside it.
-    // Zig's tests live IN the source file, so grepping `@embedFile("queue.zig")`
-    // finds the ledger's own marker string literals and reports every flavor as
-    // present — a self-reference that made this test fail against correct code.
-    //
-    // `@hasDecl` is both immune to that and strictly stronger: it asks the compiler
-    // what this module actually declares, rather than asking the bytes what they
-    // mention. Same enforcement, no false positive.
-    comptime {
-        for (queue_flavor_ledger) |flavor| {
-            const present = switch (flavor.tag) {
-                .single_threaded => @hasDecl(@This(), "QueueCell"),
-                .thread_safe => @hasDecl(@This(), "ThreadSafeQueueCell"),
-                .async_flavor => @hasDecl(@This(), "AsyncQueueCell"),
-            };
-            if (flavor.shipped and !present) {
-                @compileError("a queue flavor is recorded as shipped but its type is " ++
-                    "not declared in this module — the ledger claims coverage this " ++
-                    "package does not have");
-            }
-            if (!flavor.shipped and present) {
-                @compileError("a queue flavor now EXISTS in this module but the " ++
-                    "queue-family ledger still records it as unshipped, so the " ++
-                    "canonical corpus is not being replayed against it. Fix: flip " ++
-                    ".shipped for it AND extend the replay to drive it. Do NOT flip " ++
-                    "the flag alone — that restores the false green this check prevents.");
-            }
-        }
-    }
-}
-
-test "lazily/queue ledger: is not all skips" {
-    // In a summary line, "skipped" and "passed" are indistinguishable.
-    var shipped: usize = 0;
-    for (queue_flavor_ledger) |flavor| {
-        if (flavor.shipped) shipped += 1;
-    }
-    try std.testing.expect(shipped > 0);
-    try std.testing.expectEqual(@as(usize, 3), queue_flavor_ledger.len);
-}
-
-test "lazily/queue ledger: shipped flavor replays the corpus" {
-    var fixtures_read: usize = 0;
-    var steps_seen: usize = 0;
-    var matrices_seen: usize = 0;
-
-    for (queue_ledger_fixtures) |name| {
-        const path = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "../lazily-spec/conformance/collections/{s}",
-            .{name},
-        );
-        defer std.testing.allocator.free(path);
-
-        const text = readFixtureFile(path) catch return error.SkipZigTest;
-        defer std.testing.allocator.free(text);
-
-        var parsed = try json.parseFromSlice(json.Value, std.testing.allocator, text, .{});
-        defer parsed.deinit();
-        fixtures_read += 1;
-
-        const steps = (try jsonFieldRequired(parsed.value, "steps")).array;
-        // A vacuous replay would report green.
-        try std.testing.expect(steps.items.len > 0);
-        steps_seen += steps.items.len;
-
-        for (steps.items) |step| {
-            // The matrix nests under `expected`, NOT on the step. lazily-rs's MAP
-            // runner read it off the step, so it was always absent and the
-            // assertion never ran once. Pin the nesting so that cannot recur here.
-            try std.testing.expect(jsonField(step, "invalidates") == null);
-            const expected = try jsonFieldRequired(step, "expected");
-            if (jsonField(expected, "invalidates") != null) matrices_seen += 1;
-        }
-    }
-
-    try std.testing.expectEqual(queue_ledger_fixtures.len, fixtures_read);
-    try std.testing.expect(steps_seen > 0);
-    // Without this the reader-kind independence contract would be unasserted.
-    try std.testing.expect(matrices_seen > 0);
 }
