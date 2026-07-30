@@ -298,6 +298,102 @@ const AsyncModel = struct {
 
 fn Engine(comptime Model: type) type {
     return struct {
+        /// `assertKeyWith` context for one replay step. Every check here takes
+        /// the fixture's own value as its second argument, which is what makes
+        /// the key count as ASSERTED rather than merely read.
+        const StepCtx = struct {
+            model: *Model,
+            step: usize,
+            stamps_before: *std.StringHashMap(u64),
+            mv_before: u64,
+            ov_before: u64,
+            vv_before: *std.StringHashMap(u64),
+            values_before: *std.StringHashMap(V),
+
+            fn checkInvalidates(self: StepCtx, inv: json.Value) !void {
+                try assertInvalidation(
+                    Model,
+                    self.model,
+                    inv,
+                    self.step,
+                    self.mv_before,
+                    self.ov_before,
+                    self.vv_before,
+                    self.values_before,
+                );
+            }
+
+            fn checkHandleStable(self: StepCtx, hs: json.Value) !void {
+                const obj = switch (hs) {
+                    .object => |o| o,
+                    else => return error.ExpectedObject,
+                };
+                var it = obj.iterator();
+                while (it.next()) |e| {
+                    if (!(try asBool(e.value_ptr.*))) continue;
+                    const key = e.key_ptr.*;
+                    const after = self.model.handleStamp(key) orelse {
+                        std.debug.print(
+                            "{s} step {d}: handle_stable[{s}] - handle missing after op\n",
+                            .{ Model.FLAVOR, self.step, key },
+                        );
+                        return error.HandleMissing;
+                    };
+                    const before = self.stamps_before.get(key) orelse return error.NoHandleBefore;
+                    if (after != before) {
+                        std.debug.print(
+                            "{s} step {d}: handle_stable[{s}] violated - entry identity " ++
+                                "changed across an atomic move ({d} -> {d})\n",
+                            .{ Model.FLAVOR, self.step, key, before, after },
+                        );
+                        return error.HandleNotStable;
+                    }
+                }
+            }
+
+            fn checkOrder(self: StepCtx, ord: json.Value) !void {
+                const want = switch (ord) {
+                    .array => |a| a,
+                    else => return error.ExpectedArray,
+                };
+                const got = self.model.keys();
+                if (want.items.len != got.len) {
+                    std.debug.print(
+                        "{s} step {d}: order length {d} != {d}\n",
+                        .{ Model.FLAVOR, self.step, got.len, want.items.len },
+                    );
+                    return error.OrderMismatch;
+                }
+                for (want.items, got) |w, g| {
+                    try testing.expectEqualStrings(try asStr(w), g);
+                }
+            }
+
+            fn checkMembership(self: StepCtx, mem: json.Value) !void {
+                const want = switch (mem) {
+                    .array => |a| a,
+                    else => return error.ExpectedArray,
+                };
+                try testing.expectEqual(want.items.len, self.model.keys().len);
+                for (want.items) |w| {
+                    try testing.expect(self.model.contains(try asStr(w)));
+                }
+            }
+
+            fn checkValues(self: StepCtx, vals: json.Value) !void {
+                const obj = switch (vals) {
+                    .object => |o| o,
+                    else => return error.ExpectedObject,
+                };
+                var it = obj.iterator();
+                while (it.next()) |e| {
+                    const want = try asI64(e.value_ptr.*);
+                    const got = self.model.value(e.key_ptr.*) orelse return error.MissingKey;
+                    try testing.expectEqual(want, got);
+                }
+            }
+        };
+
         fn run(fixture_name: []const u8) !void {
             if (!fixturesPresent()) {
                 std.debug.print(
@@ -346,7 +442,7 @@ fn Engine(comptime Model: type) type {
                 const op = try required(step, "op");
                 var expected = cj.AssertionKeys.init(
                     "collections-family expected", try required(step, "expected"));
-                defer expected.finish() catch @panic("unconsumed conformance assertion key");
+                defer expected.finish() catch @panic("conformance assertion-key check failed");
 
                 // Sample every reader class before the op.
                 const mv_before = model.membershipVersion();
@@ -369,90 +465,29 @@ fn Engine(comptime Model: type) type {
 
                 try applyOp(Model, &model, op);
 
+                // Every arm below routes the fixture's own value into the
+                // comparison, so the tracker can tell a checked key from a read
+                // one (#lzconsumednotasserted).
+                const step_ctx = StepCtx{
+                    .model = &model,
+                    .step = i,
+                    .stamps_before = &stamps_before,
+                    .mv_before = mv_before,
+                    .ov_before = ov_before,
+                    .vv_before = &vv_before,
+                    .values_before = &values_before,
+                };
+
                 // -- invalidation (reader-class independence) ------------
-                const inv = expected.field("invalidates") orelse return error.MissingInvalidates;
-                try assertInvalidation(
-                    Model,
-                    &model,
-                    inv,
-                    i,
-                    mv_before,
-                    ov_before,
-                    &vv_before,
-                    &values_before,
-                );
+                try expected.assertKeyWith("invalidates", step_ctx, StepCtx.checkInvalidates);
 
                 // -- handle stability ------------------------------------
-                if (expected.field("handle_stable")) |hs| {
-                    switch (hs) {
-                        .object => |o| {
-                            var it = o.iterator();
-                            while (it.next()) |e| {
-                                if (!(try asBool(e.value_ptr.*))) continue;
-                                const key = e.key_ptr.*;
-                                const after = model.handleStamp(key) orelse {
-                                    std.debug.print(
-                                        "{s} step {d}: handle_stable[{s}] - handle missing after op\n",
-                                        .{ Model.FLAVOR, i, key },
-                                    );
-                                    return error.HandleMissing;
-                                };
-                                const before = stamps_before.get(key) orelse return error.NoHandleBefore;
-                                if (after != before) {
-                                    std.debug.print(
-                                        "{s} step {d}: handle_stable[{s}] violated - entry identity " ++
-                                            "changed across an atomic move ({d} -> {d})\n",
-                                        .{ Model.FLAVOR, i, key, before, after },
-                                    );
-                                    return error.HandleNotStable;
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
+                _ = try expected.assertKeyWithOpt("handle_stable", step_ctx, StepCtx.checkHandleStable);
 
                 // -- resulting state -------------------------------------
-                if (expected.field("order")) |ord| {
-                    const want = switch (ord) {
-                        .array => |a| a,
-                        else => return error.ExpectedArray,
-                    };
-                    const got = model.keys();
-                    if (want.items.len != got.len) {
-                        std.debug.print(
-                            "{s} step {d}: order length {d} != {d}\n",
-                            .{ Model.FLAVOR, i, got.len, want.items.len },
-                        );
-                        return error.OrderMismatch;
-                    }
-                    for (want.items, got) |w, g| {
-                        try testing.expectEqualStrings(try asStr(w), g);
-                    }
-                }
-                if (expected.field("membership")) |mem| {
-                    const want = switch (mem) {
-                        .array => |a| a,
-                        else => return error.ExpectedArray,
-                    };
-                    try testing.expectEqual(want.items.len, model.keys().len);
-                    for (want.items) |w| {
-                        try testing.expect(model.contains(try asStr(w)));
-                    }
-                }
-                if (expected.field("values")) |vals| {
-                    switch (vals) {
-                        .object => |o| {
-                            var it = o.iterator();
-                            while (it.next()) |e| {
-                                const want = try asI64(e.value_ptr.*);
-                                const got = model.value(e.key_ptr.*) orelse return error.MissingKey;
-                                try testing.expectEqual(want, got);
-                            }
-                        },
-                        else => {},
-                    }
-                }
+                _ = try expected.assertKeyWithOpt("order", step_ctx, StepCtx.checkOrder);
+                _ = try expected.assertKeyWithOpt("membership", step_ctx, StepCtx.checkMembership);
+                _ = try expected.assertKeyWithOpt("values", step_ctx, StepCtx.checkValues);
             }
         }
     };

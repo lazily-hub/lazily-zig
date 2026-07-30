@@ -439,11 +439,17 @@ test "collections conformance: semtree_incremental.json" {
         const expect_after = try cj.required(scenario, "expect_after");
         try expectDerived(&sem, expect_after, si, "after");
 
-        if (try cj.boolOr(expect_after, "sibling_a_cached", false)) {
-            if (sem.recomputeCount("a") != sibling_before) {
+        // Both booleans are asserted in BOTH directions. `sibling_a_cached`
+        // used to be a GATE — `if (want) { check }` — so flipping it to false
+        // in the corpus deleted the check instead of demanding the opposite
+        // fact (#lzconsumednotasserted).
+        if (cj.field(expect_after, "sibling_a_cached")) |flag| {
+            const cached = sem.recomputeCount("a") == sibling_before;
+            if (cached != try cj.asBool(flag)) {
                 std.debug.print(
-                    "scenario {d}: sibling subtree `a` was recomputed by an edit in a different subtree\n",
-                    .{si},
+                    "scenario {d}: sibling subtree `a` cached={} want {} " ++
+                        "(an edit in a different subtree must not recompute it)\n",
+                    .{ si, cached, try cj.asBool(flag) },
                 );
                 return error.SiblingSubtreeRecomputed;
             }

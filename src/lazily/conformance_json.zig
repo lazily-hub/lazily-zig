@@ -220,18 +220,39 @@ test "conformance_json: an absent corpus loads as null rather than failing" {
 /// the key. `finish()` then fails, naming the fixture and the offending key,
 /// when the block carried one the runner never asked for.
 ///
-/// No allocation: the consumed set is a bounded inline array, so a replay can
-/// build one per step without touching an allocator.
+/// Reading is not asserting — `#lzconsumednotasserted`. A runner can read a key
+/// (marking it consumed) and then drop it on the floor: a named `continue` in a
+/// consuming loop, a value bound and never compared, or an arm that gates on the
+/// fixture value but asserts against a hardcoded literal. All three satisfy the
+/// consumed set while proving nothing, so the fixture could change and the
+/// runner would stay green.
+///
+/// So `asserted` tracks the narrower fact: the key's own fixture value reached a
+/// comparison. Only `assertKey` / `assertKeyWith` can put a key there, which is
+/// why an arm comparing against a literal never marks it. `excuseKey` is the
+/// declared fallback for a key with nothing to compare here, and it is checked
+/// in both directions — excusing a key the same run also asserts is a failure,
+/// because that excuse has gone stale and is hiding nothing.
+///
+/// No allocation: the sets are bounded inline arrays, so a replay can build one
+/// per step without touching an allocator.
 pub const AssertionKeys = struct {
     pub const MAX_KEYS = 64;
 
-    /// Prose keys that carry no assertion and are documentation only.
+    /// Prose keys that carry no assertion and are documentation only. Exempt
+    /// from all three checks: unconsumed, read-but-not-asserted, stale excuse.
     pub const NARRATIVE = [_][]const u8{ "note", "notes", "comment", "description", "why" };
+
+    const Excuse = struct { name: []const u8, reason: []const u8 };
 
     where: []const u8,
     object: Value,
     consumed: [MAX_KEYS][]const u8 = undefined,
     len: usize = 0,
+    asserted: [MAX_KEYS][]const u8 = undefined,
+    asserted_len: usize = 0,
+    excused: [MAX_KEYS]Excuse = undefined,
+    excused_len: usize = 0,
     /// Suppress the diagnostic print. Only for this module's own self-test,
     /// which asserts the failure and must not pollute the suite's stderr.
     quiet: bool = false,
@@ -249,6 +270,37 @@ pub const AssertionKeys = struct {
         if (self.len == MAX_KEYS) @panic("AssertionKeys.MAX_KEYS exceeded");
         self.consumed[self.len] = name;
         self.len += 1;
+    }
+
+    fn markAsserted(self: *AssertionKeys, name: []const u8) void {
+        self.mark(name);
+        for (self.asserted[0..self.asserted_len]) |seen| {
+            if (std.mem.eql(u8, seen, name)) return;
+        }
+        if (self.asserted_len == MAX_KEYS) @panic("AssertionKeys.MAX_KEYS exceeded");
+        self.asserted[self.asserted_len] = name;
+        self.asserted_len += 1;
+    }
+
+    fn isNarrative(name: []const u8) bool {
+        for (NARRATIVE) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
+        return false;
+    }
+
+    fn wasAsserted(self: *const AssertionKeys, name: []const u8) bool {
+        for (self.asserted[0..self.asserted_len]) |a| {
+            if (std.mem.eql(u8, a, name)) return true;
+        }
+        return false;
+    }
+
+    fn excuseFor(self: *const AssertionKeys, name: []const u8) ?[]const u8 {
+        for (self.excused[0..self.excused_len]) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.reason;
+        }
+        return null;
     }
 
     /// Consume `name`; null when the fixture does not carry it.
@@ -270,11 +322,163 @@ pub const AssertionKeys = struct {
         return self.field(name) != null;
     }
 
-    /// Declare keys consumed without reading them here. Only for keys a
-    /// DIFFERENT code path in the same replay evaluates — never to silence a
-    /// key nothing evaluates, which is the allowlist this exists to replace.
-    pub fn consume(self: *AssertionKeys, names: []const []const u8) void {
-        for (names) |name| self.mark(name);
+    /// Read `name`, mark it ASSERTED, and compare the fixture's own value
+    /// against `actual`. This is the only path (with `assertKeyWith`) that can
+    /// satisfy the read-but-not-asserted check, which is the point: an arm that
+    /// compares against a hardcoded literal never reaches here, so editing the
+    /// fixture would change nothing and `finish()` says so.
+    ///
+    /// `actual` is compared by its own Zig type — bool, any integer, any float,
+    /// string, enum (by tag name), `Value` (structurally), or an optional of
+    /// any of those against a fixture `null`.
+    pub fn assertKey(self: *AssertionKeys, name: []const u8, actual: anytype) !void {
+        const expected = try self.required(name);
+        self.markAsserted(name);
+        try self.compare(name, expected, actual);
+    }
+
+    /// As `assertKey`, but only when the fixture carries `name`. The key is
+    /// consumed either way — an optional assertion is still a declaration that
+    /// the runner knows about the key — and marked asserted only when the
+    /// fixture's value actually reached the comparison. Reports whether it did.
+    pub fn assertKeyOpt(self: *AssertionKeys, name: []const u8, actual: anytype) !bool {
+        const expected = self.field(name) orelse return false;
+        self.markAsserted(name);
+        try self.compare(name, expected, actual);
+        return true;
+    }
+
+    /// Read `name`, mark it ASSERTED, and hand the fixture's value to the
+    /// caller's own check. For comparisons that are not an equality — a
+    /// tolerance, a set containment, a per-entry sweep of an object. What
+    /// matters is that the fixture's value reaches the comparison, not that the
+    /// comparison is `==`.
+    pub fn assertKeyWith(
+        self: *AssertionKeys,
+        name: []const u8,
+        context: anytype,
+        comptime check: fn (@TypeOf(context), Value) anyerror!void,
+    ) !void {
+        const expected = try self.required(name);
+        self.markAsserted(name);
+        try check(context, expected);
+    }
+
+    /// As `assertKeyWith`, but a no-op when the fixture omits `name`. Reports
+    /// whether the check ran.
+    pub fn assertKeyWithOpt(
+        self: *AssertionKeys,
+        name: []const u8,
+        context: anytype,
+        comptime check: fn (@TypeOf(context), Value) anyerror!void,
+    ) !bool {
+        const expected = self.field(name) orelse return false;
+        self.markAsserted(name);
+        try check(context, expected);
+        return true;
+    }
+
+    /// Declare that `name` cannot be asserted at this call site, and say why.
+    /// The fallback when there is genuinely nothing to compare — the fact is
+    /// proven elsewhere, or the field is a discriminator selecting a code path
+    /// rather than a value to check. Prefer converting the skip into a real
+    /// assertion; an excuse is a promise the reason text has to keep.
+    ///
+    /// Checked in BOTH directions: `finish()` fails when the same run also
+    /// asserts an excused key, because that excuse is stale and hides nothing.
+    pub fn excuseKey(self: *AssertionKeys, name: []const u8, reason: []const u8) !void {
+        if (reason.len == 0) return error.EmptyExcuseReason;
+        self.mark(name);
+        for (self.excused[0..self.excused_len]) |e| {
+            if (std.mem.eql(u8, e.name, name)) return;
+        }
+        if (self.excused_len == MAX_KEYS) @panic("AssertionKeys.MAX_KEYS exceeded");
+        self.excused[self.excused_len] = .{ .name = name, .reason = reason };
+        self.excused_len += 1;
+    }
+
+    fn mismatch(
+        self: *const AssertionKeys,
+        name: []const u8,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) error{AssertionValueMismatch} {
+        if (!self.quiet) {
+            std.debug.print("{s}: assertion key '{s}' ", .{ self.where, name });
+            std.debug.print(fmt ++ " (#lzconsumednotasserted)\n", args);
+        }
+        return error.AssertionValueMismatch;
+    }
+
+    fn compare(self: *AssertionKeys, name: []const u8, expected: Value, actual: anytype) !void {
+        const T = @TypeOf(actual);
+        if (T == Value) return expectJsonEql(expected, actual);
+        switch (@typeInfo(T)) {
+            .optional => {
+                if (actual) |inner| {
+                    if (expected == .null) {
+                        return self.mismatch(name, "want null, got a value", .{});
+                    }
+                    return self.compare(name, expected, inner);
+                }
+                if (expected != .null) {
+                    return self.mismatch(name, "want a value, got null", .{});
+                }
+            },
+            .null => {
+                if (expected != .null) {
+                    return self.mismatch(name, "want a value, got null", .{});
+                }
+            },
+            .bool => {
+                const want = try asBool(expected);
+                if (want != actual) {
+                    return self.mismatch(name, "want {}, got {}", .{ want, actual });
+                }
+            },
+            .comptime_int => return self.compare(name, expected, @as(i64, actual)),
+            .comptime_float => return self.compare(name, expected, @as(f64, actual)),
+            .int => |int| {
+                if (int.signedness == .unsigned) {
+                    const want = try asU64(expected);
+                    const got: u64 = @intCast(actual);
+                    if (want != got) {
+                        return self.mismatch(name, "want {d}, got {d}", .{ want, got });
+                    }
+                } else {
+                    const want = try asI64(expected);
+                    const got: i64 = @intCast(actual);
+                    if (want != got) {
+                        return self.mismatch(name, "want {d}, got {d}", .{ want, got });
+                    }
+                }
+            },
+            .float => {
+                const want = try asF64(expected);
+                const got: f64 = @floatCast(actual);
+                if (want != got) {
+                    return self.mismatch(name, "want {d}, got {d}", .{ want, got });
+                }
+            },
+            .@"enum", .enum_literal => {
+                const want = try asStr(expected);
+                const got = @tagName(actual);
+                if (!std.mem.eql(u8, want, got)) {
+                    return self.mismatch(name, "want '{s}', got '{s}'", .{ want, got });
+                }
+            },
+            else => {
+                if (comptime isStringLike(T)) {
+                    const want = try asStr(expected);
+                    const got: []const u8 = actual;
+                    if (!std.mem.eql(u8, want, got)) {
+                        return self.mismatch(name, "want '{s}', got '{s}'", .{ want, got });
+                    }
+                } else {
+                    @compileError("AssertionKeys.assertKey: unsupported actual type " ++ @typeName(T));
+                }
+            },
+        }
     }
 
     pub fn arrayOr(self: *AssertionKeys, name: []const u8) ![]const Value {
@@ -295,10 +499,27 @@ pub const AssertionKeys = struct {
         };
     }
 
-    /// Fail when the fixture carried an assertion key this runner never asked
-    /// for. Names the key and the fixture, because "some assertion went unread"
-    /// is not actionable.
+    /// Three failure modes, all naming the fixture and the key because "some
+    /// assertion went unread" is not actionable:
+    ///
+    /// 1. a key the runner never asked for (`#lzassertunknownkeys`);
+    /// 2. a key the runner READ but never asserted or excused
+    ///    (`#lzconsumednotasserted`);
+    /// 3. an excuse for a key the same run also asserted — stale, hiding
+    ///    nothing (`#lzconsumednotasserted`).
     pub fn finish(self: *const AssertionKeys) !void {
+        for (self.excused[0..self.excused_len]) |e| {
+            if (!self.wasAsserted(e.name)) continue;
+            if (self.quiet) return error.StaleAssertionExcuse;
+            std.debug.print(
+                "{s}: assertion key '{s}' is excused (\"{s}\") but this same run asserts " ++
+                    "it. The excuse is stale and now hides nothing — drop the excuseKey " ++
+                    "call (#lzconsumednotasserted)\n",
+                .{ self.where, e.name, e.reason },
+            );
+            return error.StaleAssertionExcuse;
+        }
+
         const obj = switch (self.object) {
             .object => |o| o,
             else => return,
@@ -306,6 +527,8 @@ pub const AssertionKeys = struct {
         var it = obj.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
+            if (isNarrative(name)) continue;
+
             var seen = false;
             for (self.consumed[0..self.len]) |c| {
                 if (std.mem.eql(u8, c, name)) {
@@ -324,9 +547,56 @@ pub const AssertionKeys = struct {
                 );
                 return error.UnconsumedAssertionKey;
             }
+
+            if (self.wasAsserted(name)) continue;
+            if (self.excuseFor(name) != null) continue;
+
+            if (self.quiet) return error.AssertionKeyReadButNotAsserted;
+            std.debug.print(
+                "{s}: assertion key '{s}' was READ but its value never reached a " ++
+                    "comparison. Reading a key marks it consumed and proves nothing — the " ++
+                    "fixture could change and this runner would stay green. Assert it with " ++
+                    "assertKey/assertKeyWith, or declare excuseKey(\"{s}\", <reason>) " ++
+                    "(#lzconsumednotasserted)\n",
+                .{ self.where, name, name },
+            );
+            return error.AssertionKeyReadButNotAsserted;
         }
     }
 };
+
+/// `[]const u8`, `[]u8`, and string literals (`*const [N:0]u8`).
+fn isStringLike(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| switch (p.size) {
+            .slice => p.child == u8,
+            .one => switch (@typeInfo(p.child)) {
+                .array => |a| a.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Assert `expected.invalidates[reader]` against an observed version bump.
+///
+/// The per-reader invalidation flag is nested one level down, so `reader` picks
+/// the sub-key rather than being a value to compare — but the flag itself is a
+/// real fact about the library and goes through the tracker as an ASSERTION,
+/// not a bare read (`#lzconsumednotasserted`).
+pub fn assertInvalidates(
+    keys: *AssertionKeys,
+    comptime reader: []const u8,
+    changed: bool,
+) !void {
+    try keys.assertKeyWith("invalidates", changed, struct {
+        fn check(observed: bool, inv: Value) !void {
+            try std.testing.expectEqual(try asBool(try required(inv, reader)), observed);
+        }
+    }.check);
+}
 
 /// Build a consumption-tracking view over `value.name` (the fixture's assertion
 /// block), or null when the fixture carries no such block.
@@ -335,18 +605,89 @@ pub fn assertionKeys(where: []const u8, value: Value, name: []const u8) ?Asserti
     return AssertionKeys.init(where, block);
 }
 
-test "conformance_json: an unconsumed assertion key fails, a consumed one does not" {
+test "conformance_json: an unconsumed assertion key fails, an asserted one does not" {
     const allocator = std.testing.allocator;
     var parsed = try json.parseFromSlice(Value, allocator, "{\"a\":1,\"note\":\"x\",\"b\":2}", .{});
     defer parsed.deinit();
 
     var all = AssertionKeys.init("fixture", parsed.value);
-    _ = all.field("a");
-    _ = all.field("b");
+    try all.assertKey("a", @as(i64, 1));
+    try all.assertKey("b", @as(i64, 2));
     try all.finish();
 
     var partial = AssertionKeys.init("fixture", parsed.value);
     partial.quiet = true;
-    _ = partial.field("a");
+    try partial.assertKey("a", @as(i64, 1));
     try std.testing.expectError(error.UnconsumedAssertionKey, partial.finish());
+}
+
+test "conformance_json: reading a key without asserting it fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, "{\"a\":1,\"b\":2}", .{});
+    defer parsed.deinit();
+
+    // Both keys READ — the `#lzassertunknownkeys` consumed set is satisfied —
+    // but only one of them reached a comparison.
+    var keys = AssertionKeys.init("fixture", parsed.value);
+    keys.quiet = true;
+    try keys.assertKey("a", @as(i64, 1));
+    _ = keys.field("b");
+    try std.testing.expectError(error.AssertionKeyReadButNotAsserted, keys.finish());
+
+    // An excuse satisfies it; the reason must be non-empty.
+    var excused = AssertionKeys.init("fixture", parsed.value);
+    try excused.assertKey("a", @as(i64, 1));
+    try excused.excuseKey("b", "asserted by the sibling replay in this module");
+    try excused.finish();
+
+    var empty = AssertionKeys.init("fixture", parsed.value);
+    try std.testing.expectError(error.EmptyExcuseReason, empty.excuseKey("b", ""));
+}
+
+test "conformance_json: an excuse for a key the same run asserts is stale" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, "{\"a\":1}", .{});
+    defer parsed.deinit();
+
+    var keys = AssertionKeys.init("fixture", parsed.value);
+    keys.quiet = true;
+    try keys.excuseKey("a", "proven elsewhere");
+    try keys.assertKey("a", @as(i64, 1));
+    try std.testing.expectError(error.StaleAssertionExcuse, keys.finish());
+}
+
+test "conformance_json: assertKey compares against the fixture's own value" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"s\":\"x\",\"b\":true,\"i\":-3,\"u\":7,\"f\":1.5,\"n\":null,\"o\":{\"k\":1}}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var keys = AssertionKeys.init("fixture", parsed.value);
+    keys.quiet = true;
+    try keys.assertKey("s", "x");
+    try keys.assertKey("b", true);
+    try keys.assertKey("i", @as(i64, -3));
+    try keys.assertKey("u", @as(usize, 7));
+    try keys.assertKey("f", @as(f64, 1.5));
+    try keys.assertKey("n", @as(?[]const u8, null));
+    try keys.assertKeyWith("o", @as(i64, 1), struct {
+        fn check(want_k: i64, v: Value) !void {
+            try std.testing.expectEqual(want_k, try asI64(try required(v, "k")));
+        }
+    }.check);
+    try keys.finish();
+
+    var wrong = AssertionKeys.init("fixture", parsed.value);
+    wrong.quiet = true;
+    try std.testing.expectError(error.AssertionValueMismatch, wrong.assertKey("s", "y"));
+    try std.testing.expectError(error.AssertionValueMismatch, wrong.assertKey("b", false));
+    try std.testing.expectError(error.AssertionValueMismatch, wrong.assertKey("u", @as(usize, 8)));
+    try std.testing.expectError(
+        error.AssertionValueMismatch,
+        wrong.assertKey("n", @as(?[]const u8, "x")),
+    );
 }

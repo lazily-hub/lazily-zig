@@ -83,6 +83,22 @@ fn expectConverged(rt: *const crdt_plane.CrdtPlaneRuntime, expected: []const Val
     }
 }
 
+/// The single conflict resolution this binding's CRDT plane implements. The
+/// fixture's `resolution` is asserted against it: a corpus that grew a second
+/// model would fail here rather than be replayed against the wrong engine.
+const RESOLUTION_IMPLEMENTED = "max_stamp";
+
+/// `assertKeyWith` context for `converged` — the failure message names the
+/// scenario, so the check needs both the runtime and the name.
+const ConvergeCheck = struct {
+    rt: *crdt_plane.CrdtPlaneRuntime,
+    name: []const u8,
+
+    fn check(self: ConvergeCheck, want: Value) !void {
+        try expectConverged(self.rt, try cj.asArray(want), self.name);
+    }
+};
+
 test "distributed conformance: anti_entropy_converge.json" {
     const allocator = testing.allocator;
     var parsed = (try cj.load("distributed/anti_entropy_converge.json")) orelse {
@@ -105,7 +121,7 @@ test "distributed conformance: anti_entropy_converge.json" {
         // This fixture pins the LWW-at-plane model: the greatest WireStamp
         // wins. A corpus that grew a second resolution would silently be
         // replayed against the wrong engine here.
-        try testing.expectEqualStrings("max_stamp", try cj.asStr(try expect.required("resolution")));
+        try expect.assertKey("resolution", RESOLUTION_IMPLEMENTED);
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -116,26 +132,28 @@ test "distributed conformance: anti_entropy_converge.json" {
         defer rt.deinit();
 
         const applied = try rt.ingest(ipc.CrdtSync.init(&.{}, ops), 0);
-        try testing.expectEqual(try cj.asUsize(try expect.required("applied_count")), applied);
-        try expectConverged(&rt, try expect.arrayOr("converged"), name);
+        try expect.assertKey("applied_count", applied);
+        try expect.assertKeyWith(
+            "converged",
+            ConvergeCheck{ .rt = &rt, .name = name },
+            ConvergeCheck.check,
+        );
         ops_replayed += ops.len;
-        // `redeliver_applied_count` and `order_independent` are only read on the
-        // scenarios that opt into those runs, so declare them here: the guard
-        // must refuse a key nothing evaluates, not a key this scenario has no
-        // run to evaluate it against.
-        if (!try cj.boolOr(scenario, "redeliver", false))
-            expect.consume(&.{"redeliver_applied_count"});
-        if (!try cj.boolOr(scenario, "reverse_order_equivalent", false))
-            expect.consume(&.{"order_independent"});
 
+        // `redeliver_applied_count` and `order_independent` are only ASSERTED on
+        // the scenarios that opt into those runs. On the others there is no run
+        // to compare against, so say so rather than reading the key and
+        // dropping it (#lzconsumednotasserted).
         if (try cj.boolOr(scenario, "redeliver", false)) {
             const again = try rt.ingest(ipc.CrdtSync.init(&.{}, ops), 0);
-            try testing.expectEqual(
-                try cj.asUsize(try expect.required("redeliver_applied_count")),
-                again,
-            );
+            try expect.assertKey("redeliver_applied_count", again);
             // Idempotence is about the state too, not just the counter.
             try expectConverged(&rt, try expect.arrayOr("converged"), name);
+        } else {
+            try expect.excuseKey(
+                "redeliver_applied_count",
+                "this scenario does not set `redeliver`, so there is no second ingest to count",
+            );
         }
 
         if (try cj.boolOr(scenario, "reverse_order_equivalent", false)) {
@@ -145,9 +163,17 @@ test "distributed conformance: anti_entropy_converge.json" {
             var rev_rt = crdt_plane.CrdtPlaneRuntime.init(allocator, 0);
             defer rev_rt.deinit();
             const rev_applied = try rev_rt.ingest(ipc.CrdtSync.init(&.{}, reversed), 0);
-            try testing.expectEqual(applied, rev_applied);
             try expectConverged(&rev_rt, try expect.arrayOr("converged"), name);
-            try testing.expect(try expect.boolOr("order_independent", true));
+            // OBSERVED order independence, not the fixture's own claim handed
+            // back to itself: the reversed replay has to land the same op count
+            // and the same converged state.
+            try expect.assertKey("order_independent", rev_applied == applied);
+        } else {
+            try expect.excuseKey(
+                "order_independent",
+                "this scenario does not set `reverse_order_equivalent`, so no reversed " ++
+                    "replay runs to observe independence",
+            );
         }
         try expect.finish();
     }

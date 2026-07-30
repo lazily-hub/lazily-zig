@@ -468,12 +468,6 @@ fn jsonAsU64(value: json.Value) !u64 {
         else => error.ExpectedUnsignedInteger,
     };
 }
-fn jsonAsBool(value: json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        else => error.ExpectedBool,
-    };
-}
 fn jsonAsString(value: json.Value) ![]const u8 {
     return switch (value) {
         .string => |s| s,
@@ -511,13 +505,6 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
-}
-
 /// Assert the step's `returns` (string emit or null) and the `output` /
 /// `invalidates.output` expectations against an operator emit + projection.
 fn expectStep(step: json.Value, emitted: ?Value, out: ?Value, out_changed: bool) !void {
@@ -529,20 +516,20 @@ fn expectStep(step: json.Value, emitted: ?Value, out: ?Value, out_changed: bool)
     } else {
         try std.testing.expectEqual(@as(?Value, null), emitted);
     }
-    // expected.output
     var exp = cj.AssertionKeys.init(
-            "rateshape expected", try jsonFieldRequired(step, "expected"));
-    exp.consume(&.{"invalidates"});
-    defer exp.finish() catch @panic("unconsumed conformance assertion key");
-    const want_out = try optString(try exp.required("output"));
-    if (want_out) |wo| {
-        try std.testing.expect(out != null);
-        try std.testing.expectEqualStrings(wo, out.?);
-    } else {
-        try std.testing.expectEqual(@as(?Value, null), out);
-    }
-    // expected.invalidates.output
-    try std.testing.expectEqual(try invalidates(step, "output"), out_changed);
+        "rateshape expected",
+        try jsonFieldRequired(step, "expected"),
+    );
+    defer exp.finish() catch @panic("conformance assertion-key check failed");
+    try exp.assertKey("output", out);
+    try exp.assertKeyWith("invalidates", out_changed, struct {
+        fn check(changed: bool, inv: json.Value) !void {
+            try std.testing.expectEqual(
+                try cj.asBool(try cj.required(inv, "output")),
+                changed,
+            );
+        }
+    }.check);
 }
 
 test "rateshape conformance: debounce" {

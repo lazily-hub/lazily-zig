@@ -437,47 +437,68 @@ fn expectEqualOptStr(where: Str, want: ?Str, got: ?Str) !void {
     try testing.expectEqualStrings(want.?, got.?);
 }
 
+/// `assertKeyWith` contexts for the QueueCell state block. Generic over the
+/// flavor's model type, which is comptime here.
+fn QueueStateCtx(comptime M: type) type {
+    return struct {
+        model: M,
+        where: Str,
+
+        const Self = @This();
+
+        fn elements(self: Self, node: Value) !void {
+            const want = try cj.asArray(node);
+            const got = self.model.elements();
+            try testing.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try testing.expectEqualStrings(try cj.asStr(w), g);
+        }
+
+        fn head(self: Self, node: Value) !void {
+            const want: ?Str = switch (node) {
+                .null => null,
+                else => try cj.asStr(node),
+            };
+            try expectEqualOptStr(self.where, want, try self.model.head());
+        }
+    };
+}
+
 fn assertQueueState(model: anytype, expected: *cj.AssertionKeys, where: Str) !void {
     errdefer std.debug.print("queue state mismatch at {s}\n", .{where});
 
-    if (expected.field("elements")) |node| {
-        const want = try cj.asArray(node);
-        const got = model.elements();
-        try testing.expectEqual(want.len, got.len);
-        for (want, got) |w, g| try testing.expectEqualStrings(try cj.asStr(w), g);
-    }
-    if (expected.field("head")) |node| {
-        const want: ?Str = switch (node) {
-            .null => null,
-            else => try cj.asStr(node),
-        };
-        try expectEqualOptStr(where, want, try model.head());
-    }
-    if (expected.field("len")) |node| {
-        try testing.expectEqual(try cj.asUsize(node), try model.len());
-    }
-    if (expected.field("is_empty")) |node| {
-        try testing.expectEqual(try cj.asBool(node), try model.isEmpty());
-    }
-    if (expected.field("is_full")) |node| {
-        try testing.expectEqual(try cj.asBool(node), try model.isFull());
-    }
-    if (expected.field("closed")) |node| {
-        try testing.expectEqual(try cj.asBool(node), try model.isClosed());
-    }
+    const C = QueueStateCtx(@TypeOf(model));
+    const ctx = C{ .model = model, .where = where };
+    _ = try expected.assertKeyWithOpt("elements", ctx, C.elements);
+    _ = try expected.assertKeyWithOpt("head", ctx, C.head);
+    _ = try expected.assertKeyOpt("len", try model.len());
+    _ = try expected.assertKeyOpt("is_empty", try model.isEmpty());
+    _ = try expected.assertKeyOpt("is_full", try model.isFull());
+    _ = try expected.assertKeyOpt("closed", try model.isClosed());
 }
 
 /// Assert the per-reader-kind matrix in BOTH directions. Only kinds the fixture
 /// declares are asserted (an absent kind means "don't check"); the return value is
 /// the number of flags asserted, so a caller can prove the matrix was not silently
 /// absent.
+/// `assertKeyWith` context for the QueueCell invalidation matrix. The flag count
+/// comes back through `asserted`, since the check itself returns void.
+const QueueInvalidationCtx = struct {
+    before: QueueVersions,
+    after: QueueVersions,
+    where: Str,
+    asserted: *usize,
+
+    fn check(self: QueueInvalidationCtx, node: Value) !void {
+        self.asserted.* = try assertQueueInvalidation(self.before, self.after, node, self.where);
+    }
+};
+
 fn assertQueueInvalidation(
     before: QueueVersions,
     after: QueueVersions,
-    invalidates: ?Value,
+    node: Value,
     where: Str,
 ) !usize {
-    const node = invalidates orelse return 0;
     var asserted: usize = 0;
     inline for (.{ "head", "len", "is_empty", "is_full", "closed" }) |name| {
         if (cj.field(node, name)) |flag_node| {
@@ -537,7 +558,7 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
             "queue-family QueueCell expected",
             cj.field(step, "expected") orelse Value.null,
         );
-        defer expected.finish() catch @panic("unconsumed conformance assertion key");
+        defer expected.finish() catch @panic("conformance assertion-key check failed");
 
         var where_buf: [192]u8 = undefined;
         const where = try std.fmt.bufPrint(&where_buf, "{s}/{s} step {d} ({s})", .{
@@ -583,12 +604,14 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         }
 
         const after = model.versions();
-        counts.flags += try assertQueueInvalidation(
-            before,
-            after,
-            expected.field("invalidates"),
-            where,
-        );
+        var flags: usize = 0;
+        _ = try expected.assertKeyWithOpt("invalidates", QueueInvalidationCtx{
+            .before = before,
+            .after = after,
+            .where = where,
+            .asserted = &flags,
+        }, QueueInvalidationCtx.check);
+        counts.flags += flags;
         counts.steps += 1;
     }
     return counts;
@@ -881,83 +904,99 @@ fn collectSubscriberIds(
     }
 }
 
+/// `assertKeyWith` contexts for the TopicCell state block.
+fn TopicStateCtx(comptime M: type) type {
+    return struct {
+        model: M,
+        where: Str,
+
+        const Self = @This();
+
+        fn elements(self: Self, node: Value) !void {
+            const want = try cj.asArray(node);
+            const got = self.model.items();
+            try testing.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try testing.expectEqualStrings(try cj.asStr(w), g);
+        }
+
+        /// Subscriptions are asserted as a SET, not just per named id: a step
+        /// that must REMOVE an ephemeral subscription is only observable if a
+        /// surviving extra entry fails, so the count is part of the claim.
+        fn subscriptions(self: Self, node: Value) !void {
+            const object = switch (node) {
+                .object => |o| o,
+                else => return error.ExpectedObject,
+            };
+            var want_count: usize = 0;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                want_count += 1;
+                const got = self.model.subscription(entry.key_ptr.*) orelse {
+                    std.debug.print(
+                        "{s}: subscription {s} is absent\n",
+                        .{ self.where, entry.key_ptr.* },
+                    );
+                    return error.MissingSubscription;
+                };
+                try testing.expectEqual(
+                    try cj.asUsize(try cj.required(entry.value_ptr.*, "cursor")),
+                    got.cursor,
+                );
+                try testing.expectEqual(
+                    try parseDurability(
+                        try cj.asStr(try cj.required(entry.value_ptr.*, "durability")),
+                    ),
+                    got.durability,
+                );
+                try testing.expectEqual(
+                    try cj.asBool(try cj.required(entry.value_ptr.*, "connected")),
+                    got.connected,
+                );
+            }
+            try testing.expectEqual(want_count, self.model.subscriptionCount());
+        }
+
+        /// `reads` is the cursor's retained tail per subscriber. Asserted twice:
+        /// the whole suffix non-reactively, and its head THROUGH THE REACTIVE
+        /// READER — a shell that under-invalidated fails on the second even when
+        /// the first agrees.
+        fn reads(self: Self, node: Value) !void {
+            const object = switch (node) {
+                .object => |o| o,
+                else => return error.ExpectedObject,
+            };
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const want_stream = try cj.asArray(entry.value_ptr.*);
+                const got_stream = try self.model.readStream(entry.key_ptr.*);
+                try testing.expectEqual(want_stream.len, got_stream.len);
+                for (want_stream, got_stream) |want, got| {
+                    try testing.expectEqualStrings(try cj.asStr(want), got);
+                }
+                const want_head: ?Str = if (want_stream.len == 0)
+                    null
+                else
+                    try cj.asStr(want_stream[0]);
+                try expectEqualOptStr(self.where, want_head, try self.model.read(entry.key_ptr.*));
+            }
+        }
+    };
+}
+
 fn assertTopicState(model: anytype, expected: *cj.AssertionKeys, where: Str) !void {
     errdefer std.debug.print("topic state mismatch at {s}\n", .{where});
 
-    try testing.expectEqual(
-        try cj.asUsize(try expected.required("base_offset")),
-        model.baseOffset(),
-    );
+    const C = TopicStateCtx(@TypeOf(model));
+    const ctx = C{ .model = model, .where = where };
 
-    const want_elements = try expected.arrayOr("elements");
-    const got_elements = model.items();
-    try testing.expectEqual(want_elements.len, got_elements.len);
-    for (want_elements, got_elements) |want, got| {
-        try testing.expectEqualStrings(try cj.asStr(want), got);
+    try expected.assertKey("base_offset", model.baseOffset());
+    if (!try expected.assertKeyWithOpt("elements", ctx, C.elements)) {
+        try testing.expectEqual(@as(usize, 0), model.items().len);
     }
-
-    // Subscriptions are asserted as a set, not just per named id: a step that must
-    // REMOVE an ephemeral subscription is only observable if a surviving extra
-    // entry fails, so the count is part of the claim.
-    var want_count: usize = 0;
-    if (expected.field("subscriptions")) |node| {
-        switch (node) {
-            .object => |object| {
-                var it = object.iterator();
-                while (it.next()) |entry| {
-                    want_count += 1;
-                    const got = model.subscription(entry.key_ptr.*) orelse {
-                        std.debug.print(
-                            "{s}: subscription {s} is absent\n",
-                            .{ where, entry.key_ptr.* },
-                        );
-                        return error.MissingSubscription;
-                    };
-                    try testing.expectEqual(
-                        try cj.asUsize(try cj.required(entry.value_ptr.*, "cursor")),
-                        got.cursor,
-                    );
-                    try testing.expectEqual(
-                        try parseDurability(
-                            try cj.asStr(try cj.required(entry.value_ptr.*, "durability")),
-                        ),
-                        got.durability,
-                    );
-                    try testing.expectEqual(
-                        try cj.asBool(try cj.required(entry.value_ptr.*, "connected")),
-                        got.connected,
-                    );
-                }
-            },
-            else => {},
-        }
+    if (!try expected.assertKeyWithOpt("subscriptions", ctx, C.subscriptions)) {
+        try testing.expectEqual(@as(usize, 0), model.subscriptionCount());
     }
-    try testing.expectEqual(want_count, model.subscriptionCount());
-
-    // `reads` is the cursor's retained tail per subscriber. Asserted twice: the
-    // whole suffix non-reactively, and its head THROUGH THE REACTIVE READER — a
-    // shell that under-invalidated fails on the second even when the first agrees.
-    if (expected.field("reads")) |node| {
-        switch (node) {
-            .object => |object| {
-                var it = object.iterator();
-                while (it.next()) |entry| {
-                    const want_stream = try cj.asArray(entry.value_ptr.*);
-                    const got_stream = try model.readStream(entry.key_ptr.*);
-                    try testing.expectEqual(want_stream.len, got_stream.len);
-                    for (want_stream, got_stream) |want, got| {
-                        try testing.expectEqualStrings(try cj.asStr(want), got);
-                    }
-                    const want_head: ?Str = if (want_stream.len == 0)
-                        null
-                    else
-                        try cj.asStr(want_stream[0]);
-                    try expectEqualOptStr(where, want_head, try model.read(entry.key_ptr.*));
-                }
-            },
-            else => {},
-        }
-    }
+    _ = try expected.assertKeyWithOpt("reads", ctx, C.reads);
 }
 
 fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
@@ -1022,7 +1061,7 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
         const op_type = try cj.asStr(try cj.required(op, "type"));
         var expected = cj.AssertionKeys.init(
             "queue-family expected", try cj.required(step, "expected"));
-        defer expected.finish() catch @panic("unconsumed conformance assertion key");
+        defer expected.finish() catch @panic("conformance assertion-key check failed");
 
         var where_buf: [192]u8 = undefined;
         const where = try std.fmt.bufPrint(&where_buf, "{s}/{s} step {d} ({s})", .{
@@ -1087,40 +1126,54 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
         }
 
         // The reader-kind claim, both directions, per subscriber.
-        if (expected.field("invalidates")) |node| {
-            switch (node) {
-                .object => |object| {
-                    var it = object.iterator();
-                    while (it.next()) |entry| {
-                        const want_invalidated = try cj.asBool(entry.value_ptr.*);
-                        const id = entry.key_ptr.*;
-                        var slot: usize = 0;
-                        while (slot < ids.items.len and
-                            !std.mem.eql(u8, ids.items[slot], id)) : (slot += 1)
-                        {}
-                        if (slot == ids.items.len) return error.UnknownFixtureSubscriber;
-                        const after = model.readerVersion(id);
-                        const changed = if (after) |now|
-                            (before[slot] == null or before[slot].? != now)
-                        else
-                            // The subscription is gone. Its reader was disposed,
-                            // so every reader of it is invalid — a stronger
-                            // observation than a version bump, and the only one
-                            // available for a removed ephemeral.
-                            before[slot] != null;
-                        if (want_invalidated != changed) {
-                            std.debug.print(
-                                "{s}: subscriber {s} invalidates want={} got={}\n",
-                                .{ where, id, want_invalidated, changed },
-                            );
-                            return error.TestExpectedEqual;
-                        }
-                        counts.flags += 1;
+        const TopicInvCtx = struct {
+            model: @TypeOf(model),
+            ids: []const Str,
+            before: []const ?u64,
+            where: Str,
+            flags: *usize,
+
+            fn check(self: @This(), node: Value) !void {
+                const object = switch (node) {
+                    .object => |o| o,
+                    else => return error.ExpectedObject,
+                };
+                var it = object.iterator();
+                while (it.next()) |entry| {
+                    const want_invalidated = try cj.asBool(entry.value_ptr.*);
+                    const id = entry.key_ptr.*;
+                    var slot: usize = 0;
+                    while (slot < self.ids.len and
+                        !std.mem.eql(u8, self.ids[slot], id)) : (slot += 1)
+                    {}
+                    if (slot == self.ids.len) return error.UnknownFixtureSubscriber;
+                    const after = self.model.readerVersion(id);
+                    const changed = if (after) |now|
+                        (self.before[slot] == null or self.before[slot].? != now)
+                    else
+                        // The subscription is gone. Its reader was disposed, so
+                        // every reader of it is invalid — a stronger observation
+                        // than a version bump, and the only one available for a
+                        // removed ephemeral.
+                        self.before[slot] != null;
+                    if (want_invalidated != changed) {
+                        std.debug.print(
+                            "{s}: subscriber {s} invalidates want={} got={}\n",
+                            .{ self.where, id, want_invalidated, changed },
+                        );
+                        return error.TestExpectedEqual;
                     }
-                },
-                else => {},
+                    self.flags.* += 1;
+                }
             }
-        }
+        };
+        _ = try expected.assertKeyWithOpt("invalidates", TopicInvCtx{
+            .model = model,
+            .ids = ids.items,
+            .before = before,
+            .where = where,
+            .flags = &counts.flags,
+        }, TopicInvCtx.check);
         counts.steps += 1;
     }
     return counts;
@@ -1367,81 +1420,134 @@ const AsyncWorkQueueModel = struct {
 
 // --- the work-queue replay -------------------------------------------------
 
+/// `assertKeyWith` contexts for the WorkQueueCell state block.
+fn WorkQueueStateCtx(comptime M: type) type {
+    return struct {
+        model: M,
+        where: Str,
+
+        const Self = @This();
+
+        fn pending(self: Self, node: Value) !void {
+            const want_pending = try cj.asArray(node);
+            const got_pending = self.model.pendingItems();
+            try testing.expectEqual(want_pending.len, got_pending.len);
+            for (want_pending, got_pending) |want, got| {
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "item_id")), got.item_id);
+                try testing.expectEqualStrings(try cj.asStr(try cj.required(want, "value")), got.value);
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "attempts")), got.attempts);
+            }
+        }
+
+        /// In-flight deliveries are keyed by delivery id in a hash map here, so
+        /// the fixture's array order is not this binding's order. Match by
+        /// delivery id and assert the count, which pins the same set without
+        /// inventing an ordering the primitive does not promise.
+        fn inFlight(self: Self, node: Value) !void {
+            const want_in_flight = try cj.asArray(node);
+            const got_in_flight = try self.model.inFlightDeliveries(testing.allocator);
+            defer testing.allocator.free(got_in_flight);
+            try testing.expectEqual(want_in_flight.len, got_in_flight.len);
+            for (want_in_flight) |want| {
+                const delivery_id = try cj.asU64(try cj.required(want, "delivery_id"));
+                const found = for (got_in_flight) |got| {
+                    if (got.delivery_id == delivery_id) break got;
+                } else {
+                    std.debug.print(
+                        "{s}: delivery {d} is not in flight\n",
+                        .{ self.where, delivery_id },
+                    );
+                    return error.MissingDelivery;
+                };
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "item_id")), found.item_id);
+                try testing.expectEqualStrings(try cj.asStr(try cj.required(want, "value")), found.value);
+                try testing.expectEqualStrings(
+                    try cj.asStr(try cj.required(want, "worker")),
+                    found.worker,
+                );
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "attempt")), found.attempt);
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "deadline")), found.deadline);
+            }
+        }
+
+        fn deadLetters(self: Self, node: Value) !void {
+            const want_dead = try cj.asArray(node);
+            const got_dead = self.model.deadLetterItems();
+            try testing.expectEqual(want_dead.len, got_dead.len);
+            for (want_dead, got_dead) |want, got| {
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "item_id")), got.item_id);
+                try testing.expectEqualStrings(try cj.asStr(try cj.required(want, "value")), got.value);
+                try testing.expectEqual(try cj.asU64(try cj.required(want, "attempts")), got.attempts);
+                const want_reason = try cj.asStr(try cj.required(want, "reason"));
+                const got_reason = switch (got.reason) {
+                    .nack => "nack",
+                    .expired => "expired",
+                };
+                try testing.expectEqualStrings(want_reason, got_reason);
+            }
+        }
+
+        /// `reads` are the four reader kinds. Reading them here (not only their
+        /// version counters) is what makes the invalidation matrix a claim about
+        /// an observable value rather than about a counter that happens to move.
+        fn reads(self: Self, node: Value) !void {
+            try testing.expectEqual(
+                try cj.asUsize(try cj.required(node, "pending_len")),
+                try self.model.pendingLen(),
+            );
+            try testing.expectEqual(
+                try cj.asBool(try cj.required(node, "is_empty")),
+                try self.model.isEmpty(),
+            );
+            try testing.expectEqual(
+                try cj.asUsize(try cj.required(node, "in_flight_len")),
+                try self.model.inFlightLen(),
+            );
+            try testing.expectEqual(
+                try cj.asUsize(try cj.required(node, "dead_letter_len")),
+                try self.model.deadLetterLen(),
+            );
+        }
+    };
+}
+
 fn assertWorkQueueState(model: anytype, expected: *cj.AssertionKeys, where: Str) !void {
     errdefer std.debug.print("work-queue state mismatch at {s}\n", .{where});
 
-    const want_pending = try expected.arrayOr("pending");
-    const got_pending = model.pendingItems();
-    try testing.expectEqual(want_pending.len, got_pending.len);
-    for (want_pending, got_pending) |want, got| {
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "item_id")), got.item_id);
-        try testing.expectEqualStrings(try cj.asStr(try cj.required(want, "value")), got.value);
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "attempts")), got.attempts);
-    }
+    const C = WorkQueueStateCtx(@TypeOf(model));
+    const ctx = C{ .model = model, .where = where };
 
-    // In-flight deliveries are keyed by delivery id in a hash map here, so the
-    // fixture's array order is not this binding's order. Match by delivery id and
-    // assert the count, which pins the same set without inventing an ordering the
-    // primitive does not promise.
-    const want_in_flight = try expected.arrayOr("in_flight");
-    const got_in_flight = try model.inFlightDeliveries(testing.allocator);
-    defer testing.allocator.free(got_in_flight);
-    try testing.expectEqual(want_in_flight.len, got_in_flight.len);
-    for (want_in_flight) |want| {
-        const delivery_id = try cj.asU64(try cj.required(want, "delivery_id"));
-        const found = for (got_in_flight) |got| {
-            if (got.delivery_id == delivery_id) break got;
-        } else {
-            std.debug.print("{s}: delivery {d} is not in flight\n", .{ where, delivery_id });
-            return error.MissingDelivery;
-        };
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "item_id")), found.item_id);
-        try testing.expectEqualStrings(try cj.asStr(try cj.required(want, "value")), found.value);
-        try testing.expectEqualStrings(
-            try cj.asStr(try cj.required(want, "worker")),
-            found.worker,
-        );
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "attempt")), found.attempt);
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "deadline")), found.deadline);
+    if (!try expected.assertKeyWithOpt("pending", ctx, C.pending)) {
+        try testing.expectEqual(@as(usize, 0), model.pendingItems().len);
     }
-
-    const want_dead = try expected.arrayOr("dead_letters");
-    const got_dead = model.deadLetterItems();
-    try testing.expectEqual(want_dead.len, got_dead.len);
-    for (want_dead, got_dead) |want, got| {
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "item_id")), got.item_id);
-        try testing.expectEqualStrings(try cj.asStr(try cj.required(want, "value")), got.value);
-        try testing.expectEqual(try cj.asU64(try cj.required(want, "attempts")), got.attempts);
-        const want_reason = try cj.asStr(try cj.required(want, "reason"));
-        const got_reason = switch (got.reason) {
-            .nack => "nack",
-            .expired => "expired",
-        };
-        try testing.expectEqualStrings(want_reason, got_reason);
+    if (!try expected.assertKeyWithOpt("in_flight", ctx, C.inFlight)) {
+        const got = try model.inFlightDeliveries(testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqual(@as(usize, 0), got.len);
     }
-
-    // `reads` are the four reader kinds. Reading them here (not only their version
-    // counters) is what makes the invalidation matrix a claim about an observable
-    // value rather than about a counter that happens to move.
-    if (expected.field("reads")) |reads| {
-        try testing.expectEqual(
-            try cj.asUsize(try cj.required(reads, "pending_len")),
-            try model.pendingLen(),
-        );
-        try testing.expectEqual(
-            try cj.asBool(try cj.required(reads, "is_empty")),
-            try model.isEmpty(),
-        );
-        try testing.expectEqual(
-            try cj.asUsize(try cj.required(reads, "in_flight_len")),
-            try model.inFlightLen(),
-        );
-        try testing.expectEqual(
-            try cj.asUsize(try cj.required(reads, "dead_letter_len")),
-            try model.deadLetterLen(),
-        );
+    if (!try expected.assertKeyWithOpt("dead_letters", ctx, C.deadLetters)) {
+        try testing.expectEqual(@as(usize, 0), model.deadLetterItems().len);
     }
+    _ = try expected.assertKeyWithOpt("reads", ctx, C.reads);
 }
+
+/// `assertKeyWith` context for the WorkQueueCell invalidation matrix. The flag
+/// count comes back through `asserted`, since the check itself returns void.
+const WorkQueueInvalidationCtx = struct {
+    before: WorkQueueVersions,
+    after: WorkQueueVersions,
+    where: Str,
+    asserted: *usize,
+
+    fn check(self: WorkQueueInvalidationCtx, node: Value) !void {
+        self.asserted.* = try assertWorkQueueInvalidation(
+            self.before,
+            self.after,
+            node,
+            self.where,
+        );
+    }
+};
 
 fn assertWorkQueueInvalidation(
     before: WorkQueueVersions,
@@ -1504,7 +1610,7 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         const op_type = try cj.asStr(try cj.required(op, "type"));
         var expected = cj.AssertionKeys.init(
             "queue-family expected", try cj.required(step, "expected"));
-        defer expected.finish() catch @panic("unconsumed conformance assertion key");
+        defer expected.finish() catch @panic("conformance assertion-key check failed");
 
         var where_buf: [192]u8 = undefined;
         const where = try std.fmt.bufPrint(&where_buf, "{s}/{s} step {d} ({s})", .{
@@ -1594,12 +1700,14 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         }
 
         const after = model.versions();
-        counts.flags += try assertWorkQueueInvalidation(
-            before,
-            after,
-            try expected.required("invalidates"),
-            where,
-        );
+        var flags: usize = 0;
+        try expected.assertKeyWith("invalidates", WorkQueueInvalidationCtx{
+            .before = before,
+            .after = after,
+            .where = where,
+            .asserted = &flags,
+        }, WorkQueueInvalidationCtx.check);
+        counts.flags += flags;
         counts.steps += 1;
     }
     return counts;

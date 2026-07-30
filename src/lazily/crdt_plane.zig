@@ -652,8 +652,10 @@ test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
             count_true,
         );
 
+        // Both directions: a fixture that says `false` now demands the epoch
+        // did NOT move, instead of deleting the check (#lzconsumednotasserted).
         if (expect.get("target_epoch_bumped")) |eb| {
-            if (eb.bool) try std.testing.expect(target.membershipEpoch() != epoch_before);
+            try std.testing.expectEqual(eb.bool, target.membershipEpoch() != epoch_before);
         }
     }
 }

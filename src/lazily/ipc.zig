@@ -1185,13 +1185,108 @@ fn assertFixtureRoundTripFromFile(comptime fixture_name: []const u8) !ParsedMess
 
     try std.testing.expectEqualSlices(u8, wire_json, encoded);
 
+    // The fixture's own `assertions` block. It used to be replayed by nobody:
+    // each test below re-typed the same numbers as Zig literals, so upstream
+    // could move `epoch` or `op_count` in the corpus and every one of these
+    // stayed green (#lzconsumednotasserted).
+    if (objectGet(parsed_fixture.value, "assertions")) |block| {
+        var keys = cj.AssertionKeys.init(fixture_name ++ " assertions", block);
+        try assertDecodedClaims(&keys, parsed_message.message);
+        try keys.finish();
+    }
+
     return parsed_message;
+}
+
+/// Drive a fixture's `assertions` block against the decoded envelope. Every key
+/// the corpus carries for `Snapshot` / `Delta` is asserted here from the
+/// fixture's own value; an unrecognised key fails via `finish()`.
+fn assertDecodedClaims(keys: *cj.AssertionKeys, message: IpcMessage) !void {
+    switch (message) {
+        .Snapshot => |snapshot| {
+            try keys.assertKey("epoch", snapshot.epoch);
+            try keys.assertKey("node_count", snapshot.nodes.len);
+            try keys.assertKey("edge_count", snapshot.edges.len);
+            try keys.assertKey("root_count", snapshot.roots.len);
+            if (snapshot.nodes.len > 0) {
+                _ = try keys.assertKeyOpt("first_node_type_tag", snapshot.nodes[0].type_tag);
+                _ = try keys.assertKeyOpt(
+                    "first_node_state_kind",
+                    @tagName(std.meta.activeTag(snapshot.nodes[0].state)),
+                );
+                if (snapshot.nodes[0].state == .SharedBlob) {
+                    const blob = snapshot.nodes[0].state.SharedBlob;
+                    _ = try keys.assertKeyOpt("blob_offset", blob.offset);
+                    _ = try keys.assertKeyOpt("blob_len", blob.len);
+                    _ = try keys.assertKeyOpt("blob_epoch", blob.epoch);
+                }
+            }
+            var opaque_id: ?NodeId = null;
+            for (snapshot.nodes) |node| {
+                if (node.state == .Opaque) opaque_id = node.node;
+            }
+            _ = try keys.assertKeyOpt("has_opaque_node", opaque_id != null);
+            _ = try keys.assertKeyOpt("opaque_node_id", opaque_id);
+        },
+        .Delta => |delta| {
+            try keys.assertKey("base_epoch", delta.base_epoch);
+            try keys.assertKey("epoch", delta.epoch);
+            _ = try keys.assertKeyOpt("is_sequential", delta.isNextAfter(delta.base_epoch));
+            _ = try keys.assertKeyOpt("op_count", delta.ops.len);
+            if (delta.ops.len > 0) {
+                _ = try keys.assertKeyOpt(
+                    "first_op_kind",
+                    @tagName(std.meta.activeTag(delta.ops[0])),
+                );
+                if (delta.ops[0] == .SlotValue) {
+                    const payload = delta.ops[0].SlotValue.payload;
+                    _ = try keys.assertKeyOpt(
+                        "first_op_payload_kind",
+                        @tagName(std.meta.activeTag(payload)),
+                    );
+                    if (payload == .SharedBlob) {
+                        _ = try keys.assertKeyOpt(
+                            "first_op_payload_backend",
+                            @tagName(payload.SharedBlob.backend),
+                        );
+                    }
+                }
+            }
+            // Every DeltaOp variant present at least once — the claim the
+            // all-variants fixture exists to make. A plain bool-per-tag array
+            // rather than `std.EnumSet`, whose constructors moved on master.
+            // `@typeInfo(...).@"enum"` renamed `fields` to `field_names` on
+            // zig master while 0.15.2 / 0.16.0 still carry `fields`, and
+            // `std.meta.fields` is deprecated there — so detect the shape.
+            const tag_info = @typeInfo(std.meta.Tag(DeltaOp)).@"enum";
+            const variant_count = if (@hasField(@TypeOf(tag_info), "field_names"))
+                tag_info.field_names.len
+            else
+                tag_info.fields.len;
+            var seen: [variant_count]bool = @splat(false);
+            for (delta.ops) |op| seen[@intFromEnum(std.meta.activeTag(op))] = true;
+            var all_variants = true;
+            for (seen) |present| {
+                if (!present) all_variants = false;
+            }
+            _ = try keys.assertKeyOpt("has_all_op_variants", all_variants);
+            // `resync_after_epoch_10`: applied on top of epoch 10, this delta
+            // must demand a resync. The epoch is in the key name, so the value
+            // that reaches the comparison is the claim itself.
+            _ = try keys.assertKeyOpt(
+                "resync_after_epoch_10",
+                delta.applyStatus(10) == .resync_required,
+            );
+        },
+        else => {},
+    }
 }
 
 /// Reads through the runtime conformance manifest recorder
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const cj = @import("conformance_json.zig");
 
 test "lazily/ipc: snapshot_minimal fixture" {
     var parsed = try assertFixtureRoundTripFromFile("snapshot_minimal.json");

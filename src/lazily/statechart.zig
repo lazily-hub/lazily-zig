@@ -756,6 +756,17 @@ fn depthDesc(def: *ChartDef, a: Index, b: Index) bool {
 // lazily-rs/tests/statechart_conformance.rs.
 // ----------------------------------------------------------------------
 
+/// `assertKeyWith` context for `active` — the check needs both an allocator and
+/// the chart, and a struct is the closure Zig gives you.
+const ActiveCheck = struct {
+    allocator: std.mem.Allocator,
+    sc: *const StateChart,
+
+    fn check(self: ActiveCheck, expected: std.json.Value) !void {
+        try assertActive(self.allocator, self.sc, expected);
+    }
+};
+
 fn assertActive(allocator: std.mem.Allocator, sc: *const StateChart, expected: std.json.Value) !void {
     const leaves = try sc.activeLeaves(allocator);
     var want = emptyUnmanaged([]const u8);
@@ -813,7 +824,12 @@ fn runFixture(bytes: []const u8) !void {
         // arms below; a step key the corpus adds would otherwise be replayed and
         // silently skipped (#lzassertunknownkeys).
         var keys = cj.AssertionKeys.init("statechart step", step);
-        defer keys.finish() catch @panic("unconsumed conformance assertion key");
+        defer keys.finish() catch @panic("conformance assertion-key check failed");
+        // `event` and `guards` are the step's INPUT — they drive `send`, they
+        // are not facts about the chart to compare against. Declared rather
+        // than silently read (#lzconsumednotasserted).
+        try keys.excuseKey("event", "step input: the event name fed to send()");
+        try keys.excuseKey("guards", "step input: the guard valuation fed to send()");
         const event = (keys.field("event") orelse return error.FixtureStepMissingEvent).string;
         var guards = std.StringHashMap(bool).init(ta);
         if (keys.field("guards")) |gv| {
@@ -822,17 +838,23 @@ fn runFixture(bytes: []const u8) !void {
         }
 
         const accepted = sc.send(event, &guards);
-        try std.testing.expectEqual((keys.field("accepted") orelse return error.FixtureStepMissingAccepted).bool, accepted);
+        try keys.assertKey("accepted", accepted);
 
-        try assertActive(ta, sc, keys.field("active") orelse return error.FixtureStepMissingActive);
+        try keys.assertKeyWith("active", ActiveCheck{ .allocator = ta, .sc = sc }, ActiveCheck.check);
 
-        if (keys.field("matches")) |mv| {
-            var mit = mv.object.iterator();
-            while (mit.next()) |e| {
-                try std.testing.expectEqual(e.value_ptr.bool, sc.matches(e.key_ptr.*));
+        _ = try keys.assertKeyWithOpt("matches", sc, struct {
+            fn check(chart: *StateChart, mv: std.json.Value) !void {
+                var mit = mv.object.iterator();
+                while (mit.next()) |e| {
+                    try std.testing.expectEqual(e.value_ptr.bool, chart.matches(e.key_ptr.*));
+                }
             }
-        }
-        if (keys.field("actions")) |av| try assertActions(sc, av);
+        }.check);
+        _ = try keys.assertKeyWithOpt("actions", sc, struct {
+            fn check(chart: *StateChart, av: std.json.Value) !void {
+                try assertActions(chart, av);
+            }
+        }.check);
     }
 }
 

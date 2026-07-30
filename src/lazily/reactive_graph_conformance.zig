@@ -1493,8 +1493,19 @@ fn Engine(comptime Model: type) type {
                 if (std.mem.eql(u8, key, "note")) continue;
 
                 if (std.mem.eql(u8, key, "value")) {
-                    // An errored read has no value to compare.
-                    if (has_error_key) continue;
+                    // Reading `value` and skipping past it is exactly the
+                    // read-then-discard shape this guard exists to refuse. No
+                    // fixture in the corpus pairs `value` with `error` today; if
+                    // one ever does, it has to grow a real comparison here
+                    // rather than a `continue` (#lzconsumednotasserted).
+                    if (has_error_key) {
+                        std.debug.print(
+                            "  step assertion carries both `value` and `error`; `value` " ++
+                                "would be read and discarded\n",
+                            .{},
+                        );
+                        return error.ValueAndErrorAssertedTogether;
+                    }
                     const want = try asI64(raw);
                     const got = op_value orelse blk: {
                         // `value` attaches to the step's own op; if that op was
@@ -1630,32 +1641,47 @@ fn Engine(comptime Model: type) type {
             // check here" -- an assumption only the corpus gets to make
             // (#lzassertunknownkeys).
             var expected = cj.AssertionKeys.init("reactive-graph expected tail", expected_block);
-            // Consumed by `runCorpus`, which needs every scenario's report
-            // before it can compare two worlds.
-            expected.consume(&.{"observationally_equal"});
+            // Asserted by `runCorpus`, which needs every scenario's report
+            // before it can compare two worlds — the relation is between two op
+            // streams, which this single-scenario tail cannot express.
+            try expected.excuseKey(
+                "observationally_equal",
+                "a relation between two scenarios' observations, asserted in runCorpus " ++
+                    "after every scenario has been replayed",
+            );
 
-            if (expected.field("final_state")) |fin_block| {
-                var fin = cj.AssertionKeys.init("reactive-graph expected.final_state", fin_block);
-                if (fin.field("dependents_of")) |m| {
+            _ = try expected.assertKeyWithOpt("final_state", self, Self.checkFinalState);
+            _ = try expected.assertKeyWithOpt("after_publish", self, Self.checkAfterPublish);
+
+            try expected.finish();
+            for (EffectLog.cleanups.items) |c| self.rep.obs.add(a, "cleanup[{d}];", .{c});
+        }
+
+        fn checkFinalState(self: *Self, fin_block: json.Value) !void {
+            var fin = cj.AssertionKeys.init("reactive-graph expected.final_state", fin_block);
+            _ = try fin.assertKeyWithOpt("dependents_of", self, struct {
+                fn check(engine: *Self, m: json.Value) !void {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
-                        const idx = try self.node(id);
-                        const got = self.model.dependentCount(idx);
+                        const idx = try engine.node(id);
+                        const got = engine.model.dependentCount(idx);
                         var k: [96]u8 = undefined;
-                        self.check(
+                        engine.check(
                             std.fmt.bufPrint(&k, "final.dependents_of.{s}", .{id}) catch "final.dependents_of",
                             got,
                             try asUsize(map.get(id).?),
                         );
-                        self.rep.obs.add(a, "dep[{s}]={d};", .{ id, got });
+                        engine.rep.obs.add(engine.allocator, "dep[{s}]={d};", .{ id, got });
                     }
                 }
-                if (fin.field("readable")) |m| {
+            }.check);
+            _ = try fin.assertKeyWithOpt("readable", self, struct {
+                fn check(engine: *Self, m: json.Value) !void {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
-                        const got = self.readable(id);
+                        const got = engine.readable(id);
                         var k: [96]u8 = undefined;
-                        self.check(
+                        engine.check(
                             std.fmt.bufPrint(&k, "final.readable.{s}", .{id}) catch "final.readable",
                             got,
                             switch (map.get(id).?) {
@@ -1663,78 +1689,102 @@ fn Engine(comptime Model: type) type {
                                 else => return error.MalformedReadableAssertion,
                             },
                         );
-                        self.rep.obs.add(a, "readable[{s}]={};", .{ id, got });
+                        engine.rep.obs.add(engine.allocator, "readable[{s}]={};", .{ id, got });
                     }
                 }
-                if (fin.field("read")) |m| {
+            }.check);
+            _ = try fin.assertKeyWithOpt("read", self, struct {
+                fn check(engine: *Self, m: json.Value) !void {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
-                        const idx = try self.node(id);
+                        const idx = try engine.node(id);
                         const want = try asI64(map.get(id).?);
                         var k: [96]u8 = undefined;
                         const key = std.fmt.bufPrint(&k, "final.read.{s}", .{id}) catch "final.read";
-                        if (self.model.read(idx)) |got| {
-                            self.check(key, got, want);
-                            self.rep.obs.add(a, "read[{s}]={d};", .{ id, got });
+                        if (engine.model.read(idx)) |got| {
+                            engine.check(key, got, want);
+                            engine.rep.obs.add(engine.allocator, "read[{s}]={d};", .{ id, got });
                         } else |_| {
-                            self.check(key, @as(V, -1), want);
-                            self.rep.obs.add(a, "read[{s}]=err;", .{id});
+                            engine.check(key, @as(V, -1), want);
+                            engine.rep.obs.add(engine.allocator, "read[{s}]=err;", .{id});
                         }
                     }
                 }
-                try fin.finish();
-            }
+            }.check);
+            try fin.finish();
+        }
 
-            if (expected.field("after_publish")) |pub_block| {
-                var pub_keys = cj.AssertionKeys.init("reactive-graph expected.after_publish", pub_block);
-                const op = pub_keys.field("op") orelse return error.MissingOp;
-                const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
-                const runs_before = EffectLog.runs.items.len;
-                try self.model.setCell(idx, try asI64(field(op, "value") orelse return error.MissingValue));
-                self.model.settle();
+        fn checkAfterPublish(self: *Self, pub_block: json.Value) !void {
+            const a = self.allocator;
+            var pub_keys = cj.AssertionKeys.init("reactive-graph expected.after_publish", pub_block);
+            // `op` is the publish to PERFORM, not a fact to compare — it drives
+            // the cascade every other key here observes.
+            try pub_keys.excuseKey(
+                "op",
+                "block input: the cell write whose cascade the other keys observe",
+            );
+            const op = pub_keys.field("op") orelse return error.MissingOp;
+            const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
+            const runs_before = EffectLog.runs.items.len;
+            try self.model.setCell(idx, try asI64(field(op, "value") orelse return error.MissingValue));
+            self.model.settle();
 
-                const ran = EffectLog.runs.items[runs_before..];
-                if (pub_keys.field("observed_by")) |ob| {
-                    try self.checkIdList("after_publish.observed_by", ran, try asArray(ob), false);
-                }
-                for (ran) |r| self.rep.obs.add(a, "ran[{d}];", .{r});
+            const ran = EffectLog.runs.items[runs_before..];
+            _ = try pub_keys.assertKeyWithOpt("observed_by", RanCtx{ .engine = self, .ran = ran }, RanCtx.check);
+            for (ran) |r| self.rep.obs.add(a, "ran[{d}];", .{r});
 
-                if (pub_keys.field("read")) |m| {
+            _ = try pub_keys.assertKeyWithOpt("read", self, struct {
+                fn check(engine: *Self, m: json.Value) !void {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
-                        const nidx = try self.node(id);
+                        const nidx = try engine.node(id);
                         const want = try asI64(map.get(id).?);
                         var k: [96]u8 = undefined;
                         const key = std.fmt.bufPrint(&k, "after_publish.read.{s}", .{id}) catch "after_publish.read";
-                        if (self.model.read(nidx)) |got| {
-                            self.check(key, got, want);
-                            self.rep.obs.add(a, "pubread[{s}]={d};", .{ id, got });
+                        if (engine.model.read(nidx)) |got| {
+                            engine.check(key, got, want);
+                            engine.rep.obs.add(engine.allocator, "pubread[{s}]={d};", .{ id, got });
                         } else |_| {
-                            self.check(key, @as(V, -1), want);
-                            self.rep.obs.add(a, "pubread[{s}]=err;", .{id});
+                            engine.check(key, @as(V, -1), want);
+                            engine.rep.obs.add(engine.allocator, "pubread[{s}]=err;", .{id});
                         }
                     }
                 }
-                if (pub_keys.field("dependents_of")) |m| {
+            }.check);
+            _ = try pub_keys.assertKeyWithOpt("dependents_of", self, struct {
+                fn check(engine: *Self, m: json.Value) !void {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
-                        const nidx = try self.node(id);
-                        const got = self.model.dependentCount(nidx);
+                        const nidx = try engine.node(id);
+                        const got = engine.model.dependentCount(nidx);
                         var k: [96]u8 = undefined;
-                        self.check(
+                        engine.check(
                             std.fmt.bufPrint(&k, "after_publish.dependents_of.{s}", .{id}) catch "after_publish.dependents_of",
                             got,
                             try asUsize(map.get(id).?),
                         );
-                        self.rep.obs.add(a, "pubdep[{s}]={d};", .{ id, got });
+                        engine.rep.obs.add(engine.allocator, "pubdep[{s}]={d};", .{ id, got });
                     }
                 }
-                try pub_keys.finish();
-            }
-
-            try expected.finish();
-            for (EffectLog.cleanups.items) |c| self.rep.obs.add(a, "cleanup[{d}];", .{c});
+            }.check);
+            try pub_keys.finish();
         }
+
+        /// `assertKeyWith` context for `after_publish.observed_by` — the check
+        /// needs both the engine and the effect runs the publish produced.
+        const RanCtx = struct {
+            engine: *Self,
+            ran: []const usize,
+
+            fn check(self: RanCtx, ob: json.Value) !void {
+                try self.engine.checkIdList(
+                    "after_publish.observed_by",
+                    self.ran,
+                    try asArray(ob),
+                    false,
+                );
+            }
+        };
     };
 }
 

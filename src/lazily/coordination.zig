@@ -539,13 +539,6 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
-}
-
 fn opType(step: json.Value) ![]const u8 {
     return jsonAsString(try jsonFieldRequired(try jsonFieldRequired(step, "op"), "type"));
 }
@@ -585,12 +578,15 @@ test "coordination conformance: lease" {
 
         var exp = cj.AssertionKeys.init(
             "coordination expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try optU64(try exp.required("holder")), cell.holderAt(now));
-        try std.testing.expectEqual(try jsonAsBool(try exp.required("held")), cell.isHeld(now));
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("fence")), cell.fenceValue());
-        try std.testing.expectEqual(try invalidates(step, "holder"), cell.holderVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("holder", cell.holderAt(now), struct {
+            fn check(actual: ?u64, want: json.Value) !void {
+                try std.testing.expectEqual(try optU64(want), actual);
+            }
+        }.check);
+        try exp.assertKey("held", cell.isHeld(now));
+        try exp.assertKey("fence", cell.fenceValue());
+        try cj.assertInvalidates(&exp, "holder", cell.holderVersion() != pre);
     }
 }
 
@@ -623,14 +619,14 @@ test "coordination conformance: leader" {
 
         var exp = cj.AssertionKeys.init(
             "coordination expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqualStrings(
-            try jsonAsString(try exp.required("role")),
-            leaderRoleName(cell.role(now)),
-        );
-        try std.testing.expectEqual(try optU64(try exp.required("current_leader")), cell.currentLeader(now));
-        try std.testing.expectEqual(try invalidates(step, "current_leader"), cell.leaderVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("role", leaderRoleName(cell.role(now)));
+        try exp.assertKeyWith("current_leader", cell.currentLeader(now), struct {
+            fn check(actual: ?u64, want: json.Value) !void {
+                try std.testing.expectEqual(try optU64(want), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "current_leader", cell.leaderVersion() != pre);
     }
 }
 
@@ -665,11 +661,10 @@ test "coordination conformance: lock" {
 
         var exp = cj.AssertionKeys.init(
             "coordination expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsBool(try exp.required("is_locked")), cell.isLocked(now));
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("fence")), cell.fenceValue());
-        try std.testing.expectEqual(try invalidates(step, "is_locked"), cell.lockedVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("is_locked", cell.isLocked(now));
+        try exp.assertKey("fence", cell.fenceValue());
+        try cj.assertInvalidates(&exp, "is_locked", cell.lockedVersion() != pre);
     }
 }
 
@@ -697,10 +692,9 @@ test "coordination conformance: semaphore" {
 
         var exp = cj.AssertionKeys.init(
             "coordination expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("permits_available")), cell.permitsAvailable());
-        try std.testing.expectEqual(try invalidates(step, "permits_available"), cell.permitsVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("permits_available", cell.permitsAvailable());
+        try cj.assertInvalidates(&exp, "permits_available", cell.permitsVersion() != pre);
     }
 }
 
@@ -728,10 +722,9 @@ test "coordination conformance: quorum" {
 
         var exp = cj.AssertionKeys.init(
             "coordination expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("votes")), cell.count());
-        try std.testing.expectEqual(try jsonAsBool(try exp.required("is_open")), cell.isOpen());
-        try std.testing.expectEqual(try invalidates(step, "is_open"), cell.openVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("votes", cell.count());
+        try exp.assertKey("is_open", cell.isOpen());
+        try cj.assertInvalidates(&exp, "is_open", cell.openVersion() != pre);
     }
 }

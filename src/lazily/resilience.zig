@@ -444,13 +444,6 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
-}
-
 test "resilience conformance: circuit_breaker" {
     if (!specFixturesPresent()) return error.SkipZigTest;
     const ctx = try Context.init(std.testing.allocator);
@@ -484,13 +477,9 @@ test "resilience conformance: circuit_breaker" {
 
         var exp = cj.AssertionKeys.init(
             "resilience expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqualStrings(
-            try jsonAsString(try exp.required("state")),
-            breaker.state().specName(),
-        );
-        try std.testing.expectEqual(try invalidates(step, "state"), breaker.stateVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("state", breaker.state().specName());
+        try cj.assertInvalidates(&exp, "state", breaker.stateVersion() != pre);
     }
 }
 
@@ -521,10 +510,9 @@ test "resilience conformance: retry" {
 
         var exp = cj.AssertionKeys.init(
             "resilience expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("delay")), retry.delay());
-        try std.testing.expectEqual(try invalidates(step, "delay"), retry.delayVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("delay", retry.delay());
+        try cj.assertInvalidates(&exp, "delay", retry.delayVersion() != pre);
     }
 }
 
@@ -558,10 +546,9 @@ test "resilience conformance: bulkhead" {
 
         var exp = cj.AssertionKeys.init(
             "resilience expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("in_use")), bulkhead.inUse());
-        try std.testing.expectEqual(try invalidates(step, "in_use"), bulkhead.inUseVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("in_use", bulkhead.inUse());
+        try cj.assertInvalidates(&exp, "in_use", bulkhead.inUseVersion() != pre);
     }
 }
 
@@ -594,9 +581,8 @@ test "resilience conformance: timeout" {
 
         var exp = cj.AssertionKeys.init(
             "resilience expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsBool(try exp.required("is_timed_out")), timeout.isTimedOut());
-        try std.testing.expectEqual(try invalidates(step, "is_timed_out"), timeout.timedOutVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("is_timed_out", timeout.isTimedOut());
+        try cj.assertInvalidates(&exp, "is_timed_out", timeout.timedOutVersion() != pre);
     }
 }

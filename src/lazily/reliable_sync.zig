@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const ipc = @import("ipc.zig");
+const cj = @import("conformance_json.zig");
 
 /// Whether this toolchain has the `std.Io` interface the file-backed outbox store
 /// is written against.
@@ -565,6 +566,19 @@ fn snapshotMessage(epoch: u64) IpcMessage {
     return .{ .Snapshot = ipc.Snapshot.init(epoch, &.{}, &.{}, &.{}) };
 }
 
+/// Assert an epoch list from a fixture `expect` block against an observed one.
+fn expectEpochList(want: std.json.Value, got: []const u64) !void {
+    const items = want.array.items;
+    try std.testing.expectEqual(items.len, got.len);
+    for (items, got) |w, g| try std.testing.expectEqual(@as(u64, @intCast(w.integer)), g);
+}
+
+// Replay the storage-independent `OutboxStore` protocol scenarios out of the
+// fixture rather than re-typing their numbers as Zig literals: `put_epochs`,
+// `ack_through`, and `restart` drive the run, and every key of the scenario's
+// `expect` block is asserted against what the outbox actually did. The whole
+// scenario used to be hand-transcribed, so upstream could move any of these
+// epochs and this test kept agreeing with itself (#lzconsumednotasserted).
 test "OutboxStore protocol replays canonical ordered, monotone, and restart cases" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture_outbox_store, .{});
@@ -572,49 +586,86 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
     try std.testing.expectEqualStrings("ReliableSync", parsed.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("OutboxStore", parsed.value.object.get("model").?.string);
     const scenarios = parsed.value.object.get("scenarios").?.array.items;
-    try std.testing.expectEqual(@as(usize, 4), scenarios.len);
-    try std.testing.expectEqualStrings(
-        "stale handle cannot regress serialized cursor",
-        scenarios[3].object.get("name").?.string,
-    );
+    try std.testing.expect(scenarios.len > 0);
 
-    var unordered = InMemoryStore.init(allocator);
-    defer unordered.deinit();
-    try unordered.put(3, "three");
-    try unordered.put(1, "one");
-    try unordered.put(2, "two");
-    const ordered = try unordered.scanAfter(allocator, 0);
-    defer freeStoredFrames(allocator, ordered);
-    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &.{ ordered[0].epoch, ordered[1].epoch, ordered[2].epoch });
+    var replayed: usize = 0;
+    for (scenarios) |scenario| {
+        const sc = scenario.object;
+        // The `open_handles` scenario is the file-backed stale-cursor case; it
+        // is replayed by "StoredOutbox replays canonical stale-handle cursor
+        // serialization", which needs a real FileOutboxStore.
+        if (sc.get("open_handles") != null) continue;
 
-    var store = InMemoryStore.init(allocator);
-    defer store.deinit();
-    var outbox = try StoredOutbox(InMemoryStore).init(&store);
-    for (1..5) |epoch| try outbox.append(epoch, snapshotMessage(epoch));
-    try outbox.ackThrough(2);
-    try outbox.ackThrough(1);
-    try outbox.ackThrough(3);
-    try std.testing.expectEqual(@as(u64, 3), outbox.ackedThrough());
-    const retained = try outbox.retainedEpochs(allocator);
-    defer allocator.free(retained);
-    try std.testing.expectEqualSlices(u64, &.{4}, retained);
+        var store = InMemoryStore.init(allocator);
+        defer store.deinit();
+        var outbox = try StoredOutbox(InMemoryStore).init(&store);
+        for (sc.get("put_epochs").?.array.items) |e| {
+            const epoch: u64 = @intCast(e.integer);
+            try outbox.append(epoch, snapshotMessage(epoch));
+        }
+        if (sc.get("ack_through")) |acks| {
+            for (acks.array.items) |e| try outbox.ackThrough(@intCast(e.integer));
+        }
+        if (sc.get("restart")) |r| {
+            if (r.bool) outbox = try StoredOutbox(InMemoryStore).init(&store);
+        }
 
-    var replay_arena = std.heap.ArenaAllocator.init(allocator);
-    defer replay_arena.deinit();
-    const replay = try outbox.replayFrom(replay_arena.allocator(), 0);
-    try std.testing.expectEqual(@as(usize, 1), replay.len);
-    try std.testing.expectEqual(@as(u64, 4), replay[0].epoch);
+        var keys = cj.AssertionKeys.init(
+            "reliable-sync/outbox_store_protocol.json expect",
+            sc.get("expect").?,
+        );
 
-    var restarted_store = InMemoryStore.init(allocator);
-    defer restarted_store.deinit();
-    var before_restart = try StoredOutbox(InMemoryStore).init(&restarted_store);
-    for (10..13) |epoch| try before_restart.append(epoch, snapshotMessage(epoch));
-    try before_restart.ackThrough(10);
-    var after_restart = try StoredOutbox(InMemoryStore).init(&restarted_store);
-    try std.testing.expectEqual(@as(u64, 10), after_restart.ackedThrough());
-    const restart_retained = try after_restart.retainedEpochs(allocator);
-    defer allocator.free(restart_retained);
-    try std.testing.expectEqualSlices(u64, &.{ 11, 12 }, restart_retained);
+        // `epochs`: the store replays unordered puts in ascending epoch order.
+        if (keys.field("epochs") != null) {
+            const scan_after: u64 = if (sc.get("scan_after")) |sa| @intCast(sa.integer) else 0;
+            const ordered = try store.scanAfter(allocator, scan_after);
+            defer freeStoredFrames(allocator, ordered);
+            var got = try allocator.alloc(u64, ordered.len);
+            defer allocator.free(got);
+            for (ordered, 0..) |frame, i| got[i] = frame.epoch;
+            try keys.assertKeyWith("epochs", @as([]const u64, got), struct {
+                fn check(observed: []const u64, w: std.json.Value) !void {
+                    try expectEpochList(w, observed);
+                }
+            }.check);
+        }
+
+        // `cursor` / `loaded_cursor`: the monotone ack cursor, the second read
+        // back through a freshly reopened handle.
+        _ = try keys.assertKeyOpt("cursor", outbox.ackedThrough());
+        _ = try keys.assertKeyOpt("loaded_cursor", outbox.ackedThrough());
+
+        if (keys.field("retained") != null) {
+            const retained = try outbox.retainedEpochs(allocator);
+            defer allocator.free(retained);
+            try keys.assertKeyWith("retained", @as([]const u64, retained), struct {
+                fn check(observed: []const u64, w: std.json.Value) !void {
+                    try expectEpochList(w, observed);
+                }
+            }.check);
+        }
+
+        inline for (.{ "replay_from_zero", "replay" }) |name| {
+            if (keys.field(name) != null) {
+                var replay_arena = std.heap.ArenaAllocator.init(allocator);
+                defer replay_arena.deinit();
+                const frames = try outbox.replayFrom(replay_arena.allocator(), 0);
+                var got = try allocator.alloc(u64, frames.len);
+                defer allocator.free(got);
+                for (frames, 0..) |frame, i| got[i] = frame.epoch;
+                try keys.assertKeyWith(name, @as([]const u64, got), struct {
+                    fn check(observed: []const u64, w: std.json.Value) !void {
+                        try expectEpochList(w, observed);
+                    }
+                }.check);
+            }
+        }
+
+        try keys.finish();
+        replayed += 1;
+    }
+    // A vacuous loop must not report green.
+    try std.testing.expect(replayed >= 3);
 }
 
 test "FileOutboxStore survives restart and rejects stale cursor regression" {
@@ -1532,30 +1583,69 @@ fn decodeFixtureWire(a: std.mem.Allocator, fixture: []const u8) !ipc.ParsedMessa
     return IpcMessage.decodeJson(a, wire_json);
 }
 
+/// One scalar out of a fixture's own `wire` envelope, e.g.
+/// `wire.ResyncRequest.from_epoch`. The decoded value is compared against THIS,
+/// not against a number re-typed into the test — the corpus could move the
+/// epoch and every literal below would have kept agreeing with itself
+/// (#lzconsumednotasserted).
+fn fixtureWireU64(
+    a: std.mem.Allocator,
+    fixture: []const u8,
+    variant: []const u8,
+    name: []const u8,
+) !u64 {
+    var root = try std.json.parseFromSlice(std.json.Value, a, fixture, .{});
+    defer root.deinit();
+    const wire = root.value.object.get("wire") orelse return error.MissingWire;
+    const body = wire.object.get(variant) orelse return error.MissingWireVariant;
+    const value = body.object.get(name) orelse return error.MissingWireField;
+    return @intCast(value.integer);
+}
+
 test "reliable_sync: embedded fixtures decode through codec" {
     const a = testing.allocator;
 
-    // resync_gap_converge → ResyncRequest { from_epoch: 2 }
+    // resync_gap_converge → ResyncRequest { from_epoch }
     var f1 = try decodeFixtureWire(a, fixture_resync);
     defer f1.deinit();
-    try testing.expectEqual(@as(u64, 2), f1.message.ResyncRequest.from_epoch);
+    try testing.expectEqual(
+        try fixtureWireU64(a, fixture_resync, "ResyncRequest", "from_epoch"),
+        f1.message.ResyncRequest.from_epoch,
+    );
 
-    // idempotent_redelivery → OutboxAck { through_epoch: 42 }
+    // idempotent_redelivery → OutboxAck { through_epoch }
     var f2 = try decodeFixtureWire(a, fixture_idempotent);
     defer f2.deinit();
-    try testing.expectEqual(@as(u64, 42), f2.message.OutboxAck.through_epoch);
+    try testing.expectEqual(
+        try fixtureWireU64(a, fixture_idempotent, "OutboxAck", "through_epoch"),
+        f2.message.OutboxAck.through_epoch,
+    );
 
-    // multi_epoch_delta → Delta { base_epoch: 40, epoch: 43, ops: 3 }
+    // multi_epoch_delta carries an `assertions` block that nothing used to read
+    // — the same numbers were re-typed here as literals.
     var f3 = try decodeFixtureWire(a, fixture_multi_epoch);
     defer f3.deinit();
-    try testing.expectEqual(@as(u64, 40), f3.message.Delta.base_epoch);
-    try testing.expectEqual(@as(u64, 43), f3.message.Delta.epoch);
-    try testing.expectEqual(@as(usize, 3), f3.message.Delta.ops.len);
+    var multi_epoch = try std.json.parseFromSlice(std.json.Value, a, fixture_multi_epoch, .{});
+    defer multi_epoch.deinit();
+    var keys = cj.AssertionKeys.init(
+        "reliable-sync/multi_epoch_delta.json assertions",
+        multi_epoch.value.object.get("assertions") orelse return error.MissingAssertions,
+    );
+    const delta = f3.message.Delta;
+    try keys.assertKey("base_epoch", delta.base_epoch);
+    try keys.assertKey("epoch", delta.epoch);
+    try keys.assertKey("span", delta.epoch - delta.base_epoch);
+    try keys.assertKey("is_multi_epoch", delta.epoch > delta.base_epoch + 1);
+    try keys.assertKey("op_count", delta.ops.len);
+    try keys.finish();
 
-    // outbox_replay_after_crash → OutboxAck { through_epoch: 41 }
+    // outbox_replay_after_crash → OutboxAck { through_epoch }
     var f4 = try decodeFixtureWire(a, fixture_outbox);
     defer f4.deinit();
-    try testing.expectEqual(@as(u64, 41), f4.message.OutboxAck.through_epoch);
+    try testing.expectEqual(
+        try fixtureWireU64(a, fixture_outbox, "OutboxAck", "through_epoch"),
+        f4.message.OutboxAck.through_epoch,
+    );
 
     // liveness_orset_lww has no top-level `wire`; assert it parses + has scenarios.
     var f5 = try std.json.parseFromSlice(std.json.Value, a, fixture_liveness, .{ .allocate = .alloc_always });

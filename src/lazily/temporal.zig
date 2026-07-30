@@ -445,11 +445,14 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
+/// The fixture's spelling of a `DeadlineState`. Asserting the NAME rather than
+/// `state == "Expired"` means a fixture that renames or adds a state fails here
+/// instead of silently collapsing into the false branch.
+fn deadlineStateName(state: DeadlineState) []const u8 {
+    return switch (state) {
+        .live => "Live",
+        .expired => "Expired",
+    };
 }
 
 test "temporal conformance: timer_single_shot" {
@@ -471,18 +474,22 @@ test "temporal conformance: timer_single_shot" {
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
         var exp = cj.AssertionKeys.init(
             "temporal expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsBool(try exp.required("fired")), timer.hasFired());
-        const want_value: bool = switch (try exp.required("value")) {
-            .null => false,
-            else => true,
-        };
-        try std.testing.expectEqual(want_value, timer.value() != null);
-        try std.testing.expectEqual(try optU64(try exp.required("next_fire")), timer.nextFire());
-
-        const changed = timer.firedVersion() != pre;
-        try std.testing.expectEqual(try invalidates(step, "fired"), changed);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("fired", timer.hasFired());
+        // A single-shot timer's payload is the unit, so the fixture's `"()"`
+        // carries no content to compare — its PRESENCE is the whole fact, and
+        // that is what reaches the comparison.
+        try exp.assertKeyWith("value", timer.value() != null, struct {
+            fn check(present: bool, v: json.Value) !void {
+                try std.testing.expectEqual(v != .null, present);
+            }
+        }.check);
+        try exp.assertKeyWith("next_fire", timer.nextFire(), struct {
+            fn check(actual: ?u64, v: json.Value) !void {
+                try std.testing.expectEqual(try optU64(v), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "fired", timer.firedVersion() != pre);
     }
 }
 
@@ -505,11 +512,14 @@ test "temporal conformance: interval_periodic" {
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
         var exp = cj.AssertionKeys.init(
             "temporal expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("count")), iv.count());
-        try std.testing.expectEqual(try optU64(try exp.required("next_fire")), iv.nextFire());
-        try std.testing.expectEqual(try invalidates(step, "count"), iv.countVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("count", iv.count());
+        try exp.assertKeyWith("next_fire", iv.nextFire(), struct {
+            fn check(actual: ?u64, v: json.Value) !void {
+                try std.testing.expectEqual(try optU64(v), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "count", iv.countVersion() != pre);
     }
 }
 
@@ -539,11 +549,14 @@ test "temporal conformance: cron_pattern" {
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
         var exp = cj.AssertionKeys.init(
             "temporal expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsU64(try exp.required("count")), cron.count());
-        try std.testing.expectEqual(try optU64(try exp.required("next_fire")), cron.nextFire());
-        try std.testing.expectEqual(try invalidates(step, "count"), cron.countVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("count", cron.count());
+        try exp.assertKeyWith("next_fire", cron.nextFire(), struct {
+            fn check(actual: ?u64, v: json.Value) !void {
+                try std.testing.expectEqual(try optU64(v), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "count", cron.countVersion() != pre);
     }
 }
 
@@ -568,11 +581,9 @@ test "temporal conformance: deadline_expiry" {
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
         var exp = cj.AssertionKeys.init(
             "temporal expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        const want_expired = std.mem.eql(u8, try jsonAsString(try exp.required("state")), "Expired");
-        try std.testing.expectEqual(want_expired, d.isExpired());
-        try std.testing.expectEqualStrings(try jsonAsString(try exp.required("value")), d.value());
-        try std.testing.expectEqual(try invalidates(step, "state"), d.stateVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("state", deadlineStateName(d.state()));
+        try exp.assertKey("value", d.value());
+        try cj.assertInvalidates(&exp, "state", d.stateVersion() != pre);
     }
 }

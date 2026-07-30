@@ -460,12 +460,6 @@ fn jsonAsU64(value: json.Value) !u64 {
         else => error.ExpectedUnsignedInteger,
     };
 }
-fn jsonAsBool(value: json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        else => error.ExpectedBool,
-    };
-}
 fn jsonAsString(value: json.Value) ![]const u8 {
     return switch (value) {
         .string => |s| s,
@@ -544,33 +538,38 @@ test "membership conformance: membership_lifecycle" {
 
         var exp = cj.AssertionKeys.init(
             "membership expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
 
         // Per-peer state assertions.
-        const states = try exp.required("states");
-        var sit = states.object.iterator();
-        while (sit.next()) |kv| {
-            const peer_id = try std.fmt.parseInt(u64, kv.key_ptr.*, 10);
-            const want = try jsonAsString(kv.value_ptr.*);
-            const got = cell.state(peer_id) orelse return error.MissingPeer;
-            try std.testing.expectEqualStrings(want, peerStateName(got));
-        }
+        try exp.assertKeyWith("states", &cell, struct {
+            fn check(c: *MembershipCell, states: json.Value) !void {
+                var sit = states.object.iterator();
+                while (sit.next()) |kv| {
+                    const peer_id = try std.fmt.parseInt(u64, kv.key_ptr.*, 10);
+                    const want = try jsonAsString(kv.value_ptr.*);
+                    const got = c.state(peer_id) orelse return error.MissingPeer;
+                    try std.testing.expectEqualStrings(want, peerStateName(got));
+                }
+            }
+        }.check);
 
         // Alive-set equality (as a sorted set).
         var alive = std.ArrayList(u64).empty;
         defer alive.deinit(std.testing.allocator);
         try cell.aliveInto(&alive);
-        var want_alive = std.ArrayList(u64).empty;
-        defer want_alive.deinit(std.testing.allocator);
-        for ((try exp.required("alive_set")).array.items) |v| {
-            try want_alive.append(std.testing.allocator, try jsonAsU64(v));
-        }
-        std.mem.sort(u64, want_alive.items, {}, std.sort.asc(u64));
-        try std.testing.expect(std.mem.eql(u64, want_alive.items, alive.items));
+        try exp.assertKeyWith("alive_set", alive.items, struct {
+            fn check(actual: []const u64, want_json: json.Value) !void {
+                var want_alive = std.ArrayList(u64).empty;
+                defer want_alive.deinit(std.testing.allocator);
+                for (want_json.array.items) |v| {
+                    try want_alive.append(std.testing.allocator, try jsonAsU64(v));
+                }
+                std.mem.sort(u64, want_alive.items, {}, std.sort.asc(u64));
+                try std.testing.expect(std.mem.eql(u64, want_alive.items, actual));
+            }
+        }.check);
 
         // Reader invalidation: scalar bool (not a {reader: bool} map).
-        const want_inv = try jsonAsBool(try exp.required("invalidates"));
-        try std.testing.expectEqual(want_inv, cell.peerSetVersion() != pre);
+        try exp.assertKey("invalidates", cell.peerSetVersion() != pre);
     }
 }

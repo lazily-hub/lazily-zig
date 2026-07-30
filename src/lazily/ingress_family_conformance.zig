@@ -870,8 +870,24 @@ fn collectKeys(allocator: std.mem.Allocator, fixture: json.Value) ![][]const u8 
 /// Assert the fixture's expected state after one step. Reads through the reactive
 /// readers, so a shell that under-invalidated fails HERE as well as in the
 /// invalidation matrix.
-fn assertState(model: anytype, expected: *cj.AssertionKeys, where: []const u8) !void {
-    const scopes = try expected.required("scopes");
+/// `assertKeyWith` context for `expected.scopes`. Generic over the flavor's
+/// model type, which is comptime here.
+fn StateCtx(comptime M: type) type {
+    return struct {
+        model: M,
+        where: []const u8,
+
+        fn check(self: @This(), scopes: json.Value) !void {
+            try assertState(self.model, scopes, self.where);
+        }
+
+        fn checkReceipts(self: @This(), receipts: json.Value) !void {
+            try assertReceipts(self.model, receipts, self.where);
+        }
+    };
+}
+
+fn assertState(model: anytype, scopes: json.Value, where: []const u8) !void {
     switch (scopes) {
         .object => |map| {
             var it = map.iterator();
@@ -943,7 +959,9 @@ fn assertState(model: anytype, expected: *cj.AssertionKeys, where: []const u8) !
         else => return error.ExpectedObject,
     }
 
-    const receipts = try expected.required("receipts");
+}
+
+fn assertReceipts(model: anytype, receipts: json.Value, where: []const u8) !void {
     try expectEqU64(where, try requiredU64(receipts, "accepted"), try model.acceptedLen());
     try expectEqU64(where, try requiredU64(receipts, "dropped"), try model.droppedLen());
     try expectEqU64(where, try requiredU64(receipts, "error"), try model.errorsLen());
@@ -954,17 +972,36 @@ fn assertState(model: anytype, expected: *cj.AssertionKeys, where: []const u8) !
 /// that invalidated anyway fails here, and over-invalidation is as visible as
 /// under-. Returns the number of flags asserted, so the caller can prove the
 /// matrix was not silently absent.
+/// `assertKeyWith` context for `expected.invalidates`. The flag count comes back
+/// through `asserted`, since the check itself returns void.
+const InvalidationCtx = struct {
+    keys: [][]const u8,
+    before: Snapshot,
+    after: Snapshot,
+    where: []const u8,
+    asserted: *usize,
+
+    fn check(self: InvalidationCtx, want: json.Value) !void {
+        self.asserted.* = try assertInvalidation(
+            self.keys,
+            want,
+            self.before,
+            self.after,
+            self.where,
+        );
+    }
+};
+
+/// The matrix nests under `expected`, NOT on the step. lazily-rs's MAP runner
+/// read it off the step, so it was always absent and the assertion never ran
+/// once. Pin the nesting so that cannot recur here.
 fn assertInvalidation(
     keys: [][]const u8,
-    expected: *cj.AssertionKeys,
+    want: json.Value,
     before: Snapshot,
     after: Snapshot,
     where: []const u8,
 ) !usize {
-    // The matrix nests under `expected`, NOT on the step. lazily-rs's MAP runner
-    // read it off the step, so it was always absent and the assertion never ran
-    // once. Pin the nesting so that cannot recur here.
-    const want = try expected.required("invalidates");
     var asserted: usize = 0;
 
     const want_scopes = try jsonFieldRequired(want, "scopes");
@@ -1139,8 +1176,26 @@ fn replay(
         if (jsonField(step, "invalidates") != null) return error.InvalidatesMustNestUnderExpected;
         var expected = cj.AssertionKeys.init(
             "ingress-family expected", try jsonFieldRequired(step, "expected"));
-        try assertState(model, &expected, where);
-        counts.flags += try assertInvalidation(keys, &expected, before, after, where);
+        const StateCheck = StateCtx(@TypeOf(model));
+        try expected.assertKeyWith(
+            "scopes",
+            StateCheck{ .model = model, .where = where },
+            StateCheck.check,
+        );
+        try expected.assertKeyWith(
+            "receipts",
+            StateCheck{ .model = model, .where = where },
+            StateCheck.checkReceipts,
+        );
+        var flags: usize = 0;
+        try expected.assertKeyWith("invalidates", InvalidationCtx{
+            .keys = keys,
+            .before = before,
+            .after = after,
+            .where = where,
+            .asserted = &flags,
+        }, InvalidationCtx.check);
+        counts.flags += flags;
         try expected.finish();
         try model.materialize();
         counts.steps += 1;

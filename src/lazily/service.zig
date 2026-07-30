@@ -525,13 +525,6 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
-}
-
 /// Assert a live `service → endpoint` map equals the fixture object as a set of
 /// pairs (count + every key/value).
 fn expectMapEquals(actual: *const std.StringHashMap([]const u8), expected: json.Value) !void {
@@ -567,13 +560,9 @@ test "service conformance: health" {
 
         var exp = cj.AssertionKeys.init(
             "service expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqualStrings(
-            try jsonAsString(try exp.required("health")),
-            cell.health().toString(),
-        );
-        try std.testing.expectEqual(try invalidates(step, "health"), cell.healthVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("health", cell.health().toString());
+        try cj.assertInvalidates(&exp, "health", cell.healthVersion() != pre);
     }
 }
 
@@ -596,10 +585,9 @@ test "service conformance: readiness" {
 
         var exp = cj.AssertionKeys.init(
             "service expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try jsonAsBool(try exp.required("ready")), cell.ready());
-        try std.testing.expectEqual(try invalidates(step, "ready"), cell.readyVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("ready", cell.ready());
+        try cj.assertInvalidates(&exp, "ready", cell.readyVersion() != pre);
     }
 }
 
@@ -637,12 +625,11 @@ test "service conformance: discovery" {
 
         var exp = cj.AssertionKeys.init(
             "service expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
         var proj = try cell.discovery(std.testing.allocator);
         defer proj.deinit();
-        try expectMapEquals(&proj, try exp.required("discovery"));
-        try std.testing.expectEqual(try invalidates(step, "discovery"), cell.discoveryVersion() != pre);
+        try exp.assertKeyWith("discovery", &proj, expectMapEquals);
+        try cj.assertInvalidates(&exp, "discovery", cell.discoveryVersion() != pre);
     }
 }
 
@@ -673,9 +660,8 @@ test "service conformance: service_registry" {
 
         var exp = cj.AssertionKeys.init(
             "service expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try expectMapEquals(reg.projectionMap(), try exp.required("projection"));
-        try std.testing.expectEqual(try invalidates(step, "projection"), reg.projectionVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("projection", reg.projectionMap(), expectMapEquals);
+        try cj.assertInvalidates(&exp, "projection", reg.projectionVersion() != pre);
     }
 }

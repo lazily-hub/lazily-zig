@@ -802,8 +802,15 @@ test "lazily/receipt: replaying the conformance fixture into a projection yields
         "receipts/causal_receipts.json assertions",
         try field(root, "assertions"),
     );
-    const current_generation = try asU64(try assertions.required("current_generation"));
-    const expected_count = try asU64(try assertions.required("receipt_count"));
+    // The observation generation is fixture INPUT, not a fact to check: it
+    // selects which receipts land as `recorded` and which as `stale_generation`.
+    // Its effect is asserted through `stale_receipt_ids` below.
+    try assertions.excuseKey(
+        "current_generation",
+        "fixture input: the generation the projection observes at; its effect is " ++
+            "asserted through stale_receipt_ids",
+    );
+    const current_generation = try asU64(assertions.field("current_generation").?);
 
     const wire = try field(root, "wire");
     var wire_arena = std.heap.ArenaAllocator.init(allocator);
@@ -827,19 +834,33 @@ test "lazily/receipt: replaying the conformance fixture into a projection yields
         }
     }
 
-    try std.testing.expectEqual(@as(usize, expected_count), body.receipts.len);
+    try assertions.assertKey("receipt_count", body.receipts.len);
     try std.testing.expectEqual(@as(usize, 3), applied_count); // observed + accepted + applied
-    try std.testing.expectEqual(@as(usize, 1), stale_count); // receipt-stale
 
     // `causation_id` and `terminal_outcome` were carried by the fixture and
     // hardcoded here, so the corpus could move either and this replay would keep
     // asserting the old pair (#lzassertunknownkeys).
-    const causation_id = try asString(try assertions.required("causation_id"));
-    const terminal = projection.terminalFor(causation_id).?;
-    try std.testing.expectEqual(
-        try ReceiptOutcome.fromWireName(try asString(try assertions.required("terminal_outcome"))),
-        terminal.outcome,
+    const causation_id = try asString(assertions.field("causation_id").?);
+    try assertions.assertKeyWith(
+        "causation_id",
+        &projection,
+        struct {
+            fn check(proj: *ReceiptProjection, want: std.json.Value) !void {
+                // A terminal receipt exists for exactly the causation the corpus
+                // names — move it in the fixture and this stops resolving.
+                try std.testing.expect(proj.terminalFor(try asString(want)) != null);
+            }
+        }.check,
     );
+    const terminal = projection.terminalFor(causation_id).?;
+    try assertions.assertKeyWith("terminal_outcome", terminal.outcome, struct {
+        fn check(actual: ReceiptOutcome, want: std.json.Value) !void {
+            try std.testing.expectEqual(
+                try ReceiptOutcome.fromWireName(try asString(want)),
+                actual,
+            );
+        }
+    }.check);
     try std.testing.expectEqualStrings(
         "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
         terminal.payload_hash.?,
@@ -848,30 +869,54 @@ test "lazily/receipt: replaying the conformance fixture into a projection yields
     // The non-terminal half of the outcome lattice, read by nothing until now: a
     // binding that classified `accepted` as terminal satisfies every other key
     // here and is still wrong.
-    const nonterminal = try asArray(try assertions.required("nonterminal_outcomes"));
-    var seen_nonterminal: usize = 0;
-    for (nonterminal) |want| {
-        const outcome = try ReceiptOutcome.fromWireName(try asString(want));
-        try std.testing.expect(!outcome.isTerminal());
-        for (body.receipts) |r| {
-            if (r.outcome == outcome) {
-                seen_nonterminal += 1;
-                break;
+    try assertions.assertKeyWith("nonterminal_outcomes", body.receipts, struct {
+        fn check(receipts: []const CausalReceipt, want: std.json.Value) !void {
+            const nonterminal = try asArray(want);
+            var seen_nonterminal: usize = 0;
+            for (nonterminal) |w| {
+                const outcome = try ReceiptOutcome.fromWireName(try asString(w));
+                try std.testing.expect(!outcome.isTerminal());
+                for (receipts) |r| {
+                    if (r.outcome == outcome) {
+                        seen_nonterminal += 1;
+                        break;
+                    }
+                }
             }
+            try std.testing.expectEqual(nonterminal.len, seen_nonterminal);
         }
-    }
-    try std.testing.expectEqual(nonterminal.len, seen_nonterminal);
+    }.check);
 
-    const stale_ids = try asArray(try assertions.required("stale_receipt_ids"));
-    try std.testing.expectEqual(@as(usize, 1), stale_ids.len);
-    try std.testing.expectEqualStrings("receipt-stale", try asString(stale_ids[0]));
-    try std.testing.expect(projection.containsReceipt("receipt-stale"));
+    // Every id the corpus calls stale must BE stale here, and there must be
+    // exactly that many — the id was hardcoded, so the corpus could rename it
+    // and this replay would keep proving a receipt that no longer exists.
+    try assertions.assertKeyWith(
+        "stale_receipt_ids",
+        StaleCheck{ .projection = &projection, .stale_count = stale_count },
+        StaleCheck.check,
+    );
     try assertions.finish();
 }
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
+
+/// `assertKeyWith` context for `stale_receipt_ids`: every id the corpus names
+/// must be present in the projection, and the observed stale count must match
+/// the corpus's list length.
+const StaleCheck = struct {
+    projection: *ReceiptProjection,
+    stale_count: usize,
+
+    fn check(self: StaleCheck, want: std.json.Value) !void {
+        const ids = try asArray(want);
+        try std.testing.expectEqual(ids.len, self.stale_count);
+        for (ids) |id| {
+            try std.testing.expect(self.projection.containsReceipt(try asString(id)));
+        }
+    }
+};
 
 fn Some(g: u64) ?u64 {
     return g;

@@ -428,12 +428,6 @@ fn jsonAsI64(value: json.Value) !i64 {
         else => error.ExpectedInteger,
     };
 }
-fn jsonAsBool(value: json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        else => error.ExpectedBool,
-    };
-}
 fn jsonAsString(value: json.Value) ![]const u8 {
     return switch (value) {
         .string => |s| s,
@@ -463,13 +457,6 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
-}
-
 fn config(fx: json.Value) !json.Value {
     return jsonFieldRequired(fx, "config");
 }
@@ -494,10 +481,13 @@ test "windowing conformance: tumbling_count" {
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
         var exp = cj.AssertionKeys.init(
             "windowing expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
-        try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("output", w.output(), struct {
+            fn check(actual: ?i64, want: json.Value) !void {
+                try std.testing.expectEqual(try optI64(want), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "output", w.outputVersion() != pre);
     }
 }
 
@@ -528,10 +518,13 @@ test "windowing conformance: tumbling_time" {
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
         var exp = cj.AssertionKeys.init(
             "windowing expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
-        try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("output", w.output(), struct {
+            fn check(actual: ?i64, want: json.Value) !void {
+                try std.testing.expectEqual(try optI64(want), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "output", w.outputVersion() != pre);
     }
 }
 
@@ -558,10 +551,13 @@ test "windowing conformance: sliding_count" {
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
         var exp = cj.AssertionKeys.init(
             "windowing expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
-        try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("output", w.output(), struct {
+            fn check(actual: ?i64, want: json.Value) !void {
+                try std.testing.expectEqual(try optI64(want), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "output", w.outputVersion() != pre);
     }
 }
 
@@ -592,9 +588,12 @@ test "windowing conformance: session" {
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
         var exp = cj.AssertionKeys.init(
             "windowing expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
-        try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("output", w.output(), struct {
+            fn check(actual: ?i64, want: json.Value) !void {
+                try std.testing.expectEqual(try optI64(want), actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "output", w.outputVersion() != pre);
     }
 }

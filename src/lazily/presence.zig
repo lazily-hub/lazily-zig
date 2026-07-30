@@ -372,12 +372,6 @@ fn jsonAsU64(value: json.Value) !u64 {
         else => error.ExpectedUnsignedInteger,
     };
 }
-fn jsonAsBool(value: json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        else => error.ExpectedBool,
-    };
-}
 fn jsonAsString(value: json.Value) ![]const u8 {
     return switch (value) {
         .string => |s| s,
@@ -398,13 +392,6 @@ fn steps(fx: json.Value) ![]const json.Value {
         .array => |a| a.items,
         else => error.ExpectedArray,
     };
-}
-
-/// The fixture's `invalidates[reader]` flag for a step.
-fn invalidates(step: json.Value, reader: []const u8) !bool {
-    const exp = try jsonFieldRequired(step, "expected");
-    const inv = try jsonFieldRequired(exp, "invalidates");
-    return jsonAsBool(try jsonFieldRequired(inv, reader));
 }
 
 /// Canonical signature of the fixture's `expected.present` object, sorted by
@@ -463,13 +450,9 @@ test "presence conformance: ephemeral" {
 
         var exp = cj.AssertionKeys.init(
             "presence expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        switch (try exp.required("value")) {
-            .null => try std.testing.expect(cell.value() == null),
-            else => |v| try std.testing.expectEqualStrings(try jsonAsString(v), cell.value().?),
-        }
-        try std.testing.expectEqual(try invalidates(step, "value"), cell.valueVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKey("value", cell.value());
+        try cj.assertInvalidates(&exp, "value", cell.valueVersion() != pre);
     }
 }
 
@@ -504,12 +487,15 @@ test "presence conformance: presence" {
 
         var exp = cj.AssertionKeys.init(
             "presence expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        const want = try expectedPresentSig(std.testing.allocator, try exp.required("present"));
-        defer std.testing.allocator.free(want);
-        try std.testing.expectEqualStrings(want, cell.presentSig());
-        try std.testing.expectEqual(try invalidates(step, "present"), cell.presentVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("present", cell.presentSig(), struct {
+            fn check(actual: []const u8, present: json.Value) !void {
+                const want = try expectedPresentSig(std.testing.allocator, present);
+                defer std.testing.allocator.free(want);
+                try std.testing.expectEqualStrings(want, actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "present", cell.presentVersion() != pre);
     }
 }
 
@@ -541,11 +527,14 @@ test "presence conformance: awareness" {
 
         var exp = cj.AssertionKeys.init(
             "presence expected", try jsonFieldRequired(step, "expected"));
-        exp.consume(&.{"invalidates"});
-        defer exp.finish() catch @panic("unconsumed conformance assertion key");
-        const want = try expectedPresentSig(std.testing.allocator, try exp.required("present"));
-        defer std.testing.allocator.free(want);
-        try std.testing.expectEqualStrings(want, cell.presentSig());
-        try std.testing.expectEqual(try invalidates(step, "present"), cell.presentVersion() != pre);
+        defer exp.finish() catch @panic("conformance assertion-key check failed");
+        try exp.assertKeyWith("present", cell.presentSig(), struct {
+            fn check(actual: []const u8, present: json.Value) !void {
+                const want = try expectedPresentSig(std.testing.allocator, present);
+                defer std.testing.allocator.free(want);
+                try std.testing.expectEqualStrings(want, actual);
+            }
+        }.check);
+        try cj.assertInvalidates(&exp, "present", cell.presentVersion() != pre);
     }
 }

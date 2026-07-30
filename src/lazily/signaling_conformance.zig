@@ -271,14 +271,16 @@ test "signaling conformance: anti_spoof_session.json" {
         "signaling/anti_spoof_session.json assertions",
         try cj.required(fixture, "assertions"),
     );
-    const want_excludes_self = try assertions.boolOr("roster_excludes_self", false);
-    const want_sorted = try assertions.boolOr("roster_sorted_ascending", false);
-    const want_server_from = try assertions.boolOr("forwarded_from_is_server_registered", false);
-    // The per-frame blocks in `frames.json` already refuse an unrecognised key;
-    // this fixture-level block did not (#lzassertunknownkeys).
-    try assertions.finish();
+    // These three used to be read as GATES — `if (want_excludes_self) { ... }`
+    // — so flipping any of them to `false` in the corpus deleted the check and
+    // the suite stayed green. Now the invariant is observed unconditionally and
+    // the fixture's own claim is asserted against what was observed
+    // (#lzconsumednotasserted).
     var rosters_seen: usize = 0;
     var forwards_seen: usize = 0;
+    var saw_self_in_roster = false;
+    var saw_unsorted_roster = false;
+    var saw_foreign_from = false;
 
     for (steps, 0..) |step, si| {
         const input = try cj.required(step, "input");
@@ -327,41 +329,48 @@ test "signaling conformance: anti_spoof_session.json" {
 
             switch (got.frame) {
                 .welcome => |w| {
-                    if (want_excludes_self) {
-                        for (w.peers) |p| try testing.expect(p != w.peer);
+                    for (w.peers) |p| {
+                        if (p == w.peer) saw_self_in_roster = true;
                     }
-                    if (want_sorted) {
-                        var prev: ?ipc.PeerId = null;
-                        for (w.peers) |p| {
-                            if (prev) |q| try testing.expect(q < p);
-                            prev = p;
+                    var prev: ?ipc.PeerId = null;
+                    for (w.peers) |p| {
+                        if (prev) |q| {
+                            if (q >= p) saw_unsorted_roster = true;
                         }
+                        prev = p;
                     }
                     rosters_seen += 1;
                 },
                 .offer, .answer, .ice, .relay => {
-                    if (want_server_from) {
-                        const from = switch (got.frame) {
-                            .offer, .answer => |s| s.from,
-                            .ice => |i| i.from,
-                            .relay => |r| r.from,
-                            else => unreachable,
-                        };
-                        // The load-bearing invariant: `from` is the SENDER's
-                        // server-registered peer id, not anything in `recv`.
-                        try testing.expectEqual(registered_peer.?, from);
-                        forwards_seen += 1;
+                    const from = switch (got.frame) {
+                        .offer, .answer => |sig| sig.from,
+                        .ice => |i| i.from,
+                        .relay => |r| r.from,
+                        else => unreachable,
+                    };
+                    // The load-bearing invariant: `from` is the SENDER's
+                    // server-registered peer id, not anything in `recv`.
+                    if (registered_peer == null or registered_peer.? != from) {
+                        saw_foreign_from = true;
                     }
+                    forwards_seen += 1;
                 },
                 else => {},
             }
         }
     }
 
-    // The two claims above are only meaningful if the transcript actually
+    // The three claims above are only meaningful if the transcript actually
     // produced frames of each kind.
     try testing.expect(rosters_seen > 0);
     try testing.expect(forwards_seen > 0);
+
+    try assertions.assertKey("roster_excludes_self", !saw_self_in_roster);
+    try assertions.assertKey("roster_sorted_ascending", !saw_unsorted_roster);
+    try assertions.assertKey("forwarded_from_is_server_registered", !saw_foreign_from);
+    // The per-frame blocks in `frames.json` already refuse an unrecognised key;
+    // this fixture-level block did not (#lzassertunknownkeys).
+    try assertions.finish();
 
     const rejects = try cj.asArray(try cj.required(fixture, "rejects"));
     for (rejects) |reject| {
