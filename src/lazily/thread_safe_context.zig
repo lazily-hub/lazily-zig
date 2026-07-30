@@ -488,6 +488,21 @@ pub const ThreadSafeContext = struct {
         return n.deps.items.len;
     }
 
+    /// Whether `id`'s cached value is still current: `false` from the moment an
+    /// upstream write marks it dirty until the next read recomputes it.
+    ///
+    /// The cache-validity probe a conformance runner asserts an `invalidates`
+    /// matrix through, in BOTH directions — a step expecting `false` must fail if
+    /// the shell invalidated anyway, and only the graph can answer that. Sibling
+    /// of `dependentCount`/`isDisposed`: introspection, not a read (it never
+    /// recomputes, which is the whole point).
+    pub fn isCacheValid(self: *Self, id: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const node = self.nodes.getPtr(id) orelse return false;
+        return !node.dirty and !node.disposed;
+    }
+
     pub fn isDisposed(self: *Self, id: u64) bool {
         self.mutex.lock();
         defer self.mutex.unlock();

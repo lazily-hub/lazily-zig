@@ -618,6 +618,20 @@ pub fn AsyncContext(comptime V: type) type {
             return list.items.len;
         }
 
+        /// Whether `id`'s computed value is currently resolved: `false` from the
+        /// moment an upstream write supersedes it until the next settle
+        /// republishes it.
+        ///
+        /// The cache-validity probe a conformance runner asserts an `invalidates`
+        /// matrix through, in BOTH directions — a step expecting `false` must fail
+        /// if the shell invalidated anyway, and only the graph can answer that.
+        /// Introspection, never a read: it does not settle, which is the point.
+        pub fn isCacheValid(self: *Self, id: u64) bool {
+            const node = self.slots.getPtr(id) orelse return false;
+            if (node.disposed) return false;
+            return node.state == .resolved;
+        }
+
         pub fn isDisposed(self: *Self, id: u64) bool {
             if (self.slots.getPtr(id)) |n| return n.disposed;
             return self.disposed_cells.contains(id);

@@ -153,6 +153,39 @@ pub const WorkQueueDeadLetterReason = work_queue.WorkQueueDeadLetterReason;
 pub const WorkQueueError = work_queue.WorkQueueError;
 pub const WorkQueueVersions = work_queue.WorkQueueVersions;
 
+// The transport-agnostic reactive ingress family (`#designimplementtransport`).
+// `ingress_core` is the graph-agnostic admission algebra; the three shells own
+// the graph and clear exactly the reader-kind set the core reports.
+pub const ingress_core = @import("./lazily/ingress_core.zig");
+pub const IngressCore = ingress_core.IngressCore;
+pub const IngressAdmission = ingress_core.IngressAdmission;
+pub const IngressAuthority = ingress_core.IngressAuthority;
+pub const IngressConfigError = ingress_core.IngressConfigError;
+pub const IngressDropReason = ingress_core.IngressDropReason;
+pub const IngressEnvelope = ingress_core.IngressEnvelope;
+pub const IngressError = ingress_core.IngressError;
+pub const IngressLifecycle = ingress_core.IngressLifecycle;
+pub const IngressPolicy = ingress_core.IngressPolicy;
+pub const IngressReadiness = ingress_core.IngressReadiness;
+pub const IngressReceipt = ingress_core.IngressReceipt;
+pub const IngressReceiptChannel = ingress_core.IngressReceiptChannel;
+pub const IngressReceiptOutcome = ingress_core.IngressReceiptOutcome;
+pub const IngressRetry = ingress_core.IngressRetry;
+pub const IngressSchedule = ingress_core.IngressSchedule;
+pub const IngressScopeChange = ingress_core.IngressScopeChange;
+pub const IngressScopeView = ingress_core.ScopeView;
+pub const IngressTransportKind = ingress_core.IngressTransportKind;
+pub const ReplayRequest = ingress_core.ReplayRequest;
+pub const ingress = @import("./lazily/ingress.zig");
+pub const IngressCell = ingress.IngressCell;
+pub const IngressScopeVersions = ingress.IngressScopeVersions;
+pub const thread_safe_ingress = @import("./lazily/thread_safe_ingress.zig");
+pub const ThreadSafeIngressCell = thread_safe_ingress.ThreadSafeIngressCell;
+pub const async_ingress = @import("./lazily/async_ingress.zig");
+pub const AsyncIngressCell = async_ingress.AsyncIngressCell;
+pub const AsyncIngressRead = async_ingress.AsyncIngressRead;
+pub const ingress_family_conformance = @import("./lazily/ingress_family_conformance.zig");
+
 // #lztime temporal source primitives (TimerCell/IntervalCell/CronCell/DeadlineCell).
 pub const temporal = @import("./lazily/temporal.zig");
 pub const ManualClock = temporal.ManualClock;
