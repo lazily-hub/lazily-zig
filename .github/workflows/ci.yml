@@ -23,14 +23,18 @@ jobs:
   # that. Version-sensitive reflection belongs behind a `@hasField` shim so one
   # tree satisfies both; see `normalizeCompute` in src/lazily/context.zig.
   #
-  # 0.15.2 stays non-gating: the tree does not compile there at all
-  # (`std.testing.io` in reliable_sync.zig, a comptime dependency loop in
-  # cell.zig). That is pre-existing and tracked separately; the job is kept so
-  # the gap stays visible rather than being silently dropped.
+  # 0.15.2 is gating again (#lzzig0152). It had been non-gating because the tree
+  # did not compile there at all, and a job that cannot fail is indistinguishable
+  # from a job that passes — the same shape as a suite reporting green while
+  # testing nothing. All four faults are fixed: the graph lock is one reentrant
+  # lock on every toolchain (the split had left 0.15 with a NON-reentrant mutex
+  # the engine cannot use), plus a `build.zig` env-field rename, a comptime
+  # dependency loop from a field naming a container decl, and a nested error
+  # union 0.15.2 will not coerce. `std.Io` genuinely does not exist there, so
+  # `FileOutboxStore`'s two tests skip visibly; nothing else is downgraded.
   test:
     name: Zig ${{ matrix.zig }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.zig == '0.15.2' }}
     strategy:
       fail-fast: false
       matrix:
