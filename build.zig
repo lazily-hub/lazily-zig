@@ -1,6 +1,24 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+/// Read a process environment variable from the build graph, across every
+/// pinned toolchain.
+///
+/// `std.Build.Graph` spells this field `env_map` on 0.15.x and `environ_map`
+/// from 0.16 onward, so naming either one directly makes `build.zig` itself
+/// fail to compile on the other. `std.process.getEnvVarOwned` is NOT the
+/// portable escape hatch — it is absent on 0.16/master, so reaching for it
+/// trades one red toolchain for two. Ask the compiler which field this
+/// toolchain declares instead: the condition is comptime-known, so only the
+/// matching branch is ever analyzed.
+fn buildEnvVar(b: *std.Build, name: []const u8) ?[]const u8 {
+    if (comptime @hasField(std.Build.Graph, "environ_map")) {
+        return b.graph.environ_map.get(name);
+    } else {
+        return b.graph.env_map.get(name);
+    }
+}
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -222,7 +240,7 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "conformance-manifest",
         "Absolute runtime conformance evidence path",
-    ) orelse b.graph.environ_map.get("LAZILY_CONFORMANCE_MANIFEST");
+    ) orelse buildEnvVar(b, "LAZILY_CONFORMANCE_MANIFEST");
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to

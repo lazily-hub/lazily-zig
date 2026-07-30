@@ -303,11 +303,27 @@ pub const ShmBackend = struct {
         };
     }
 
+    /// `mmap`'s `prot` argument is a plain `u32` bitmask on 0.15.x and a packed
+    /// struct of named bits from 0.16 onward (#lzzig0152). Naming either form
+    /// directly makes this file fail to compile on the other toolchain.
+    ///
+    /// Reflecting on `mmap`'s signature is NOT the portable dodge — `Type.Fn`
+    /// spells its parameter list `params` on 0.16 and `param_types` on master,
+    /// so the reflection needs the same version gate the argument did. Gate the
+    /// argument, and gate it in argument position: mmap's parameter supplies the
+    /// result type, so the struct literal still infers, and the condition is
+    /// comptime-known so only the matching branch is ever analyzed.
+    const legacy_mmap_prot_bitmask =
+        builtin.zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) == .lt;
+
     fn mapShared(fd: std.posix.fd_t, len: usize) ShmBackendError![]align(std.heap.page_size_min) u8 {
         return std.posix.mmap(
             null,
             len,
-            .{ .READ = true, .WRITE = true },
+            if (comptime legacy_mmap_prot_bitmask)
+                std.posix.PROT.READ | std.posix.PROT.WRITE
+            else
+                .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd,
             0,

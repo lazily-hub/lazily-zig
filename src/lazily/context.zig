@@ -5,9 +5,8 @@ const FfiResult = @import("ffi.zig").FfiResult;
 const AllocatorMode = @import("ffi.zig").AllocatorMode;
 const AllocatorHandle = @import("ffi.zig").AllocatorHandle;
 
-/// Version-agnostic graph mutex:
-/// - Zig < 0.16 uses `std.Thread.Mutex`.
-/// - Zig >= 0.16 uses `ReentrantMutex` (`parking_mutex.zig`, `#lzparkingmutex`)
+/// The graph mutex — one lock on EVERY pinned toolchain, no version split.
+/// - `ReentrantMutex` (`parking_mutex.zig`, `#lzparkingmutex`)
 ///   — a `ParkingMutex` (Linux futex) wrapped with owner-thread tracking so
 ///   the same thread can re-acquire the lock without deadlock. Reentrancy is
 ///   required because `Slot.initKeyed` calls user `valueFn` which re-enters
@@ -16,10 +15,15 @@ const AllocatorHandle = @import("ffi.zig").AllocatorHandle;
 ///   opened a use-after-free race (`#lzuafix`: concurrent `emitChange` freed a
 ///   slot mid-materialization). Holding the lock across subscribe → valueFn →
 ///   cache-put closes the window.
-const GraphMutex = if (builtin.zig_version.minor < 16)
-    std.Thread.Mutex
-else
-    @import("parking_mutex.zig").ReentrantMutex;
+///
+/// This used to be version-split, `std.Thread.Mutex` below 0.16 because 0.16
+/// removed it. The split was backwards (#lzzig0152): reentrancy arrived with
+/// the vendored lock, so the 0.15 arm kept a NON-reentrant mutex and deadlocked
+/// the moment a `valueFn` touched a second cell. 0.15.2's `std.Thread.Mutex`
+/// detects that re-acquire and panics "Deadlock detected"; the newer toolchains
+/// never ran the non-reentrant path at all, so no green job could see it. The
+/// vendored lock compiles on 0.15.2 as-is, so there is nothing left to gate.
+const GraphMutex = @import("parking_mutex.zig").ReentrantMutex;
 
 /// Opaque identifier for a `Slot` living in a `SlotArena`. `raw = 0` is the
 /// null id (page 0, slot 0 is never handed out — `SlotArena.next_id` starts at
@@ -2349,9 +2353,24 @@ pub const Compute = struct {
         };
     }
 
+    /// The result type of `tryGet`.
+    ///
+    /// `handle.get()` may itself return an error union — a `TopicCell.Reader`
+    /// read does. Spelling the result `error{StaleCompute}!@TypeOf(handle.get())`
+    /// then asks for a *nested* error union, and 0.15.2 refuses to coerce a plain
+    /// `E!P` into one (#lzzig0152) while later toolchains happen to accept it.
+    /// Merging the error sets yields one flat union with the same reachable
+    /// errors, which every pinned toolchain accepts.
+    fn TryGetResult(comptime R: type) type {
+        return switch (@typeInfo(R)) {
+            .error_union => |eu| (eu.error_set || error{StaleCompute})!eu.payload,
+            else => error{StaleCompute}!R,
+        };
+    }
+
     /// The checked tracked read. Registers the edge only when the view is still
     /// live; otherwise returns `error.StaleCompute` without touching the graph.
-    pub fn tryGet(self: *const Compute, handle: anytype) error{StaleCompute}!@TypeOf(handle.get()) {
+    pub fn tryGet(self: *const Compute, handle: anytype) TryGetResult(@TypeOf(handle.get())) {
         if (!self.alive()) return error.StaleCompute;
         // Read first (naturally untracked — there is no ambient tracking
         // surface), then register the edge explicitly against the node by value.

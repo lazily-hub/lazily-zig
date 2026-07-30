@@ -47,14 +47,20 @@ test "0.15:lazily/cell.cell: thread_safe slot contention" {
     const num_threads = 8;
     var threads: [num_threads]std.Thread = undefined;
 
-    // Spawn multiple threads all trying to get the same slot at once
-    for (0..num_threads) |i| {
-        threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(c: *Context, f: *const fn (*Context) anyerror!i32) void {
-                const val = slot(i32, c, f, null) catch unreachable;
+    // Spawn multiple threads all trying to get the same slot at once.
+    //
+    // `slot`'s `valueFn` parameter is `comptime`, so the racing closure has to be
+    // named at comptime inside `run`. Threading it in as a runtime
+    // `*const fn (*Context) anyerror!i32` argument cannot work — a thread
+    // argument is never comptime-known — and that is why this module had never
+    // compiled: it only builds on 0.15, so no green job ever analyzed it.
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, struct {
+            fn run(c: *Context) void {
+                const val = slot(i32, c, valueFn.call, null) catch unreachable;
                 std.testing.expectEqual(@as(i32, 42), val.*) catch @panic("Value mismatch");
             }
-        }.run, .{ ctx, valueFn.call });
+        }.run, .{ctx});
     }
 
     for (threads) |t| t.join();

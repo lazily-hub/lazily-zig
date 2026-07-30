@@ -28,6 +28,19 @@
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
+/// Whether this toolchain has the `std.Io` interface the file-backed outbox store
+/// is written against.
+///
+/// 0.15.2's `std.Io` is only the Reader/Writer namespaces — there is no `Io`
+/// value to hand `FileOutboxStore.init`, and no `std.testing.io` to build one
+/// from. So on 0.15.2 the file store is *unbuildable*, not merely untested, and
+/// its two tests skip visibly (#lzzig0152) instead of the whole job failing to
+/// compile. Everything else in this file — `InMemoryStore`, `StoredOutbox`, the
+/// `ResyncCoordinator`, and every canonical fixture replay — runs on all three
+/// pinned toolchains, so the skip is two tests wide and named, not a silent
+/// downgrade of the family.
+const has_std_io_interface = @hasDecl(std.testing, "io");
+
 const Delta = ipc.Delta;
 const IpcMessage = ipc.IpcMessage;
 const WireStamp = ipc.WireStamp;
@@ -605,6 +618,7 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
 }
 
 test "FileOutboxStore survives restart and rejects stale cursor regression" {
+    if (comptime !has_std_io_interface) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -637,6 +651,7 @@ test "FileOutboxStore survives restart and rejects stale cursor regression" {
 }
 
 test "StoredOutbox replays canonical stale-handle cursor serialization" {
+    if (comptime !has_std_io_interface) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture_outbox_store, .{});
     defer parsed.deinit();

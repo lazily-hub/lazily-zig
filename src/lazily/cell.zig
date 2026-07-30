@@ -120,7 +120,14 @@ fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type
         // computed cells read from their backing `Slot`, so carry no value here.
         // `@sizeOf(Source(i32)) == 32` is asserted below and must not grow.
         value: if (is_source) T else void,
-        deinitCellValue: if (is_source) ?DeinitFn else void,
+        // Spelled inline rather than as `?DeinitFn` on purpose (#lzzig0152).
+        // Naming the container decl here makes resolving this struct's fields
+        // depend on resolving `DeinitFn`, which the 0.15.2 compiler reports as
+        // "dependency loop detected" at the decl. Writing the pointer type out
+        // is the same type with no decl edge, and it compiles on all three
+        // pinned toolchains. `DeinitFn` stays as the public spelling for
+        // parameters, where no field-layout resolution is in play.
+        deinitCellValue: if (is_source) ?*const fn (*Self) void else void,
 
         pub const MissingCurrentSlotError = error{MissingCurrentSlot};
 
