@@ -105,6 +105,7 @@ pub const compute_fortification_test = @import("./lazily/compute_fortification.z
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const keyed_order = @import("./lazily/keyed_order.zig");
 pub const collections_family_conformance = @import("./lazily/collections_family_conformance.zig");
+pub const queue_family_conformance = @import("./lazily/queue_family_conformance.zig");
 // Canonical replays for the fixtures this binding used to assert with inline
 // mirrors (`#lazilyzigconformance`). Referenced here so `refAllDecls` pulls
 // their tests into the root test binary.
