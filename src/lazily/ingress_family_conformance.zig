@@ -110,15 +110,30 @@ const ChannelIndex = enum(usize) { accepted = 0, dropped = 1, err = 2 };
 /// hand-written list — is what keeps the corpus keys and the probe slots from
 /// drifting apart, and the comptime block below pins the one assumption that makes
 /// the slot index sound.
-const kind_names = @typeInfo(Kind).@"enum".field_names;
-const channel_names = @typeInfo(ChannelIndex).@"enum".field_names;
+/// Reflected through `std.enums.values` + `@tagName` rather than through
+/// `@typeInfo(E).@"enum"`: that struct's shape moved between the toolchains this
+/// repo's CI matrix pins — 0.16.0 exposes `fields`, master exposes `field_names` /
+/// `field_values`, and neither exposes the other. `values`/`@tagName` are stable
+/// across all three, so the corpus keys stay reflection-derived without pinning
+/// the suite to one compiler.
+fn tagNames(comptime E: type) [std.enums.values(E).len][:0]const u8 {
+    comptime {
+        const vals = std.enums.values(E);
+        var out: [vals.len][:0]const u8 = undefined;
+        for (vals, 0..) |e, i| out[i] = @tagName(e);
+        return out;
+    }
+}
+
+const kind_names = tagNames(Kind);
+const channel_names = tagNames(ChannelIndex);
 
 comptime {
-    for (@typeInfo(Kind).@"enum".field_values, 0..) |v, i| {
-        if (v != i) @compileError("Kind values must equal their declaration index");
+    for (std.enums.values(Kind), 0..) |e, i| {
+        if (@intFromEnum(e) != i) @compileError("Kind values must equal their declaration index");
     }
-    for (@typeInfo(ChannelIndex).@"enum".field_values, 0..) |v, i| {
-        if (v != i) @compileError("ChannelIndex values must equal their declaration index");
+    for (std.enums.values(ChannelIndex), 0..) |e, i| {
+        if (@intFromEnum(e) != i) @compileError("ChannelIndex values must equal their declaration index");
     }
 }
 
