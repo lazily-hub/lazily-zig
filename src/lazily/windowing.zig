@@ -21,6 +21,7 @@
 //! calls `policy.merge(old, op)`.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 const merge = @import("merge.zig");
@@ -491,8 +492,11 @@ test "windowing conformance: tumbling_count" {
         const emit = w.push(v);
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try optI64(try jsonFieldRequired(exp, "output")), w.output());
+        var exp = cj.AssertionKeys.init(
+            "windowing expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
         try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
     }
 }
@@ -522,8 +526,11 @@ test "windowing conformance: tumbling_time" {
         }
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try optI64(try jsonFieldRequired(exp, "output")), w.output());
+        var exp = cj.AssertionKeys.init(
+            "windowing expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
         try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
     }
 }
@@ -549,8 +556,11 @@ test "windowing conformance: sliding_count" {
         const emit = try w.push(v);
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try optI64(try jsonFieldRequired(exp, "output")), w.output());
+        var exp = cj.AssertionKeys.init(
+            "windowing expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
         try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
     }
 }
@@ -580,8 +590,11 @@ test "windowing conformance: session" {
         }
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try optI64(try jsonFieldRequired(exp, "output")), w.output());
+        var exp = cj.AssertionKeys.init(
+            "windowing expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try optI64(try exp.required("output")), w.output());
         try std.testing.expectEqual(try invalidates(step, "output"), w.outputVersion() != pre);
     }
 }

@@ -97,12 +97,15 @@ test "distributed conformance: anti_entropy_converge.json" {
     var ops_replayed: usize = 0;
     for (scenarios) |scenario| {
         const name = try cj.asStr(try cj.required(scenario, "name"));
-        const expect = try cj.required(scenario, "expect");
+        var expect = cj.AssertionKeys.init(
+            "distributed/anti_entropy_converge.json expect",
+            try cj.required(scenario, "expect"),
+        );
 
         // This fixture pins the LWW-at-plane model: the greatest WireStamp
         // wins. A corpus that grew a second resolution would silently be
         // replayed against the wrong engine here.
-        try testing.expectEqualStrings("max_stamp", try cj.asStr(try cj.required(expect, "resolution")));
+        try testing.expectEqualStrings("max_stamp", try cj.asStr(try expect.required("resolution")));
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -113,18 +116,26 @@ test "distributed conformance: anti_entropy_converge.json" {
         defer rt.deinit();
 
         const applied = try rt.ingest(ipc.CrdtSync.init(&.{}, ops), 0);
-        try testing.expectEqual(try cj.asUsize(try cj.required(expect, "applied_count")), applied);
-        try expectConverged(&rt, try cj.arrayOr(expect, "converged"), name);
+        try testing.expectEqual(try cj.asUsize(try expect.required("applied_count")), applied);
+        try expectConverged(&rt, try expect.arrayOr("converged"), name);
         ops_replayed += ops.len;
+        // `redeliver_applied_count` and `order_independent` are only read on the
+        // scenarios that opt into those runs, so declare them here: the guard
+        // must refuse a key nothing evaluates, not a key this scenario has no
+        // run to evaluate it against.
+        if (!try cj.boolOr(scenario, "redeliver", false))
+            expect.consume(&.{"redeliver_applied_count"});
+        if (!try cj.boolOr(scenario, "reverse_order_equivalent", false))
+            expect.consume(&.{"order_independent"});
 
         if (try cj.boolOr(scenario, "redeliver", false)) {
             const again = try rt.ingest(ipc.CrdtSync.init(&.{}, ops), 0);
             try testing.expectEqual(
-                try cj.asUsize(try cj.required(expect, "redeliver_applied_count")),
+                try cj.asUsize(try expect.required("redeliver_applied_count")),
                 again,
             );
             // Idempotence is about the state too, not just the counter.
-            try expectConverged(&rt, try cj.arrayOr(expect, "converged"), name);
+            try expectConverged(&rt, try expect.arrayOr("converged"), name);
         }
 
         if (try cj.boolOr(scenario, "reverse_order_equivalent", false)) {
@@ -135,9 +146,10 @@ test "distributed conformance: anti_entropy_converge.json" {
             defer rev_rt.deinit();
             const rev_applied = try rev_rt.ingest(ipc.CrdtSync.init(&.{}, reversed), 0);
             try testing.expectEqual(applied, rev_applied);
-            try expectConverged(&rev_rt, try cj.arrayOr(expect, "converged"), name);
-            try testing.expect(try cj.boolOr(expect, "order_independent", true));
+            try expectConverged(&rev_rt, try expect.arrayOr("converged"), name);
+            try testing.expect(try expect.boolOr("order_independent", true));
         }
+        try expect.finish();
     }
     try testing.expect(ops_replayed > 0);
 }

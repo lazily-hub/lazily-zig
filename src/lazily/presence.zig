@@ -25,6 +25,7 @@
 //! Rust reference.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 
@@ -460,8 +461,11 @@ test "presence conformance: ephemeral" {
             cell.tick(now);
         } else return error.UnknownOp;
 
-        const exp = try jsonFieldRequired(step, "expected");
-        switch (try jsonFieldRequired(exp, "value")) {
+        var exp = cj.AssertionKeys.init(
+            "presence expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        switch (try exp.required("value")) {
             .null => try std.testing.expect(cell.value() == null),
             else => |v| try std.testing.expectEqualStrings(try jsonAsString(v), cell.value().?),
         }
@@ -498,8 +502,11 @@ test "presence conformance: presence" {
             try cell.tick(now);
         } else return error.UnknownOp;
 
-        const exp = try jsonFieldRequired(step, "expected");
-        const want = try expectedPresentSig(std.testing.allocator, try jsonFieldRequired(exp, "present"));
+        var exp = cj.AssertionKeys.init(
+            "presence expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        const want = try expectedPresentSig(std.testing.allocator, try exp.required("present"));
         defer std.testing.allocator.free(want);
         try std.testing.expectEqualStrings(want, cell.presentSig());
         try std.testing.expectEqual(try invalidates(step, "present"), cell.presentVersion() != pre);
@@ -532,8 +539,11 @@ test "presence conformance: awareness" {
             try cell.tick(now);
         } else return error.UnknownOp;
 
-        const exp = try jsonFieldRequired(step, "expected");
-        const want = try expectedPresentSig(std.testing.allocator, try jsonFieldRequired(exp, "present"));
+        var exp = cj.AssertionKeys.init(
+            "presence expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        const want = try expectedPresentSig(std.testing.allocator, try exp.required("present"));
         defer std.testing.allocator.free(want);
         try std.testing.expectEqualStrings(want, cell.presentSig());
         try std.testing.expectEqual(try invalidates(step, "present"), cell.presentVersion() != pre);

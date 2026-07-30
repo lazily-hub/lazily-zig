@@ -437,32 +437,32 @@ fn expectEqualOptStr(where: Str, want: ?Str, got: ?Str) !void {
     try testing.expectEqualStrings(want.?, got.?);
 }
 
-fn assertQueueState(model: anytype, expected: Value, where: Str) !void {
+fn assertQueueState(model: anytype, expected: *cj.AssertionKeys, where: Str) !void {
     errdefer std.debug.print("queue state mismatch at {s}\n", .{where});
 
-    if (cj.field(expected, "elements")) |node| {
+    if (expected.field("elements")) |node| {
         const want = try cj.asArray(node);
         const got = model.elements();
         try testing.expectEqual(want.len, got.len);
         for (want, got) |w, g| try testing.expectEqualStrings(try cj.asStr(w), g);
     }
-    if (cj.field(expected, "head")) |node| {
+    if (expected.field("head")) |node| {
         const want: ?Str = switch (node) {
             .null => null,
             else => try cj.asStr(node),
         };
         try expectEqualOptStr(where, want, try model.head());
     }
-    if (cj.field(expected, "len")) |node| {
+    if (expected.field("len")) |node| {
         try testing.expectEqual(try cj.asUsize(node), try model.len());
     }
-    if (cj.field(expected, "is_empty")) |node| {
+    if (expected.field("is_empty")) |node| {
         try testing.expectEqual(try cj.asBool(node), try model.isEmpty());
     }
-    if (cj.field(expected, "is_full")) |node| {
+    if (expected.field("is_full")) |node| {
         try testing.expectEqual(try cj.asBool(node), try model.isFull());
     }
-    if (cj.field(expected, "closed")) |node| {
+    if (expected.field("closed")) |node| {
         try testing.expectEqual(try cj.asBool(node), try model.isClosed());
     }
 }
@@ -533,7 +533,11 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
-        const expected = cj.field(step, "expected") orelse Value.null;
+        var expected = cj.AssertionKeys.init(
+            "queue-family QueueCell expected",
+            cj.field(step, "expected") orelse Value.null,
+        );
+        defer expected.finish() catch @panic("unconsumed conformance assertion key");
 
         var where_buf: [192]u8 = undefined;
         const where = try std.fmt.bufPrint(&where_buf, "{s}/{s} step {d} ({s})", .{
@@ -568,7 +572,7 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
             return error.UnknownOpType;
         }
 
-        try assertQueueState(model, expected, where);
+        try assertQueueState(model, &expected, where);
 
         if (cj.field(step, "returns")) |want| {
             errdefer std.debug.print("returns mismatch at {s}\n", .{where});
@@ -582,7 +586,7 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         counts.flags += try assertQueueInvalidation(
             before,
             after,
-            cj.field(expected, "invalidates"),
+            expected.field("invalidates"),
             where,
         );
         counts.steps += 1;
@@ -877,15 +881,15 @@ fn collectSubscriberIds(
     }
 }
 
-fn assertTopicState(model: anytype, expected: Value, where: Str) !void {
+fn assertTopicState(model: anytype, expected: *cj.AssertionKeys, where: Str) !void {
     errdefer std.debug.print("topic state mismatch at {s}\n", .{where});
 
     try testing.expectEqual(
-        try cj.asUsize(try cj.required(expected, "base_offset")),
+        try cj.asUsize(try expected.required("base_offset")),
         model.baseOffset(),
     );
 
-    const want_elements = try cj.arrayOr(expected, "elements");
+    const want_elements = try expected.arrayOr("elements");
     const got_elements = model.items();
     try testing.expectEqual(want_elements.len, got_elements.len);
     for (want_elements, got_elements) |want, got| {
@@ -896,7 +900,7 @@ fn assertTopicState(model: anytype, expected: Value, where: Str) !void {
     // REMOVE an ephemeral subscription is only observable if a surviving extra
     // entry fails, so the count is part of the claim.
     var want_count: usize = 0;
-    if (cj.field(expected, "subscriptions")) |node| {
+    if (expected.field("subscriptions")) |node| {
         switch (node) {
             .object => |object| {
                 var it = object.iterator();
@@ -933,7 +937,7 @@ fn assertTopicState(model: anytype, expected: Value, where: Str) !void {
     // `reads` is the cursor's retained tail per subscriber. Asserted twice: the
     // whole suffix non-reactively, and its head THROUGH THE REACTIVE READER — a
     // shell that under-invalidated fails on the second even when the first agrees.
-    if (cj.field(expected, "reads")) |node| {
+    if (expected.field("reads")) |node| {
         switch (node) {
             .object => |object| {
                 var it = object.iterator();
@@ -1016,7 +1020,9 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
-        const expected = try cj.required(step, "expected");
+        var expected = cj.AssertionKeys.init(
+            "queue-family expected", try cj.required(step, "expected"));
+        defer expected.finish() catch @panic("unconsumed conformance assertion key");
 
         var where_buf: [192]u8 = undefined;
         const where = try std.fmt.bufPrint(&where_buf, "{s}/{s} step {d} ({s})", .{
@@ -1069,7 +1075,7 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
             return error.UnknownOpType;
         }
 
-        try assertTopicState(model, expected, where);
+        try assertTopicState(model, &expected, where);
 
         if (cj.field(step, "returns")) |want| {
             errdefer std.debug.print("returns mismatch at {s}\n", .{where});
@@ -1081,7 +1087,7 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
         }
 
         // The reader-kind claim, both directions, per subscriber.
-        if (cj.field(expected, "invalidates")) |node| {
+        if (expected.field("invalidates")) |node| {
             switch (node) {
                 .object => |object| {
                     var it = object.iterator();
@@ -1361,10 +1367,10 @@ const AsyncWorkQueueModel = struct {
 
 // --- the work-queue replay -------------------------------------------------
 
-fn assertWorkQueueState(model: anytype, expected: Value, where: Str) !void {
+fn assertWorkQueueState(model: anytype, expected: *cj.AssertionKeys, where: Str) !void {
     errdefer std.debug.print("work-queue state mismatch at {s}\n", .{where});
 
-    const want_pending = try cj.arrayOr(expected, "pending");
+    const want_pending = try expected.arrayOr("pending");
     const got_pending = model.pendingItems();
     try testing.expectEqual(want_pending.len, got_pending.len);
     for (want_pending, got_pending) |want, got| {
@@ -1377,7 +1383,7 @@ fn assertWorkQueueState(model: anytype, expected: Value, where: Str) !void {
     // fixture's array order is not this binding's order. Match by delivery id and
     // assert the count, which pins the same set without inventing an ordering the
     // primitive does not promise.
-    const want_in_flight = try cj.arrayOr(expected, "in_flight");
+    const want_in_flight = try expected.arrayOr("in_flight");
     const got_in_flight = try model.inFlightDeliveries(testing.allocator);
     defer testing.allocator.free(got_in_flight);
     try testing.expectEqual(want_in_flight.len, got_in_flight.len);
@@ -1399,7 +1405,7 @@ fn assertWorkQueueState(model: anytype, expected: Value, where: Str) !void {
         try testing.expectEqual(try cj.asU64(try cj.required(want, "deadline")), found.deadline);
     }
 
-    const want_dead = try cj.arrayOr(expected, "dead_letters");
+    const want_dead = try expected.arrayOr("dead_letters");
     const got_dead = model.deadLetterItems();
     try testing.expectEqual(want_dead.len, got_dead.len);
     for (want_dead, got_dead) |want, got| {
@@ -1417,7 +1423,7 @@ fn assertWorkQueueState(model: anytype, expected: Value, where: Str) !void {
     // `reads` are the four reader kinds. Reading them here (not only their version
     // counters) is what makes the invalidation matrix a claim about an observable
     // value rather than about a counter that happens to move.
-    if (cj.field(expected, "reads")) |reads| {
+    if (expected.field("reads")) |reads| {
         try testing.expectEqual(
             try cj.asUsize(try cj.required(reads, "pending_len")),
             try model.pendingLen(),
@@ -1496,7 +1502,9 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
-        const expected = try cj.required(step, "expected");
+        var expected = cj.AssertionKeys.init(
+            "queue-family expected", try cj.required(step, "expected"));
+        defer expected.finish() catch @panic("unconsumed conformance assertion key");
 
         var where_buf: [192]u8 = undefined;
         const where = try std.fmt.bufPrint(&where_buf, "{s}/{s} step {d} ({s})", .{
@@ -1540,7 +1548,7 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
             return error.UnknownOpType;
         }
 
-        try assertWorkQueueState(model, expected, where);
+        try assertWorkQueueState(model, &expected, where);
 
         if (cj.field(step, "returns")) |want| {
             errdefer std.debug.print("returns mismatch at {s}\n", .{where});
@@ -1589,7 +1597,7 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         counts.flags += try assertWorkQueueInvalidation(
             before,
             after,
-            try cj.required(expected, "invalidates"),
+            try expected.required("invalidates"),
             where,
         );
         counts.steps += 1;

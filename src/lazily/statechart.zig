@@ -19,6 +19,7 @@
 //! constraint as `StateMachine(S, E)`).
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 const cell = @import("cell.zig").source;
@@ -808,25 +809,30 @@ fn runFixture(bytes: []const u8) !void {
     };
 
     for (steps.items) |step| {
-        const event = step.object.get("event").?.string;
+        // Every key this fixture's step carries has to be claimed by one of the
+        // arms below; a step key the corpus adds would otherwise be replayed and
+        // silently skipped (#lzassertunknownkeys).
+        var keys = cj.AssertionKeys.init("statechart step", step);
+        defer keys.finish() catch @panic("unconsumed conformance assertion key");
+        const event = (keys.field("event") orelse return error.FixtureStepMissingEvent).string;
         var guards = std.StringHashMap(bool).init(ta);
-        if (step.object.get("guards")) |gv| {
+        if (keys.field("guards")) |gv| {
             var it = gv.object.iterator();
             while (it.next()) |e| try guards.put(e.key_ptr.*, e.value_ptr.bool);
         }
 
         const accepted = sc.send(event, &guards);
-        try std.testing.expectEqual(step.object.get("accepted").?.bool, accepted);
+        try std.testing.expectEqual((keys.field("accepted") orelse return error.FixtureStepMissingAccepted).bool, accepted);
 
-        try assertActive(ta, sc, step.object.get("active") orelse return error.FixtureStepMissingActive);
+        try assertActive(ta, sc, keys.field("active") orelse return error.FixtureStepMissingActive);
 
-        if (step.object.get("matches")) |mv| {
+        if (keys.field("matches")) |mv| {
             var mit = mv.object.iterator();
             while (mit.next()) |e| {
                 try std.testing.expectEqual(e.value_ptr.bool, sc.matches(e.key_ptr.*));
             }
         }
-        if (step.object.get("actions")) |av| try assertActions(sc, av);
+        if (keys.field("actions")) |av| try assertActions(sc, av);
     }
 }
 

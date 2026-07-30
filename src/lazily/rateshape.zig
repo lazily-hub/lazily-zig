@@ -23,6 +23,7 @@
 //! outlives the replay) — they are not duplicated.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 
@@ -529,8 +530,11 @@ fn expectStep(step: json.Value, emitted: ?Value, out: ?Value, out_changed: bool)
         try std.testing.expectEqual(@as(?Value, null), emitted);
     }
     // expected.output
-    const exp = try jsonFieldRequired(step, "expected");
-    const want_out = try optString(try jsonFieldRequired(exp, "output"));
+    var exp = cj.AssertionKeys.init(
+            "rateshape expected", try jsonFieldRequired(step, "expected"));
+    exp.consume(&.{"invalidates"});
+    defer exp.finish() catch @panic("unconsumed conformance assertion key");
+    const want_out = try optString(try exp.required("output"));
     if (want_out) |wo| {
         try std.testing.expect(out != null);
         try std.testing.expectEqualStrings(wo, out.?);

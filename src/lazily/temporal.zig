@@ -13,6 +13,7 @@
 //! matrix. This is the Zig analogue of the rs `Cell<T>` `PartialEq` store-guard.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 
@@ -468,14 +469,17 @@ test "temporal conformance: timer_single_shot" {
         const edge = timer.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(exp, "fired")), timer.hasFired());
-        const want_value: bool = switch (try jsonFieldRequired(exp, "value")) {
+        var exp = cj.AssertionKeys.init(
+            "temporal expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsBool(try exp.required("fired")), timer.hasFired());
+        const want_value: bool = switch (try exp.required("value")) {
             .null => false,
             else => true,
         };
         try std.testing.expectEqual(want_value, timer.value() != null);
-        try std.testing.expectEqual(try optU64(try jsonFieldRequired(exp, "next_fire")), timer.nextFire());
+        try std.testing.expectEqual(try optU64(try exp.required("next_fire")), timer.nextFire());
 
         const changed = timer.firedVersion() != pre;
         try std.testing.expectEqual(try invalidates(step, "fired"), changed);
@@ -499,9 +503,12 @@ test "temporal conformance: interval_periodic" {
         const edge = iv.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsU64(try jsonFieldRequired(exp, "count")), iv.count());
-        try std.testing.expectEqual(try optU64(try jsonFieldRequired(exp, "next_fire")), iv.nextFire());
+        var exp = cj.AssertionKeys.init(
+            "temporal expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsU64(try exp.required("count")), iv.count());
+        try std.testing.expectEqual(try optU64(try exp.required("next_fire")), iv.nextFire());
         try std.testing.expectEqual(try invalidates(step, "count"), iv.countVersion() != pre);
     }
 }
@@ -530,9 +537,12 @@ test "temporal conformance: cron_pattern" {
         const edge = cron.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsU64(try jsonFieldRequired(exp, "count")), cron.count());
-        try std.testing.expectEqual(try optU64(try jsonFieldRequired(exp, "next_fire")), cron.nextFire());
+        var exp = cj.AssertionKeys.init(
+            "temporal expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsU64(try exp.required("count")), cron.count());
+        try std.testing.expectEqual(try optU64(try exp.required("next_fire")), cron.nextFire());
         try std.testing.expectEqual(try invalidates(step, "count"), cron.countVersion() != pre);
     }
 }
@@ -556,10 +566,13 @@ test "temporal conformance: deadline_expiry" {
         const edge = d.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        const exp = try jsonFieldRequired(step, "expected");
-        const want_expired = std.mem.eql(u8, try jsonAsString(try jsonFieldRequired(exp, "state")), "Expired");
+        var exp = cj.AssertionKeys.init(
+            "temporal expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        const want_expired = std.mem.eql(u8, try jsonAsString(try exp.required("state")), "Expired");
         try std.testing.expectEqual(want_expired, d.isExpired());
-        try std.testing.expectEqualStrings(try jsonAsString(try jsonFieldRequired(exp, "value")), d.value());
+        try std.testing.expectEqualStrings(try jsonAsString(try exp.required("value")), d.value());
         try std.testing.expectEqual(try invalidates(step, "state"), d.stateVersion() != pre);
     }
 }

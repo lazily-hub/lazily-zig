@@ -267,10 +267,16 @@ test "signaling conformance: anti_spoof_session.json" {
 
     // Fixture-level claims, checked against what the room emitted rather than
     // asserted as prose.
-    const assertions = try cj.required(fixture, "assertions");
-    const want_excludes_self = try cj.boolOr(assertions, "roster_excludes_self", false);
-    const want_sorted = try cj.boolOr(assertions, "roster_sorted_ascending", false);
-    const want_server_from = try cj.boolOr(assertions, "forwarded_from_is_server_registered", false);
+    var assertions = cj.AssertionKeys.init(
+        "signaling/anti_spoof_session.json assertions",
+        try cj.required(fixture, "assertions"),
+    );
+    const want_excludes_self = try assertions.boolOr("roster_excludes_self", false);
+    const want_sorted = try assertions.boolOr("roster_sorted_ascending", false);
+    const want_server_from = try assertions.boolOr("forwarded_from_is_server_registered", false);
+    // The per-frame blocks in `frames.json` already refuse an unrecognised key;
+    // this fixture-level block did not (#lzassertunknownkeys).
+    try assertions.finish();
     var rosters_seen: usize = 0;
     var forwards_seen: usize = 0;
 

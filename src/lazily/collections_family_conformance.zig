@@ -29,6 +29,7 @@
 //! spec's Core row. Making it green means making the map graph-backed.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const json = std.json;
 const testing = std.testing;
@@ -343,7 +344,9 @@ fn Engine(comptime Model: type) type {
 
             for (steps.items, 0..) |step, i| {
                 const op = try required(step, "op");
-                const expected = try required(step, "expected");
+                var expected = cj.AssertionKeys.init(
+                    "collections-family expected", try required(step, "expected"));
+                defer expected.finish() catch @panic("unconsumed conformance assertion key");
 
                 // Sample every reader class before the op.
                 const mv_before = model.membershipVersion();
@@ -367,7 +370,7 @@ fn Engine(comptime Model: type) type {
                 try applyOp(Model, &model, op);
 
                 // -- invalidation (reader-class independence) ------------
-                const inv = field(expected, "invalidates") orelse return error.MissingInvalidates;
+                const inv = expected.field("invalidates") orelse return error.MissingInvalidates;
                 try assertInvalidation(
                     Model,
                     &model,
@@ -380,7 +383,7 @@ fn Engine(comptime Model: type) type {
                 );
 
                 // -- handle stability ------------------------------------
-                if (field(expected, "handle_stable")) |hs| {
+                if (expected.field("handle_stable")) |hs| {
                     switch (hs) {
                         .object => |o| {
                             var it = o.iterator();
@@ -410,7 +413,7 @@ fn Engine(comptime Model: type) type {
                 }
 
                 // -- resulting state -------------------------------------
-                if (field(expected, "order")) |ord| {
+                if (expected.field("order")) |ord| {
                     const want = switch (ord) {
                         .array => |a| a,
                         else => return error.ExpectedArray,
@@ -427,7 +430,7 @@ fn Engine(comptime Model: type) type {
                         try testing.expectEqualStrings(try asStr(w), g);
                     }
                 }
-                if (field(expected, "membership")) |mem| {
+                if (expected.field("membership")) |mem| {
                     const want = switch (mem) {
                         .array => |a| a,
                         else => return error.ExpectedArray,
@@ -437,7 +440,7 @@ fn Engine(comptime Model: type) type {
                         try testing.expect(model.contains(try asStr(w)));
                     }
                 }
-                if (field(expected, "values")) |vals| {
+                if (expected.field("values")) |vals| {
                     switch (vals) {
                         .object => |o| {
                             var it = o.iterator();

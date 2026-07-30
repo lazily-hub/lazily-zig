@@ -19,6 +19,7 @@
 //! FIRST op only invalidates when it actually changes the projection.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 
@@ -564,9 +565,12 @@ test "service conformance: health" {
         const pre = cell.healthVersion();
         try cell.set(name, up, critical);
 
-        const exp = try jsonFieldRequired(step, "expected");
+        var exp = cj.AssertionKeys.init(
+            "service expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
         try std.testing.expectEqualStrings(
-            try jsonAsString(try jsonFieldRequired(exp, "health")),
+            try jsonAsString(try exp.required("health")),
             cell.health().toString(),
         );
         try std.testing.expectEqual(try invalidates(step, "health"), cell.healthVersion() != pre);
@@ -590,8 +594,11 @@ test "service conformance: readiness" {
         const pre = cell.readyVersion();
         try cell.set(name, ready_val);
 
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(exp, "ready")), cell.ready());
+        var exp = cj.AssertionKeys.init(
+            "service expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsBool(try exp.required("ready")), cell.ready());
         try std.testing.expectEqual(try invalidates(step, "ready"), cell.readyVersion() != pre);
     }
 }
@@ -628,10 +635,13 @@ test "service conformance: discovery" {
             );
         } else return error.UnknownOp;
 
-        const exp = try jsonFieldRequired(step, "expected");
+        var exp = cj.AssertionKeys.init(
+            "service expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
         var proj = try cell.discovery(std.testing.allocator);
         defer proj.deinit();
-        try expectMapEquals(&proj, try jsonFieldRequired(exp, "discovery"));
+        try expectMapEquals(&proj, try exp.required("discovery"));
         try std.testing.expectEqual(try invalidates(step, "discovery"), cell.discoveryVersion() != pre);
     }
 }
@@ -661,8 +671,11 @@ test "service conformance: service_registry" {
             try reg.replay();
         } else return error.UnknownOp;
 
-        const exp = try jsonFieldRequired(step, "expected");
-        try expectMapEquals(reg.projectionMap(), try jsonFieldRequired(exp, "projection"));
+        var exp = cj.AssertionKeys.init(
+            "service expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try expectMapEquals(reg.projectionMap(), try exp.required("projection"));
         try std.testing.expectEqual(try invalidates(step, "projection"), reg.projectionVersion() != pre);
     }
 }

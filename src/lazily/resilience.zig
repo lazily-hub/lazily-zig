@@ -14,6 +14,7 @@
 //! matrix. This is the Zig analogue of the rs `Cell<T>` `PartialEq` store-guard.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 
@@ -481,9 +482,12 @@ test "resilience conformance: circuit_breaker" {
             return error.UnknownOp;
         }
 
-        const exp = try jsonFieldRequired(step, "expected");
+        var exp = cj.AssertionKeys.init(
+            "resilience expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
         try std.testing.expectEqualStrings(
-            try jsonAsString(try jsonFieldRequired(exp, "state")),
+            try jsonAsString(try exp.required("state")),
             breaker.state().specName(),
         );
         try std.testing.expectEqual(try invalidates(step, "state"), breaker.stateVersion() != pre);
@@ -515,8 +519,11 @@ test "resilience conformance: retry" {
             return error.UnknownOp;
         }
 
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsU64(try jsonFieldRequired(exp, "delay")), retry.delay());
+        var exp = cj.AssertionKeys.init(
+            "resilience expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsU64(try exp.required("delay")), retry.delay());
         try std.testing.expectEqual(try invalidates(step, "delay"), retry.delayVersion() != pre);
     }
 }
@@ -549,8 +556,11 @@ test "resilience conformance: bulkhead" {
             return error.UnknownOp;
         }
 
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsU64(try jsonFieldRequired(exp, "in_use")), bulkhead.inUse());
+        var exp = cj.AssertionKeys.init(
+            "resilience expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsU64(try exp.required("in_use")), bulkhead.inUse());
         try std.testing.expectEqual(try invalidates(step, "in_use"), bulkhead.inUseVersion() != pre);
     }
 }
@@ -582,8 +592,11 @@ test "resilience conformance: timeout" {
             return error.UnknownOp;
         }
 
-        const exp = try jsonFieldRequired(step, "expected");
-        try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(exp, "is_timed_out")), timeout.isTimedOut());
+        var exp = cj.AssertionKeys.init(
+            "resilience expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
+        try std.testing.expectEqual(try jsonAsBool(try exp.required("is_timed_out")), timeout.isTimedOut());
         try std.testing.expectEqual(try invalidates(step, "is_timed_out"), timeout.timedOutVersion() != pre);
     }
 }

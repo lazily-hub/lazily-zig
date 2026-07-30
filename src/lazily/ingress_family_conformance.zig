@@ -46,6 +46,7 @@
 //! and what each one turned red.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const json = std.json;
 const Context = @import("context.zig").Context;
 const Compute = @import("context.zig").Compute;
@@ -869,9 +870,8 @@ fn collectKeys(allocator: std.mem.Allocator, fixture: json.Value) ![][]const u8 
 /// Assert the fixture's expected state after one step. Reads through the reactive
 /// readers, so a shell that under-invalidated fails HERE as well as in the
 /// invalidation matrix.
-fn assertState(model: anytype, step: json.Value, where: []const u8) !void {
-    const expected = try jsonFieldRequired(step, "expected");
-    const scopes = try jsonFieldRequired(expected, "scopes");
+fn assertState(model: anytype, expected: *cj.AssertionKeys, where: []const u8) !void {
+    const scopes = try expected.required("scopes");
     switch (scopes) {
         .object => |map| {
             var it = map.iterator();
@@ -943,7 +943,7 @@ fn assertState(model: anytype, step: json.Value, where: []const u8) !void {
         else => return error.ExpectedObject,
     }
 
-    const receipts = try jsonFieldRequired(expected, "receipts");
+    const receipts = try expected.required("receipts");
     try expectEqU64(where, try requiredU64(receipts, "accepted"), try model.acceptedLen());
     try expectEqU64(where, try requiredU64(receipts, "dropped"), try model.droppedLen());
     try expectEqU64(where, try requiredU64(receipts, "error"), try model.errorsLen());
@@ -956,17 +956,15 @@ fn assertState(model: anytype, step: json.Value, where: []const u8) !void {
 /// matrix was not silently absent.
 fn assertInvalidation(
     keys: [][]const u8,
-    step: json.Value,
+    expected: *cj.AssertionKeys,
     before: Snapshot,
     after: Snapshot,
     where: []const u8,
 ) !usize {
-    const expected = try jsonFieldRequired(step, "expected");
     // The matrix nests under `expected`, NOT on the step. lazily-rs's MAP runner
     // read it off the step, so it was always absent and the assertion never ran
     // once. Pin the nesting so that cannot recur here.
-    if (jsonField(step, "invalidates") != null) return error.InvalidatesMustNestUnderExpected;
-    const want = try jsonFieldRequired(expected, "invalidates");
+    const want = try expected.required("invalidates");
     var asserted: usize = 0;
 
     const want_scopes = try jsonFieldRequired(want, "scopes");
@@ -1132,8 +1130,18 @@ fn replay(
         // Snapshot BEFORE asserting state: `assertState` reads through the
         // readers, which re-warms every cache it touches.
         const after = try model.snapshot();
-        try assertState(model, step, where);
-        counts.flags += try assertInvalidation(keys, step, before, after, where);
+        // One guard over the step's whole `expected` block, shared by both
+        // helpers: every key it carries has to be claimed by one of them
+        // (#lzassertunknownkeys).
+        // The matrix nests under `expected`, NOT on the step. lazily-rs's MAP
+        // runner read it off the step, so it was always absent and the
+        // assertion never ran once. Pin the nesting so that cannot recur here.
+        if (jsonField(step, "invalidates") != null) return error.InvalidatesMustNestUnderExpected;
+        var expected = cj.AssertionKeys.init(
+            "ingress-family expected", try jsonFieldRequired(step, "expected"));
+        try assertState(model, &expected, where);
+        counts.flags += try assertInvalidation(keys, &expected, before, after, where);
+        try expected.finish();
         try model.materialize();
         counts.steps += 1;
     }

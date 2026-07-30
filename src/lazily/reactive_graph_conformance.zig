@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const cj = @import("conformance_json.zig");
 const json = std.json;
 
 const ContextMod = @import("context.zig");
@@ -1620,11 +1621,22 @@ fn Engine(comptime Model: type) type {
         /// the middle of a cascade.
         fn evaluateTail(self: *Self, fx: json.Value) !void {
             self.step = 9999; // "expected", not a step index
-            const expected = field(fx, "expected") orelse return;
+            const expected_block = field(fx, "expected") orelse return;
             const a = self.allocator;
 
-            if (field(expected, "final_state")) |fin| {
-                if (field(fin, "dependents_of")) |m| {
+            // The step-level `expect` refuses an unrecognised key; this tail did
+            // not, at any nesting level. The module comment used to argue its
+            // keys "are fixed rather than free-form, so they need no support
+            // check here" -- an assumption only the corpus gets to make
+            // (#lzassertunknownkeys).
+            var expected = cj.AssertionKeys.init("reactive-graph expected tail", expected_block);
+            // Consumed by `runCorpus`, which needs every scenario's report
+            // before it can compare two worlds.
+            expected.consume(&.{"observationally_equal"});
+
+            if (expected.field("final_state")) |fin_block| {
+                var fin = cj.AssertionKeys.init("reactive-graph expected.final_state", fin_block);
+                if (fin.field("dependents_of")) |m| {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
                         const idx = try self.node(id);
@@ -1638,7 +1650,7 @@ fn Engine(comptime Model: type) type {
                         self.rep.obs.add(a, "dep[{s}]={d};", .{ id, got });
                     }
                 }
-                if (field(fin, "readable")) |m| {
+                if (fin.field("readable")) |m| {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
                         const got = self.readable(id);
@@ -1654,7 +1666,7 @@ fn Engine(comptime Model: type) type {
                         self.rep.obs.add(a, "readable[{s}]={};", .{ id, got });
                     }
                 }
-                if (field(fin, "read")) |m| {
+                if (fin.field("read")) |m| {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
                         const idx = try self.node(id);
@@ -1670,22 +1682,24 @@ fn Engine(comptime Model: type) type {
                         }
                     }
                 }
+                try fin.finish();
             }
 
-            if (field(expected, "after_publish")) |pub_block| {
-                const op = field(pub_block, "op") orelse return error.MissingOp;
+            if (expected.field("after_publish")) |pub_block| {
+                var pub_keys = cj.AssertionKeys.init("reactive-graph expected.after_publish", pub_block);
+                const op = pub_keys.field("op") orelse return error.MissingOp;
                 const idx = try self.node(try asString(field(op, "id") orelse return error.MissingOpId));
                 const runs_before = EffectLog.runs.items.len;
                 try self.model.setCell(idx, try asI64(field(op, "value") orelse return error.MissingValue));
                 self.model.settle();
 
                 const ran = EffectLog.runs.items[runs_before..];
-                if (field(pub_block, "observed_by")) |ob| {
+                if (pub_keys.field("observed_by")) |ob| {
                     try self.checkIdList("after_publish.observed_by", ran, try asArray(ob), false);
                 }
                 for (ran) |r| self.rep.obs.add(a, "ran[{d}];", .{r});
 
-                if (field(pub_block, "read")) |m| {
+                if (pub_keys.field("read")) |m| {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
                         const nidx = try self.node(id);
@@ -1701,7 +1715,7 @@ fn Engine(comptime Model: type) type {
                         }
                     }
                 }
-                if (field(pub_block, "dependents_of")) |m| {
+                if (pub_keys.field("dependents_of")) |m| {
                     const map = try asObject(m);
                     for (try sortedKeys(map)) |id| {
                         const nidx = try self.node(id);
@@ -1715,8 +1729,10 @@ fn Engine(comptime Model: type) type {
                         self.rep.obs.add(a, "pubdep[{s}]={d};", .{ id, got });
                     }
                 }
+                try pub_keys.finish();
             }
 
+            try expected.finish();
             for (EffectLog.cleanups.items) |c| self.rep.obs.add(a, "cleanup[{d}];", .{c});
         }
     };

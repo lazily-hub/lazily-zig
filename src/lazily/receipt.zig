@@ -1,4 +1,5 @@
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 
 // Causal receipt projection — the Zig counterpart of `lazily-spec/protocol.md`
 // § "Causal Receipts" and the Lean model in `lazily-formal/LazilyFormal/Receipt.lean`.
@@ -797,9 +798,12 @@ test "lazily/receipt: replaying the conformance fixture into a projection yields
     defer parsed_fixture.deinit();
     const root = parsed_fixture.value;
 
-    const assertions = try field(root, "assertions");
-    const current_generation = try asU64(try field(assertions, "current_generation"));
-    const expected_count = try asU64(try field(assertions, "receipt_count"));
+    var assertions = cj.AssertionKeys.init(
+        "receipts/causal_receipts.json assertions",
+        try field(root, "assertions"),
+    );
+    const current_generation = try asU64(try assertions.required("current_generation"));
+    const expected_count = try asU64(try assertions.required("receipt_count"));
 
     const wire = try field(root, "wire");
     var wire_arena = std.heap.ArenaAllocator.init(allocator);
@@ -827,17 +831,42 @@ test "lazily/receipt: replaying the conformance fixture into a projection yields
     try std.testing.expectEqual(@as(usize, 3), applied_count); // observed + accepted + applied
     try std.testing.expectEqual(@as(usize, 1), stale_count); // receipt-stale
 
-    const terminal = projection.terminalFor("patch-123").?;
-    try std.testing.expectEqual(ReceiptOutcome.applied, terminal.outcome);
+    // `causation_id` and `terminal_outcome` were carried by the fixture and
+    // hardcoded here, so the corpus could move either and this replay would keep
+    // asserting the old pair (#lzassertunknownkeys).
+    const causation_id = try asString(try assertions.required("causation_id"));
+    const terminal = projection.terminalFor(causation_id).?;
+    try std.testing.expectEqual(
+        try ReceiptOutcome.fromWireName(try asString(try assertions.required("terminal_outcome"))),
+        terminal.outcome,
+    );
     try std.testing.expectEqualStrings(
         "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
         terminal.payload_hash.?,
     );
 
-    const stale_ids = try asArray(try field(assertions, "stale_receipt_ids"));
+    // The non-terminal half of the outcome lattice, read by nothing until now: a
+    // binding that classified `accepted` as terminal satisfies every other key
+    // here and is still wrong.
+    const nonterminal = try asArray(try assertions.required("nonterminal_outcomes"));
+    var seen_nonterminal: usize = 0;
+    for (nonterminal) |want| {
+        const outcome = try ReceiptOutcome.fromWireName(try asString(want));
+        try std.testing.expect(!outcome.isTerminal());
+        for (body.receipts) |r| {
+            if (r.outcome == outcome) {
+                seen_nonterminal += 1;
+                break;
+            }
+        }
+    }
+    try std.testing.expectEqual(nonterminal.len, seen_nonterminal);
+
+    const stale_ids = try asArray(try assertions.required("stale_receipt_ids"));
     try std.testing.expectEqual(@as(usize, 1), stale_ids.len);
     try std.testing.expectEqualStrings("receipt-stale", try asString(stale_ids[0]));
     try std.testing.expect(projection.containsReceipt("receipt-stale"));
+    try assertions.finish();
 }
 
 // ---------------------------------------------------------------------------

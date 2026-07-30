@@ -17,6 +17,7 @@
 //! The peer id type is `u64`.
 
 const std = @import("std");
+const cj = @import("conformance_json.zig");
 const builtin = @import("builtin");
 const Context = @import("context.zig").Context;
 
@@ -541,10 +542,13 @@ test "membership conformance: membership_lifecycle" {
             return error.UnknownOp;
         }
 
-        const exp = try jsonFieldRequired(step, "expected");
+        var exp = cj.AssertionKeys.init(
+            "membership expected", try jsonFieldRequired(step, "expected"));
+        exp.consume(&.{"invalidates"});
+        defer exp.finish() catch @panic("unconsumed conformance assertion key");
 
         // Per-peer state assertions.
-        const states = try jsonFieldRequired(exp, "states");
+        const states = try exp.required("states");
         var sit = states.object.iterator();
         while (sit.next()) |kv| {
             const peer_id = try std.fmt.parseInt(u64, kv.key_ptr.*, 10);
@@ -559,14 +563,14 @@ test "membership conformance: membership_lifecycle" {
         try cell.aliveInto(&alive);
         var want_alive = std.ArrayList(u64).empty;
         defer want_alive.deinit(std.testing.allocator);
-        for ((try jsonFieldRequired(exp, "alive_set")).array.items) |v| {
+        for ((try exp.required("alive_set")).array.items) |v| {
             try want_alive.append(std.testing.allocator, try jsonAsU64(v));
         }
         std.mem.sort(u64, want_alive.items, {}, std.sort.asc(u64));
         try std.testing.expect(std.mem.eql(u64, want_alive.items, alive.items));
 
         // Reader invalidation: scalar bool (not a {reader: bool} map).
-        const want_inv = try jsonAsBool(try jsonFieldRequired(exp, "invalidates"));
+        const want_inv = try jsonAsBool(try exp.required("invalidates"));
         try std.testing.expectEqual(want_inv, cell.peerSetVersion() != pre);
     }
 }
