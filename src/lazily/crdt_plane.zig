@@ -562,6 +562,10 @@ test "lazily/crdt_plane: family sync materializes remote keys on ingest" {
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFamilyFixture = @import("conformance_manifest.zig").specReadFile;
 
+/// Per-scenario replay accounting (#lzscenariocoverage). Opening the fixture is
+/// rung 1; this records that each of its three scenarios was actually replayed.
+const cj = @import("conformance_json.zig");
+
 test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
     const allocator = std.testing.allocator;
     const raw = readFamilyFixture(FAMILY_FIXTURE) catch return error.SkipZigTest;
@@ -573,7 +577,10 @@ test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
     const namespace = fixture.object.get("namespace").?.string;
     try std.testing.expectEqualStrings("bool", fixture.object.get("value_type").?.string);
 
-    for (fixture.object.get("scenarios").?.array.items) |scenario| {
+    var ledger = try cj.scenarios("familysync/materialize_on_ingest.json", fixture);
+    try std.testing.expect(ledger.len() > 0);
+    while (ledger.next()) |scenario| {
+        _ = ledger.replaying();
         const obj = scenario.object;
         const origin_peer: PeerId = @intCast(obj.get("origin_peer").?.integer);
         const target_peer: PeerId = @intCast(obj.get("target_peer").?.integer);

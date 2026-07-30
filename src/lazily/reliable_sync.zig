@@ -557,6 +557,16 @@ fn storedFrameLessThan(_: void, a: StoredOutboxFrame, b: StoredOutboxFrame) bool
 
 const fixture_outbox_store = @embedFile("test/reliable-sync/outbox_store_protocol.json");
 
+// Corpus-relative ids for the runtime scenario ledger (#lzscenariocoverage).
+// The fixtures themselves are replayed from the vendored copies above, which a
+// manifest test asserts byte-identical to these canonical paths.
+const RS_RESYNC = "reliable-sync/resync_gap_converge.json";
+const RS_IDEMPOTENT = "reliable-sync/idempotent_redelivery.json";
+const RS_MULTI_EPOCH = "reliable-sync/multi_epoch_delta.json";
+const RS_OUTBOX_REPLAY = "reliable-sync/outbox_replay_after_crash.json";
+const RS_OUTBOX_STORE = "reliable-sync/outbox_store_protocol.json";
+const RS_LIVENESS = "reliable-sync/liveness_orset_lww.json";
+
 fn freeStoredFrames(allocator: std.mem.Allocator, entries: []StoredOutboxFrame) void {
     for (entries) |entry| allocator.free(entry.frame);
     allocator.free(entries);
@@ -588,23 +598,53 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
     const scenarios = parsed.value.object.get("scenarios").?.array.items;
     try std.testing.expect(scenarios.len > 0);
 
+    // Per-scenario replay accounting (#lzscenariocoverage).
+    var ledger = try cj.scenarios(RS_OUTBOX_STORE, parsed.value);
     var replayed: usize = 0;
-    for (scenarios) |scenario| {
+    while (ledger.next()) |scenario| {
+        _ = ledger.replaying();
         const sc = scenario.object;
-        // The `open_handles` scenario is the file-backed stale-cursor case; it
-        // is replayed by "StoredOutbox replays canonical stale-handle cursor
-        // serialization", which needs a real FileOutboxStore.
-        if (sc.get("open_handles") != null) continue;
 
         var store = InMemoryStore.init(allocator);
         defer store.deinit();
         var outbox = try StoredOutbox(InMemoryStore).init(&store);
-        for (sc.get("put_epochs").?.array.items) |e| {
-            const epoch: u64 = @intCast(e.integer);
-            try outbox.append(epoch, snapshotMessage(epoch));
+
+        // `open_handles` is the two-writers-one-store case. `StoredOutbox` is
+        // storage-independent — the monotone cursor fold lives in the protocol,
+        // not the journal — so it replays here against InMemoryStore, and the
+        // FileOutboxStore test below proves the same scenario survives a real
+        // serialized cursor. This loop used to `continue` past it, which left
+        // the scenario replayed ONLY by a test that skips on 0.15.2 (no
+        // `std.Io`): a whole scenario silently unreplayed on a gating
+        // toolchain, which is precisely the hole per-scenario accounting exists
+        // to close.
+        var stale: ?StoredOutbox(InMemoryStore) = null;
+        if (sc.get("open_handles") != null) {
+            stale = try StoredOutbox(InMemoryStore).init(&store);
+        }
+
+        if (sc.get("put_epochs")) |puts| {
+            for (puts.array.items) |e| {
+                const epoch: u64 = @intCast(e.integer);
+                try outbox.append(epoch, snapshotMessage(epoch));
+            }
         }
         if (sc.get("ack_through")) |acks| {
             for (acks.array.items) |e| try outbox.ackThrough(@intCast(e.integer));
+        }
+        if (sc.get("save_cursor")) |saves| {
+            for (saves.array.items) |save| {
+                const handle = save.object.get("handle").?.string;
+                const epoch: u64 = @intCast(save.object.get("epoch").?.integer);
+                if (std.mem.eql(u8, handle, "current")) {
+                    try outbox.ackThrough(epoch);
+                } else {
+                    try stale.?.ackThrough(epoch);
+                }
+            }
+            // The stale handle refreshes to the newer persisted cursor rather
+            // than winning with its own lower one.
+            try std.testing.expectEqual(outbox.ackedThrough(), stale.?.ackedThrough());
         }
         if (sc.get("restart")) |r| {
             if (r.bool) outbox = try StoredOutbox(InMemoryStore).init(&store);
@@ -664,8 +704,10 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
         try keys.finish();
         replayed += 1;
     }
-    // A vacuous loop must not report green.
-    try std.testing.expect(replayed >= 3);
+    // A vacuous loop must not report green, and a loop that quietly stops
+    // covering one of the fixture's scenarios must not either.
+    try std.testing.expectEqual(scenarios.len, replayed);
+    try std.testing.expect(replayed >= 4);
 }
 
 test "FileOutboxStore survives restart and rejects stale cursor regression" {
@@ -706,7 +748,13 @@ test "StoredOutbox replays canonical stale-handle cursor serialization" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture_outbox_store, .{});
     defer parsed.deinit();
-    const scenario = parsed.value.object.get("scenarios").?.array.items[3].object;
+    // By resolved id, not by index: a scenario reordered upstream used to
+    // silently point this replay at a different case (#lzscenariocoverage).
+    const scenario = (try cj.replayingScenario(
+        RS_OUTBOX_STORE,
+        parsed.value,
+        "stale handle cannot regress serialized cursor",
+    )).object;
     const saves = scenario.get("save_cursor").?.array.items;
     const expected: u64 = @intCast(scenario.get("expect").?.object.get("loaded_cursor").?.integer);
 
@@ -1199,6 +1247,25 @@ const GraphModel = struct {
     }
 };
 
+/// Enter one hand-written per-scenario replay into the runtime scenario ledger
+/// (`#lzscenariocoverage`).
+///
+/// The replays below are one test per scenario rather than a loop, so there is
+/// no shared iteration helper to instrument. `cj.replayingScenario` resolves the
+/// id out of the fixture and ERRORS when the fixture does not carry it, so this
+/// is not the hand-authored coverage claim the ledger exists to replace: an
+/// upstream rename breaks the runner instead of quietly shrinking the ledger.
+///
+/// The vendored `@embedFile` copies are asserted byte-identical to the canonical
+/// corpus by `conformance_manifest.zig`, so resolving against them is resolving
+/// against the corpus.
+fn ledgerScenario(fixture_id: []const u8, embedded: []const u8, scenario_id: []const u8) !void {
+    const a = testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, embedded, .{});
+    defer parsed.deinit();
+    _ = try cj.replayingScenario(fixture_id, parsed.value, scenario_id);
+}
+
 // ── resync_gap_converge.json ─────────────────────────────────────────────────
 
 // drop_suffix_then_resync_converges: receiver misses delta 2->3, detects the gap
@@ -1206,6 +1273,7 @@ const GraphModel = struct {
 // and reaches the SAME graph as a receiver that saw every delta.
 test "reliable_sync conformance: resync drop-suffix converges" {
     const a = testing.allocator;
+    try ledgerScenario(RS_RESYNC, fixture_resync, "drop_suffix_then_resync_converges");
     var coord = ResyncCoordinator.withEpoch(1);
     var ga = GraphModel.init(a);
     defer ga.deinit();
@@ -1245,6 +1313,7 @@ test "reliable_sync conformance: resync drop-suffix converges" {
 // single_request_per_gap: while resyncing, further ahead-of-cursor deltas are
 // Ignored and do NOT emit duplicate ResyncRequests.
 test "reliable_sync conformance: single request per gap" {
+    try ledgerScenario(RS_RESYNC, fixture_resync, "single_request_per_gap");
     var coord = ResyncCoordinator.withEpoch(2);
     var resync_requests: usize = 0;
 
@@ -1270,6 +1339,7 @@ test "reliable_sync conformance: single request per gap" {
 // replayed_delta_is_ignored: a re-delivered delta 40->41 (base_epoch 40 < 42) is
 // Ignored; net state and last_epoch unchanged. OutboxAck advertises through=42.
 test "reliable_sync conformance: idempotent replayed delta ignored" {
+    try ledgerScenario(RS_IDEMPOTENT, fixture_idempotent, "replayed_delta_is_ignored");
     var coord = ResyncCoordinator.withEpoch(42);
     const redeliver = mkDelta(40, 41, &.{cellset(1, &.{99})});
     try testing.expect(coord.ingestDelta(redeliver).isIgnore());
@@ -1282,6 +1352,7 @@ test "reliable_sync conformance: idempotent replayed delta ignored" {
 // duplicate_current_head_is_ignored: an exact re-delivery of the last-applied
 // delta is also Ignored — a duplicate never double-applies.
 test "reliable_sync conformance: idempotent duplicate head ignored" {
+    try ledgerScenario(RS_IDEMPOTENT, fixture_idempotent, "duplicate_current_head_is_ignored");
     var coord = ResyncCoordinator.withEpoch(41);
     try testing.expect(coord.ingestDelta(mkDelta(40, 41, &.{cellset(1, &.{10})})).isIgnore());
     try testing.expectEqual(@as(u64, 41), coord.lastEpoch());
@@ -1293,6 +1364,7 @@ test "reliable_sync conformance: idempotent duplicate head ignored" {
 // last_epoch as three unit deltas carrying the same ops in order.
 test "reliable_sync conformance: multi-epoch apply equals fold" {
     const a = testing.allocator;
+    try ledgerScenario(RS_MULTI_EPOCH, fixture_multi_epoch, "span_3_applies_equal_to_unit_fold");
     const span3 = mkDelta(40, 43, &.{ cellset(1, &.{10}), cellset(2, &.{20}), slotvalue(3, &.{30}) });
 
     // assertions block
@@ -1329,6 +1401,7 @@ test "reliable_sync conformance: multi-epoch apply equals fold" {
 // gap_rule_unchanged_under_span: a span-3 delta whose base_epoch != last_epoch is
 // still a gap; the span does not relax gap detection.
 test "reliable_sync conformance: multi-epoch gap rule unchanged" {
+    try ledgerScenario(RS_MULTI_EPOCH, fixture_multi_epoch, "gap_rule_unchanged_under_span");
     var coord = ResyncCoordinator.withEpoch(39);
     const act = coord.ingestDelta(mkDelta(40, 43, &.{}));
     try testing.expect(act.isRequestSnapshot());
@@ -1343,6 +1416,7 @@ test "reliable_sync conformance: multi-epoch gap rule unchanged" {
 // applies both -> last_epoch 43. Exactly-once effect: none lost, none doubled.
 test "reliable_sync conformance: outbox replay after crash" {
     const a = testing.allocator;
+    try ledgerScenario(RS_OUTBOX_REPLAY, fixture_outbox, "crash_between_append_and_ack_replays_on_reconnect");
     var outbox = InMemoryOutbox.init(a);
     defer outbox.deinit();
     try outbox.append(41, .{ .Delta = mkDelta(40, 41, &.{cellset(1, &.{10})}) });
@@ -1380,6 +1454,7 @@ test "reliable_sync conformance: outbox replay after crash" {
 // later tick. Driven through the SyncDriver loop.
 test "reliable_sync conformance: outbox send-failure retains" {
     const a = testing.allocator;
+    try ledgerScenario(RS_OUTBOX_REPLAY, fixture_outbox, "send_failure_retains_frame_for_next_tick");
 
     var d = try Harness.at(a, 0);
     defer d.deinit();
@@ -1410,6 +1485,7 @@ test "reliable_sync conformance: outbox send-failure retains" {
 // lagging close (remove observing only t1) keeps the doc open; order-independent.
 test "reliable_sync conformance: liveness OR-set add wins" {
     const a = testing.allocator;
+    try ledgerScenario(RS_LIVENESS, fixture_liveness, "open_set_add_wins_over_stale_remove");
     var s = OrSet.init(a);
     defer s.deinit();
     try s.add("t1");
@@ -1434,6 +1510,7 @@ test "reliable_sync conformance: liveness OR-set add wins" {
 // lww_alive_highest_stamp_wins: the OS process-exit write (alive=false at higher
 // stamp) wins; a stale re-assert (alive=true at lower stamp) is dominated.
 test "reliable_sync conformance: liveness LWW highest stamp wins" {
+    try ledgerScenario(RS_LIVENESS, fixture_liveness, "lww_alive_highest_stamp_wins");
     const Reg = WireLwwRegister(bool);
     var alive = Reg.init(ws(20, 0, 1), true);
     alive.set(ws(25, 0, 1), false);
@@ -1470,6 +1547,7 @@ fn liveDocs(
 // live aggregate for BOTH docs pid100 held; docC (pid200) unaffected.
 test "reliable_sync conformance: liveness whole-editor death cascades" {
     const a = testing.allocator;
+    try ledgerScenario(RS_LIVENESS, fixture_liveness, "whole_editor_death_cascades");
     const Reg = WireLwwRegister(bool);
 
     var entries: [3]LiveEntry = .{
@@ -1504,6 +1582,7 @@ test "reliable_sync conformance: liveness whole-editor death cascades" {
 // identically (semilattice join).
 test "reliable_sync conformance: liveness converges under retry" {
     const a = testing.allocator;
+    try ledgerScenario(RS_LIVENESS, fixture_liveness, "derived_live_doc_aggregate_converges_under_retry");
     const Reg = WireLwwRegister(bool);
 
     const build = struct {

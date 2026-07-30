@@ -1836,7 +1836,12 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
     // context and the resulting observations are compared as wholes. Asserting
     // only that each scenario independently satisfies `expected` would not test
     // the relation the fixture exists to state.
-    const scenarios = try asArray(field(fx, "scenarios") orelse return error.MissingScenarios);
+    // Per-scenario replay accounting (#lzscenariocoverage). `FIXTURES` names
+    // are bare filenames; the ledger keys by corpus-relative id.
+    var ledger_id_buf: [256]u8 = undefined;
+    const ledger_fixture = try std.fmt.bufPrint(&ledger_id_buf, "reactive-graph/{s}", .{fixture_name});
+    var ledger = try cj.scenarios(ledger_fixture, fx);
+
     var obs_bufs: [8]Observation = @splat(.{});
     var obs_names: [8][]const u8 = undefined;
     var obs_len: usize = 0;
@@ -1845,9 +1850,10 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
         m.deinit(a);
     };
 
-    for (scenarios) |sc| {
+    while (ledger.next()) |sc| {
         if (obs_len == obs_bufs.len) return error.TooManyScenarios;
         const name = try asString(field(sc, "name") orelse return error.MissingScenarioName);
+        _ = ledger.replaying();
         var label_buf: [96]u8 = undefined;
         const label = try std.fmt.bufPrint(&label_buf, "[{s}]", .{name});
 

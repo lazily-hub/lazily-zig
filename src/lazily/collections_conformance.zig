@@ -247,11 +247,17 @@ test "collections conformance: mergecell_algebra.json" {
     };
     defer parsed.deinit();
 
-    const scenarios = try cj.asArray(try cj.required(parsed.value, "scenarios"));
-    try testing.expect(scenarios.len > 0);
+    // Per-scenario replay accounting (#lzscenariocoverage). This fixture is the
+    // one in the corpus carrying NO identifier — its scenarios are told apart
+    // only by `policy` — so the ledger records them positionally and the
+    // coverage guard reports the fallback rather than accepting it silently.
+    var ledger = try cj.scenarios("collections/mergecell_algebra.json", parsed.value);
+    try testing.expect(ledger.len() > 0);
 
     var steps_replayed: usize = 0;
-    for (scenarios, 0..) |scenario, si| {
+    while (ledger.next()) |scenario| {
+        const si = ledger.at();
+        _ = ledger.replaying();
         const policy = try policyByName(try cj.asStr(try cj.required(scenario, "policy")));
 
         // The transport-selected property flags are part of the contract: they
@@ -400,10 +406,13 @@ test "collections conformance: semtree_incremental.json" {
     };
     defer parsed.deinit();
 
-    const scenarios = try cj.asArray(try cj.required(parsed.value, "scenarios"));
-    try testing.expect(scenarios.len > 0);
+    // Per-scenario replay accounting (#lzscenariocoverage).
+    var ledger = try cj.scenarios("collections/semtree_incremental.json", parsed.value);
+    try testing.expect(ledger.len() > 0);
 
-    for (scenarios, 0..) |scenario, si| {
+    while (ledger.next()) |scenario| {
+        const si = ledger.at();
+        _ = ledger.replaying();
         const fold = try foldByName(try cj.asStr(try cj.required(scenario, "fold")));
         var tree = try buildTree(allocator, try cj.required(scenario, "tree"));
         defer tree.deinit();
@@ -513,11 +522,16 @@ test "collections conformance: stableid_alignment.json" {
     };
     defer parsed.deinit();
 
-    const scenarios = try cj.asArray(try cj.required(parsed.value, "scenarios"));
-    try testing.expect(scenarios.len > 0);
+    // Per-scenario replay accounting (#lzscenariocoverage). Both shapes below
+    // are recorded — the `blocks` shape `continue`s out of the body, so the
+    // ledger entry has to be written before that branch is taken.
+    var ledger = try cj.scenarios("collections/stableid_alignment.json", parsed.value);
+    try testing.expect(ledger.len() > 0);
 
     var claims: usize = 0;
-    for (scenarios, 0..) |scenario, si| {
+    while (ledger.next()) |scenario| {
+        const si = ledger.at();
+        _ = ledger.replaying();
         const expect = try cj.required(scenario, "expect");
 
         // Shape 1: one `blocks` list, with key-identity claims over its indices.

@@ -21,6 +21,9 @@ pub const Value = json.Value;
 /// a source grep.
 pub const specReadFile = @import("conformance_manifest.zig").specReadFile;
 
+/// Runtime scenario ledger (`#lzscenariocoverage`). See `Scenarios` below.
+pub const recordScenario = @import("conformance_manifest.zig").recordScenario;
+
 pub const CONFORMANCE_ROOT = "../lazily-spec/conformance";
 
 pub const Fixture = json.Parsed(Value);
@@ -201,6 +204,119 @@ test "conformance_json: structural equality ignores object key order" {
 test "conformance_json: an absent corpus loads as null rather than failing" {
     const missing = try load("definitely-not-a-corpus-directory/nope.json");
     try std.testing.expect(missing == null);
+}
+
+// ---------------------------------------------------------------------------
+// Per-scenario replay accounting (#lzscenariocoverage)
+// ---------------------------------------------------------------------------
+
+/// A scenario id spelled positionally is at most `#` plus 20 digits.
+const POSITIONAL_ID_MAX = 24;
+
+/// Resolve a scenario's identifier in the order every binding uses:
+///
+///   1. `id` if present
+///   2. else `name` if present
+///   3. else the positional index, spelled `#<n>` (0-based)
+///
+/// The corpus is not uniform — three `stdlib` fixtures key by `id`, 28 by
+/// `name`, and `collections/mergecell_algebra.json` carries no identifier at
+/// all (its scenarios are told apart only by `policy`). The positional fallback
+/// exists so per-scenario accounting is not blocked on a shared-corpus edit;
+/// the coverage guard REPORTS every id that fell back to it, because the
+/// visibility is what makes the corpus gap fixable later.
+pub fn scenarioIdInto(scenario: Value, index: usize, buf: []u8) []const u8 {
+    if (field(scenario, "id")) |v| {
+        if (v == .string and v.string.len > 0) return v.string;
+    }
+    if (field(scenario, "name")) |v| {
+        if (v == .string and v.string.len > 0) return v.string;
+    }
+    return std.fmt.bufPrint(buf, "#{d}", .{index}) catch "#?";
+}
+
+/// The shared scenario-iteration helper, and the one place a scenario is
+/// entered into the runtime ledger.
+///
+/// `next()` deliberately does NOT record. The runner calls `replaying()` at the
+/// top of the loop body — AFTER any `continue` — so a scenario the runner skips
+/// does not record itself, which is exactly the case this accounting exists to
+/// catch. Forgetting the call is not silent either: the fixture's bytes were
+/// still opened, so the guard sees a scenario on disk with no ledger entry and
+/// fails naming both. The helper is fail-closed in both directions.
+pub const Scenarios = struct {
+    /// Corpus-relative fixture id, e.g. `stdlib/timer.json`.
+    fixture: []const u8,
+    items: []const Value,
+    index: usize = 0,
+    id_buf: [POSITIONAL_ID_MAX]u8 = undefined,
+
+    pub fn len(self: Scenarios) usize {
+        return self.items.len;
+    }
+
+    /// Yield the next scenario without recording it.
+    pub fn next(self: *Scenarios) ?Value {
+        if (self.index >= self.items.len) return null;
+        self.index += 1;
+        return self.items[self.index - 1];
+    }
+
+    /// 0-based index of the scenario `next()` last yielded.
+    pub fn at(self: Scenarios) usize {
+        return self.index - 1;
+    }
+
+    /// The resolved id of the scenario `next()` last yielded, WITHOUT recording
+    /// it. For a skip decision that needs to name the scenario it is skipping.
+    /// The slice may borrow `id_buf`, so it does not outlive the iteration.
+    pub fn currentId(self: *Scenarios) []const u8 {
+        return scenarioIdInto(self.items[self.index - 1], self.index - 1, &self.id_buf);
+    }
+
+    /// Record the scenario `next()` last yielded as REPLAYED and return its
+    /// resolved id.
+    pub fn replaying(self: *Scenarios) []const u8 {
+        const id = self.currentId();
+        recordScenario(self.fixture, id);
+        return id;
+    }
+};
+
+/// Iterate `fx.scenarios`, recording each replay into the runtime ledger.
+pub fn scenarios(fixture: []const u8, fx: Value) !Scenarios {
+    return .{ .fixture = fixture, .items = try asArray(try required(fx, "scenarios")) };
+}
+
+/// Find the scenario whose resolved id is `id`, record it as replayed, and hand
+/// it back.
+///
+/// For the replays that are one hand-written test per scenario rather than a
+/// loop. Errors when the fixture carries no such scenario, so an upstream
+/// rename breaks the runner instead of quietly dropping it out of the ledger —
+/// a bare `recordScenario("...", "some_name")` would keep claiming an id the
+/// corpus no longer has.
+pub fn replayingScenario(fixture: []const u8, fx: Value, id: []const u8) !Value {
+    return replayingScenarioImpl(fixture, fx, id, false);
+}
+
+/// `quiet` suppresses the diagnostic. Only for this module's own self-test,
+/// which asserts the failure and must not pollute the suite's stderr — the
+/// build runner surfaces any stderr from a test binary as a failed command.
+fn replayingScenarioImpl(fixture: []const u8, fx: Value, id: []const u8, quiet: bool) !Value {
+    var it = try scenarios(fixture, fx);
+    while (it.next()) |scenario| {
+        if (!std.mem.eql(u8, it.currentId(), id)) continue;
+        _ = it.replaying();
+        return scenario;
+    }
+    if (!quiet) std.debug.print(
+        "{s}: no scenario resolves to id '{s}' — the corpus renamed or dropped it, " ++
+            "and this runner is replaying something that is no longer there " ++
+            "(#lzscenariocoverage)\n",
+        .{ fixture, id },
+    );
+    return error.UnknownScenarioId;
 }
 
 /// Consumption tracking for a conformance fixture's assertion block
@@ -603,6 +719,57 @@ pub fn assertInvalidates(
 pub fn assertionKeys(where: []const u8, value: Value, name: []const u8) ?AssertionKeys {
     const block = field(value, name) orelse return null;
     return AssertionKeys.init(where, block);
+}
+
+test "conformance_json: scenario ids resolve id -> name -> positional" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        \\{"scenarios":[
+        \\  {"id":"by_id","name":"ignored"},
+        \\  {"name":"by_name"},
+        \\  {"policy":"Sum"}
+        \\]}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var it = try scenarios("fake/fixture.json", parsed.value);
+    try std.testing.expectEqual(@as(usize, 3), it.len());
+
+    var seen: [3][]const u8 = undefined;
+    var buf: [3][POSITIONAL_ID_MAX]u8 = undefined;
+    var n: usize = 0;
+    while (it.next()) |sc| {
+        // `currentId` borrows the iterator's buffer for the positional case, so
+        // copy before advancing.
+        const id = scenarioIdInto(sc, it.at(), &buf[n]);
+        seen[n] = id;
+        n += 1;
+    }
+    try std.testing.expectEqualStrings("by_id", seen[0]);
+    try std.testing.expectEqualStrings("by_name", seen[1]);
+    try std.testing.expectEqualStrings("#2", seen[2]);
+}
+
+test "conformance_json: replayingScenario refuses an id the fixture does not carry" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"scenarios\":[{\"name\":\"present\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+    // No ledger write reaches disk here: the recorder is a no-op unless
+    // LAZILY_CONFORMANCE_MANIFEST is set, and `fake/fixture.json` is not in the
+    // corpus, so the guard would flag it if it ever were.
+    try std.testing.expectError(
+        error.UnknownScenarioId,
+        replayingScenarioImpl("fake/fixture.json", parsed.value, "absent", true),
+    );
 }
 
 test "conformance_json: an unconsumed assertion key fails, an asserted one does not" {

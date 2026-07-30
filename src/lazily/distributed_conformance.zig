@@ -107,12 +107,13 @@ test "distributed conformance: anti_entropy_converge.json" {
     };
     defer parsed.deinit();
 
-    const scenarios = try cj.asArray(try cj.required(parsed.value, "scenarios"));
-    try testing.expect(scenarios.len > 0);
+    // Per-scenario replay accounting (#lzscenariocoverage).
+    var ledger = try cj.scenarios("distributed/anti_entropy_converge.json", parsed.value);
+    try testing.expect(ledger.len() > 0);
 
     var ops_replayed: usize = 0;
-    for (scenarios) |scenario| {
-        const name = try cj.asStr(try cj.required(scenario, "name"));
+    while (ledger.next()) |scenario| {
+        const name = ledger.replaying();
         var expect = cj.AssertionKeys.init(
             "distributed/anti_entropy_converge.json expect",
             try cj.required(scenario, "expect"),

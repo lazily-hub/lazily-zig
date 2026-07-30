@@ -78,6 +78,48 @@ pub fn record(path: []const u8) void {
     append(abs[idx + MARKER.len ..]);
 }
 
+/// Marks a scenario-ledger line so the coverage guard can split the two
+/// evidence channels out of one manifest. A corpus-relative fixture id can
+/// never begin with `@`, so the split is unambiguous and needs no second file,
+/// no second environment variable, and no second build.zig wiring.
+pub const SCENARIO_LINE_PREFIX = "@scenario\t";
+
+/// Record that ONE scenario of `fixture` was actually replayed
+/// (`#lzscenariocoverage`).
+///
+/// The fixture manifest proves the file's bytes were opened; a single scenario
+/// is enough to satisfy that, so a fixture carrying four scenarios can be a
+/// quarter replayed with every existing guard green. The key trackers in
+/// `conformance_json.zig` are blind to it for the same reason — an unreplayed
+/// scenario contributes no unconsumed key and no unasserted key, because a
+/// guard that inspects the blocks you reached cannot see the block you never
+/// reached.
+///
+/// This is a RUNTIME ledger, recorded at the point of replay, for the same
+/// reason the fixture manifest is one: a hand-authored list of "scenarios this
+/// runner covers" is a claim, and a claim rots.
+///
+/// `fixture` may be spelled as a corpus-relative id (`stdlib/timer.json`) or as
+/// any path containing the conformance root — vendored `@embedFile` replays
+/// pass the canonical id directly, since a compile-time embed opens nothing.
+pub fn recordScenario(fixture: []const u8, scenario_id: []const u8) void {
+    const id = canonicalFixtureId(fixture);
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        SCENARIO_LINE_PREFIX ++ "{s}\t{s}",
+        .{ id, scenario_id },
+    ) catch return;
+    append(line);
+}
+
+/// `path` reduced to its corpus-relative id, or returned unchanged when it is
+/// already one.
+fn canonicalFixtureId(path: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, path, MARKER)) |idx| return path[idx + MARKER.len ..];
+    return path;
+}
+
 /// `path` resolved against the process cwd. Test binaries can run from a working
 /// directory other than the repo root, so the id must not depend on how the read
 /// was spelled. `..` components are left in place: they do not affect the marker
@@ -226,6 +268,19 @@ test "conformance manifest: ids are relative to the conformance root" {
     try std.testing.expect(abs[0] == '/');
     const idx = std.mem.indexOf(u8, abs, MARKER).?;
     try std.testing.expectEqualStrings("collections/x.json", abs[idx + MARKER.len ..]);
+}
+
+test "conformance manifest: a scenario line is distinguishable from a fixture id" {
+    // The two evidence channels share one file. The prefix is what lets the
+    // coverage guard split them, so it must never collide with a corpus id.
+    try std.testing.expect(SCENARIO_LINE_PREFIX[0] == '@');
+    try std.testing.expectEqualStrings("stdlib/timer.json", canonicalFixtureId("stdlib/timer.json"));
+    try std.testing.expectEqualStrings(
+        "reliable-sync/liveness_orset_lww.json",
+        canonicalFixtureId(
+            "../lazily-spec/conformance/reliable-sync/liveness_orset_lww.json",
+        ),
+    );
 }
 
 test "conformance manifest: reads outside the corpus are not recorded" {

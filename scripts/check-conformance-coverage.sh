@@ -79,6 +79,58 @@ KNOWN_UNCOVERED=(
 #     `roster_sorted_ascending` assertion, and the unknown-target error text did
 #     not match the transcript (signaling.zig).
 
+# ---------------------------------------------------------------------------
+# Per-scenario replay accounting (#lzscenariocoverage).
+#
+# Rung 4. A fixture carrying several named scenarios can be PARTIALLY replayed
+# and nothing above notices: the coverage guard asks only whether the FILE was
+# opened, and one scenario is enough for that. The key trackers in
+# src/lazily/conformance_json.zig are blind for the mirror-image reason — they
+# bind only the blocks a runner reaches, so a scenario nobody replayed
+# contributes no unconsumed key and no unasserted key. Skipping a whole scenario
+# is invisible to a guard that only inspects the scenarios you ran.
+#
+# The evidence is the RUNTIME ledger the suite writes into the same manifest,
+# prefixed `@scenario<TAB>`, one line per scenario actually replayed. Like the
+# fixture manifest and unlike a hand-authored "scenarios this runner covers"
+# list, it records what happened rather than what someone claimed.
+#
+# SCOPE: only fixtures the manifest says were OPENED. A fixture in
+# KNOWN_UNCOVERED above has no runner at all in this binding, and re-stating
+# each of its scenarios here would say nothing the fixture entry does not
+# already say — it would just be the same excuse, N times.
+#
+# Excuses live here, next to KNOWN_UNCOVERED, so there is ONE place to read what
+# this binding does not prove.
+SCENARIO_EXCUSES=()
+
+# excuseScenario <fixture> <scenario-id> <reason>
+#
+# Declare that this binding does not replay one scenario of a fixture it DOES
+# open, and say why. Prefer implementing the scenario; an excuse is a promise
+# the reason text has to keep. Checked in both directions below, exactly like
+# KNOWN_UNCOVERED.
+excuseScenario() {
+  if [ -z "${3:-}" ]; then
+    echo "ERROR: excuseScenario('${1:-}', '${2:-}') has an empty reason." >&2
+    echo "       An excuse with no reason is an unexplained gap wearing a" >&2
+    echo "       guard's uniform." >&2
+    exit 1
+  fi
+  SCENARIO_EXCUSES+=("$1|$2|$3")
+}
+
+# No scenario of an opened fixture is currently unreplayed in this binding.
+#
+# One was, and is now implemented rather than excused: `outbox_store_protocol`'s
+# `stale handle cannot regress serialized cursor` was reachable only through
+# `FileOutboxStore`, whose tests skip on Zig 0.15.2 (no `std.Io`) — a whole
+# scenario silently unreplayed on a GATING toolchain. `StoredOutbox` folds the
+# cursor with `max` in the protocol rather than the journal, so the scenario now
+# replays against `InMemoryStore` on every toolchain, with the file-backed test
+# kept as the durable variant.
+
+
 # ABSOLUTE by contract — test binaries may run from a working directory other
 # than the repo root, so the recorder cannot resolve a relative path the same way
 # this script would. The Makefile exports $(CURDIR)/...; the fallback here is for
@@ -92,7 +144,15 @@ if [ ! -s "$MANIFEST" ]; then
   echo "      manifest is missing evidence, not evidence of absence." >&2
   exit 1
 fi
-OPENED="$(sort -u "$MANIFEST")"
+# Two evidence channels share one file. A corpus-relative fixture id can never
+# begin with `@`, so the split is a single grep and needs no second manifest,
+# no second environment variable, and no second build.zig wiring.
+TAB=$'\t'
+SCENARIO_MARK="@scenario$TAB"
+OPENED="$({ grep -v "^$SCENARIO_MARK" "$MANIFEST" || true; } | sort -u)"
+# `fixture<TAB>scenario-id`, one line per scenario the suite actually replayed.
+SCENARIO_LEDGER="$({ grep "^$SCENARIO_MARK" "$MANIFEST" || true; } \
+  | sed "s|^$SCENARIO_MARK||" | sort -u)"
 
 missing=0
 total=0
@@ -164,10 +224,130 @@ for known in "${KNOWN_UNCOVERED[@]:-}"; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# Per-scenario replay accounting (#lzscenariocoverage).
+# ---------------------------------------------------------------------------
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "FAIL: jq is required to resolve scenario ids out of the corpus." >&2
+  echo "      Skipping this check would report green while proving nothing —" >&2
+  echo "      the exact failure mode the scenario ledger exists to close." >&2
+  exit 1
+fi
+
+# Resolve a fixture's scenario ids in the order EVERY binding uses:
+#   1. `id` if present, 2. else `name` if present, 3. else `#<index>` (0-based).
+# Prints nothing for a fixture with no `scenarios` array.
+scenario_ids_on_disk() {
+  jq -r '(.scenarios // []) | to_entries[] | (.value.id // .value.name // "#\(.key)")' \
+    "$SPEC_DIR/$1"
+}
+
+scenario_total=0
+scenario_replayed=0
+scenario_excused=0
+positional=""
+
+# --- forward: every scenario of an OPENED fixture must be in the ledger ------
+while IFS= read -r fixture; do
+  [ -n "$fixture" ] || continue
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    scenario_total=$((scenario_total + 1))
+    case "$sid" in
+      '#'*) positional+="$fixture$TAB$sid"$'\n' ;;
+    esac
+    if grep -qxF "$fixture$TAB$sid" <<< "$SCENARIO_LEDGER"; then
+      scenario_replayed=$((scenario_replayed + 1))
+      continue
+    fi
+    excused=0
+    for entry in "${SCENARIO_EXCUSES[@]:-}"; do
+      [ -n "$entry" ] || continue
+      if [ "${entry%%|*}" = "$fixture" ]; then
+        rest="${entry#*|}"
+        [ "${rest%%|*}" = "$sid" ] && { excused=1; break; }
+      fi
+    done
+    if [ "$excused" -eq 1 ]; then
+      scenario_excused=$((scenario_excused + 1))
+      continue
+    fi
+    echo "ERROR: '$fixture' scenario '$sid' was NEVER REPLAYED." >&2
+    echo "       The fixture's bytes were opened, so the coverage guard counts it" >&2
+    echo "       covered and the key trackers see nothing — an unreplayed scenario" >&2
+    echo "       contributes no unconsumed key and no unasserted key. Replay it, or" >&2
+    echo "       declare excuseScenario \"$fixture\" \"$sid\" \"<reason>\"." >&2
+    missing=$((missing + 1))
+  done < <(scenario_ids_on_disk "$fixture")
+done <<< "$OPENED"
+
+# --- the evidence channel guards itself -------------------------------------
+# A ledger line naming a fixture the manifest never opened, or an id the fixture
+# does not carry, means the recorder is writing claims rather than observations.
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  led_fixture="${line%%$TAB*}"
+  led_id="${line#*$TAB}"
+  if ! grep -qxF "$led_fixture" <<< "$OPENED"; then
+    echo "ERROR: scenario ledger records '$led_fixture' ('$led_id'), which the" >&2
+    echo "       fixture manifest says was never opened. Coverage computed from" >&2
+    echo "       this ledger cannot be trusted." >&2
+    missing=$((missing + 1))
+    continue
+  fi
+  if ! scenario_ids_on_disk "$led_fixture" | grep -qxF "$led_id"; then
+    echo "ERROR: scenario ledger records '$led_fixture' scenario '$led_id', which" >&2
+    echo "       the fixture does not carry. The runner is replaying an id the" >&2
+    echo "       corpus renamed or dropped." >&2
+    missing=$((missing + 1))
+  fi
+done <<< "$SCENARIO_LEDGER"
+
+# --- a stale excuse is its own drift, in both directions ---------------------
+for entry in "${SCENARIO_EXCUSES[@]:-}"; do
+  [ -n "$entry" ] || continue
+  ex_fixture="${entry%%|*}"
+  ex_rest="${entry#*|}"
+  ex_id="${ex_rest%%|*}"
+  if [ ! -f "$SPEC_DIR/$ex_fixture" ]; then
+    echo "ERROR: excuseScenario names '$ex_fixture', which is not in the canonical corpus." >&2
+    missing=$((missing + 1))
+    continue
+  fi
+  if ! scenario_ids_on_disk "$ex_fixture" | grep -qxF "$ex_id"; then
+    echo "ERROR: excuseScenario names '$ex_fixture' scenario '$ex_id', which the" >&2
+    echo "       fixture does not carry. The excuse outlived the scenario it" >&2
+    echo "       described — delete it." >&2
+    missing=$((missing + 1))
+    continue
+  fi
+  if grep -qxF "$ex_fixture$TAB$ex_id" <<< "$SCENARIO_LEDGER"; then
+    echo "ERROR: excuseScenario lists '$ex_fixture' scenario '$ex_id', but this run" >&2
+    echo "       DID replay it. The excuse is stale and now hides nothing — delete" >&2
+    echo "       it. Leaving it there understates this binding's real coverage and" >&2
+    echo "       rots the list into noise." >&2
+    missing=$((missing + 1))
+  fi
+done
+
 if [ "$missing" -gt 0 ]; then
   echo "conformance coverage FAILED: $missing problem(s)" >&2
   exit 1
 fi
 
+# A positional id is NOT a failure — it is the fallback that keeps this check
+# off the critical path of a shared-corpus edit. It is reported because the
+# visibility is what makes the corpus gap fixable later: these scenarios carry
+# neither `id` nor `name` upstream, so the ledger can only tell them apart by
+# position, and a reordering upstream would move the accounting silently.
+if [ -n "$positional" ]; then
+  echo "NOTE: scenario ids that fell back to the POSITIONAL index (no \`id\`, no \`name\`" \
+       "in the corpus — fix belongs upstream in lazily-spec, not here):"
+  printf '%s' "$positional" | sed 's/^/      /'
+fi
+
 echo "conformance coverage OK: $covered/$total canonical fixtures OPENED by the suite" \
      "(${#KNOWN_UNCOVERED[@]} listed as known-uncovered; runtime manifest — these bytes were really read)"
+echo "scenario coverage OK: $scenario_replayed/$scenario_total scenarios of those fixtures REPLAYED" \
+     "($scenario_excused excused; runtime ledger — these scenarios really ran)"

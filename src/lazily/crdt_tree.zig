@@ -2,6 +2,13 @@
 
 const std = @import("std");
 const text_crdt = @import("text_crdt.zig");
+/// Per-scenario replay accounting (#lzscenariocoverage). The three scenarios
+/// below are hand-written rather than looped, so each names itself into the
+/// runtime ledger through `replayingScenario` — which errors when the corpus no
+/// longer carries that id, so a rename upstream breaks the runner instead of
+/// quietly dropping the scenario out of the ledger.
+const cj = @import("conformance_json.zig");
+const ALGEBRA_FIXTURE = "crdt-tree/algebra.json";
 
 /// Zig expresses the CrdtTree interface as a compile-time structural contract.
 /// The returned type is unchanged; missing methods fail at comptime.
@@ -65,6 +72,11 @@ test "CrdtTree replays canonical merge, snapshot, and frontier algebra" {
     try std.testing.expectEqualStrings("TextCrdt", parsed.value.object.get("model").?.string);
     try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("scenarios").?.array.items.len);
 
+    _ = try cj.replayingScenario(
+        ALGEBRA_FIXTURE,
+        parsed.value,
+        "merge algebra is order and duplication independent",
+    );
     var base = try text_crdt.TextCrdt.fromStr(allocator, 1, "root\n");
     defer base.deinit();
     var a = try base.fork(2);
@@ -107,6 +119,11 @@ test "CrdtTree replays canonical merge, snapshot, and frontier algebra" {
         try expectFrontiersEqual(&expected_frontier, &actual_frontier);
     }
 
+    _ = try cj.replayingScenario(
+        ALGEBRA_FIXTURE,
+        parsed.value,
+        "empty frontier snapshot preserves lineage",
+    );
     var source = try text_crdt.TextCrdt.fromStr(allocator, 7, "snapshot\n");
     defer source.deinit();
     var empty_frontier = std.AutoHashMap(u64, u64).init(allocator);
@@ -135,6 +152,11 @@ test "CrdtTree replays canonical merge, snapshot, and frontier algebra" {
     defer allocator.free(converged_restored);
     try std.testing.expectEqualStrings(converged_source, converged_restored);
 
+    _ = try cj.replayingScenario(
+        ALGEBRA_FIXTURE,
+        parsed.value,
+        "own frontier emits an empty delta",
+    );
     var steady = try text_crdt.TextCrdt.fromStr(allocator, 9, "steady\n");
     defer steady.deinit();
     var steady_frontier = try steady.versionVector(allocator);
