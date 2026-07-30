@@ -399,7 +399,24 @@ std.debug.assert(work.ack("worker-a", delivery.delivery_id));
 - [auth](./src/examples/auth/root.zig)
 - [cells](./src/examples/cells/root.zig)
 
-## See also
+## The lazily family
 
-- [lazily-spec](https://github.com/lazily-hub/lazily-spec) — language-agnostic wire protocol + conformance fixtures
-- [lazily-formal](https://github.com/lazily-hub/lazily-formal) — Lean 4 formal model: the executable reference behind the conformance fixtures (flat FSM kernel + Harel state chart + reactive graph + keyed collections/reconciliation + memoized semantic tree + manufactured identity + text/sequence CRDTs + async lifecycle + distributed signaling)
+`lazily` is one reactive model — the Cell kernel, keyed collections, state
+machines and charts, CRDTs, and the distributed plane — implemented natively per
+language and held to the same behaviour by a shared conformance corpus.
+
+- [lazily-spec](https://github.com/lazily-hub/lazily-spec) — language-agnostic wire protocol + conformance fixtures. It also carries the generated cross-language feature matrix; read that table rather than any per-binding copy.
+- [lazily-formal](https://github.com/lazily-hub/lazily-formal) — Lean 4 formal model: not a binding, but the neutral formal home every binding depends on *equally*, and the executable reference behind the conformance fixtures (flat FSM kernel + Harel state chart + reactive graph + keyed collections/reconciliation + memoized semantic tree + manufactured identity + text/sequence CRDTs + async lifecycle + distributed signaling). lazily-zig is one of its consumers.
+
+| Repo | Language |
+|---|---|
+| [lazily-rs](https://github.com/lazily-hub/lazily-rs) | Rust — the reference implementation |
+| [lazily-py](https://github.com/lazily-hub/lazily-py) | Python |
+| [lazily-go](https://github.com/lazily-hub/lazily-go) | Go |
+| [lazily-kt](https://github.com/lazily-hub/lazily-kt) | Kotlin / JVM |
+| [lazily-js](https://github.com/lazily-hub/lazily-js) | JavaScript / TypeScript |
+| [lazily-cs](https://github.com/lazily-hub/lazily-cs) | C# / .NET |
+| [lazily-cpp](https://github.com/lazily-hub/lazily-cpp) | C++ |
+| **lazily-zig** | Zig — you are here |
+| [lazily-dart](https://github.com/lazily-hub/lazily-dart) | Dart / Flutter |
+| [lazily-react](https://github.com/lazily-hub/lazily-react) | React / Preact bindings layered over [lazily-js](https://github.com/lazily-hub/lazily-js) — not a separate language binding |
