@@ -49,13 +49,24 @@ jobs:
         with:
           version: ${{ matrix.zig }}
 
-      # The formatting gate (#lazilydartzig). Deliberately INSIDE the matrix
-      # rather than in a job of its own: `zig fmt` is the formatter for whichever
-      # toolchain runs it, and a gate that disagreed between 0.15.2, 0.16.0 and
-      # master would be a coin flip depending on which one CI happened to use.
-      # Running it on all three is what proves they agree, continuously, instead
-      # of a comment claiming they do.
+      # The formatting gate (#lazilydartzig). Inside the matrix, but PINNED
+      # RELEASES ONLY — never `master`.
+      #
+      # This first shipped running on all three, on the strength of a local check
+      # that all three flagged the same 21 files. That check was worthless for
+      # `master` and CI said so within the hour: `mlugg/setup-zig` resolves
+      # `master` to the current nightly, so the locally-installed `master` and
+      # CI's `master` are simply different compilers, and 0.15.2 + 0.16.0 passed
+      # while master reddened on five files. `master` cannot be pinned by
+      # construction, so a gate that runs on it reddens on the upstream
+      # formatter's schedule rather than on anything a contributor did — which is
+      # how a gate teaches everyone to ignore it.
+      #
+      # The two pinned releases still cross-check each other, which is the part
+      # of the original intent that was actually verifiable. master keeps running
+      # every other step in the matrix.
       - name: Format gate (make fmt)
+        if: matrix.zig != 'master'
         run: make fmt
 
       # lazily-spec is the canonical cross-language source for the conformance
