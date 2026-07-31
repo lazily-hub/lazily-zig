@@ -1,3 +1,14 @@
+//! The peer protocol and its self-check. The process ENTRY POINT lives in
+//! `interop_peer_main.zig` (Zig 0.16+) and `interop_peer_main_0_15.zig` (0.15.x),
+//! selected by `build.zig`, because `std.process.Init` and `std.Io` exist only on
+//! 0.16+ and this file is the only place in the tree that touches either
+//! (#lzinteroppeerci). Splitting the entry point is the same shape `build.zig`
+//! already uses for `cell_0_16_test.zig`.
+//!
+//! The peer had silently stopped compiling on the pinned 0.15.2 toolchain: it
+//! ran only from `make check` on a developer's default toolchain, so nothing
+//! ever built it for the other two in the matrix. Wiring the gate into CI is
+//! what surfaced it.
 const std = @import("std");
 const lazily = @import("lazily");
 
@@ -49,7 +60,7 @@ fn cancellationAdapter(context: *CancellationContext) portable.CancellationAdapt
     return .{ .context = context, .run_fn = CancellationContext.run };
 }
 
-const Peer = struct {
+pub const Peer = struct {
     arena: std.heap.ArenaAllocator,
     peer_id: ?lazily.PeerId = null,
     runtime: ?lazily.CrdtPlaneRuntime = null,
@@ -59,16 +70,16 @@ const Peer = struct {
     last_feature: ?[]const u8 = null,
     last_observation: ?[]const u8 = null,
 
-    fn init(backing: std.mem.Allocator) Peer {
+    pub fn init(backing: std.mem.Allocator) Peer {
         return .{ .arena = std.heap.ArenaAllocator.init(backing) };
     }
 
-    fn deinit(self: *Peer) void {
+    pub fn deinit(self: *Peer) void {
         if (self.runtime) |*runtime| runtime.deinit();
         self.arena.deinit();
     }
 
-    fn requestAlloc(self: *Peer, line: []const u8) ![]u8 {
+    pub fn requestAlloc(self: *Peer, line: []const u8) ![]u8 {
         const allocator = self.arena.allocator();
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{
             .allocate = .alloc_always,
@@ -399,7 +410,7 @@ const Peer = struct {
         );
     }
 
-    fn errorAlloc(self: *Peer, message: []const u8) ![]u8 {
+    pub fn errorAlloc(self: *Peer, message: []const u8) ![]u8 {
         return stringifyAlloc(self.arena.allocator(), .{
             .ok = false,
             .@"error" = message,
@@ -407,36 +418,7 @@ const Peer = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var peer = Peer.init(init.gpa);
-    defer peer.deinit();
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--self-check")) {
-        try selfCheck(&peer);
-        std.debug.print("lazily-zig interop peer self-check: ok\n", .{});
-        return;
-    }
-
-    var stdin_buffer: [1024 * 1024]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(init.io, &stdin_buffer);
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-    const input = &stdin_reader.interface;
-    const output = &stdout_writer.interface;
-
-    while (try input.takeDelimiter('\n')) |line| {
-        const bye = std.mem.indexOf(u8, line, "\"cmd\":\"bye\"") != null or
-            std.mem.indexOf(u8, line, "\"cmd\": \"bye\"") != null;
-        const response = peer.requestAlloc(line) catch |err|
-            try peer.errorAlloc(@errorName(err));
-        try output.writeAll(response);
-        try output.writeByte('\n');
-        try output.flush();
-        if (bye) return;
-    }
-}
-
-fn selfCheck(peer: *Peer) !void {
+pub fn selfCheck(peer: *Peer) !void {
     const hello = try peer.requestAlloc(
         \\{"cmd":"hello","peer":1,"protocol_version":1}
     );

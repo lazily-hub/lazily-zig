@@ -175,10 +175,20 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // The peer's PROTOCOL is toolchain-portable; its process entry point is not.
+    // `std.process.Init` and `std.Io` exist only on 0.16+, so the entry point is
+    // split per toolchain and selected here — the same shape as the
+    // `cell_0_16_test.zig` split below (#lzinteroppeerci). Without this the peer
+    // simply did not compile on the pinned 0.15.2, which nothing noticed because
+    // the gate ran from `make check` on one developer toolchain and never in CI.
+    const interop_peer_root = if (builtin.zig_version.minor >= 16)
+        "src/interop_peer_main.zig"
+    else
+        "src/interop_peer_main_0_15.zig";
     const interop_peer = b.addExecutable(.{
         .name = "lazily-interop-peer",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/interop_peer.zig"),
+            .root_source_file = b.path(interop_peer_root),
             .target = target,
             .optimize = optimize,
             .imports = &.{
