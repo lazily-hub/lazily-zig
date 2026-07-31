@@ -12,9 +12,10 @@ CONFORMANCE_MANIFEST ?= $(CURDIR)/build/conformance-fixtures-loaded.txt
 	check \
 test \
 test-interop-peer \
-test-lean-formal
+test-lean-formal \
+ci-reach
 
-check: test test-interop-peer test-lean-formal conformance-coverage
+check: test test-interop-peer test-lean-formal conformance-coverage ci-reach
 
 # Truncate once here, then let every test binary APPEND. The recorder is a no-op
 # when LAZILY_CONFORMANCE_MANIFEST is unset, so a bare `zig build test` (or
@@ -44,3 +45,10 @@ test-lean-formal:
 # evidence and fails.
 conformance-coverage: test
 	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) ./scripts/check-conformance-coverage.sh
+
+# CI-reachability guard (#lzcheckcireachguard). Fails when a target above runs a
+# gate no CI workflow step reaches — the drift that hid #lzinteroppeerci in every
+# binding for months. It guards itself: `ci-reach` is in `check`, so CI has to
+# run it too or this target reports itself missing.
+ci-reach:
+	./scripts/check-ci-reach.sh

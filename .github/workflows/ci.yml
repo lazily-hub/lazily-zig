@@ -92,11 +92,18 @@ jobs:
       # which meant the KNOWN_UNCOVERED ledger was enforced by whoever
       # remembered to run it — the same "enforced on one developer machine" gap
       # the benchmark budgets have.
+      #
+      # `-Dconformance-manifest` is passed as well as the env var, matching what
+      # `make test` runs. The build option and the env var are the same knob —
+      # build.zig falls back to LAZILY_CONFORMANCE_MANIFEST when the option is
+      # absent — but running the command CI runs and the command `make check`
+      # runs as two different spellings is how the two drift apart.
       - name: Test
         run: |
           mkdir -p build && : > build/conformance-fixtures-loaded.txt
           LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
-            zig build test --summary all
+            zig build test --summary all \
+            -Dconformance-manifest="$PWD/build/conformance-fixtures-loaded.txt"
 
       # Cross-binding wire compatibility, run by `make check` and by no binding's
       # CI until now (#lzinteroppeerci). Runs on every toolchain in the matrix on
@@ -137,10 +144,48 @@ jobs:
             exit 1
           }
 
+      # Toolchain only. `build: false` on purpose: the gate is the explicit
+      # `lake build` below, which is the command `make test-lean-formal` runs.
+      # Letting the action build instead left CI with no run: step naming the
+      # gate at all, so the CI-reachability guard could not see it and neither
+      # could a reader diffing this file against the Makefile.
       - name: Install Lean toolchain
         uses: leanprover/lean-action@v1
         with:
           lake-package-directory: ../lazily-formal
-          build: true
+          build: false
           test: false
           lint: false
+
+      # The formal-model gate itself (#lzcheckcireachguard), spelled exactly as
+      # `make test-lean-formal` spells it.
+      - name: Build the formal model
+        run: cd ../lazily-formal && lake build
+
+  # ---------------------------------------------------------------------------
+  # The gate that keeps every job above honest (#lzcheckcireachguard). It
+  # compares `make check`'s prerequisite closure against the run: bodies in this
+  # file and fails on any target CI does not reach. Comments inside run: bodies
+  # are stripped first — a naive grep for "make check" reported all nine
+  # bindings as covered and every one of those hits was a comment.
+  #
+  # Its own job because it needs neither a Zig nor a Lean toolchain: it reads
+  # recipes through `make -n`, which expands variables without running anything.
+  # Running it inside the Zig matrix would only run the same file comparison
+  # three times.
+  ci-reach:
+    name: CI-reachability guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: CI-reachability guard (#lzcheckcireachguard)
+        run: |
+          out=$(./scripts/check-ci-reach.sh 2>&1) || { echo "$out"; echo "::error::a make check gate is unreachable from CI"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q "check-ci-reach: OK" || {
+            echo "::error::the CI-reachability guard exited 0 without reaching its verdict"
+            exit 1
+          }
