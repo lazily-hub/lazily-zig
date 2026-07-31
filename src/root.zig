@@ -113,6 +113,9 @@ pub const conformance_json = @import("./lazily/conformance_json.zig");
 pub const stdlib_conformance = @import("./lazily/stdlib_conformance.zig");
 pub const collections_conformance = @import("./lazily/collections_conformance.zig");
 pub const distributed_conformance = @import("./lazily/distributed_conformance.zig");
+// Frame-codec round-trip obligation (`#lzmsgpackparity`): the json half of
+// protocol.md § Frame codecs, replayed THROUGH the codec.
+pub const codec_conformance = @import("./lazily/codec_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;

@@ -129,11 +129,17 @@ pub const Peer = struct {
                 "stdlib_timeout_v1",
                 "stdlib_revision_barrier_v1",
             },
-            .codecs = [_][]const u8{ "json", "msgpack" },
+            // json ONLY. This used to advertise `msgpack` as well, with no
+            // encoder behind it (`#lzmsgpackparity`) — a peer that negotiated
+            // it would have gotten a frame this binding cannot produce. Every
+            // other non-implementing binding declares it a carve_out; that is
+            // the fail-CLOSED form of the same gap, and it is what belongs
+            // here until lazily-zig encodes named-field MessagePack.
+            .codecs = [_][]const u8{"json"},
             .channels = [_][]const u8{},
             .channel_variants = EmptyObject{},
             .platform_profile = "portable",
-            .carve_outs = [_][]const u8{"transport_links"},
+            .carve_outs = [_][]const u8{ "msgpack", "transport_links" },
         });
     }
 
