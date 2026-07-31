@@ -266,11 +266,10 @@ pub fn main() !void {
         // The cluster around the promote threshold (64) is deliberate: a naive
         // promote/demote pair thrashes at exactly threshold+1 and is invisible
         // at every other width.
-        32,        63,        64,         65,        96,
-        128,       129,       160,        256,       1_024,
-        4_096,     65_536,    262_144,    1_000_000,
-        4_000_000, 10_000_000,
-        100_000_000,
+        32,         63,          64,      65,        96,
+        128,        129,         160,     256,       1_024,
+        4_096,      65_536,      262_144, 1_000_000, 4_000_000,
+        10_000_000, 100_000_000,
     };
 
     std.debug.print(

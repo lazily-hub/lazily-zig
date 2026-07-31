@@ -479,8 +479,7 @@ test "windowing conformance: tumbling_count" {
         const emit = w.push(v);
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        var exp = cj.AssertionKeys.init(
-            "windowing expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("windowing expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("output", w.output(), struct {
             fn check(actual: ?i64, want: json.Value) !void {
@@ -516,8 +515,7 @@ test "windowing conformance: tumbling_time" {
         }
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        var exp = cj.AssertionKeys.init(
-            "windowing expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("windowing expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("output", w.output(), struct {
             fn check(actual: ?i64, want: json.Value) !void {
@@ -549,8 +547,7 @@ test "windowing conformance: sliding_count" {
         const emit = try w.push(v);
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        var exp = cj.AssertionKeys.init(
-            "windowing expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("windowing expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("output", w.output(), struct {
             fn check(actual: ?i64, want: json.Value) !void {
@@ -586,8 +583,7 @@ test "windowing conformance: session" {
         }
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
-        var exp = cj.AssertionKeys.init(
-            "windowing expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("windowing expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("output", w.output(), struct {
             fn check(actual: ?i64, want: json.Value) !void {

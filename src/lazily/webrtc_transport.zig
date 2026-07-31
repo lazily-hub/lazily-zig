@@ -332,8 +332,8 @@ test "lazily/webrtc_transport: WebRtcSink filters CrdtSync by read permission" {
     const msg = ipc.IpcMessage{ .CrdtSync = ipc.CrdtSync.init(
         &.{},
         &.{
-            .{ .node = 10, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = ipc.IpcValue.fromInline(&.{ 1 }) },
-            .{ .node = 20, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = ipc.IpcValue.fromInline(&.{ 2 }) },
+            .{ .node = 10, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = ipc.IpcValue.fromInline(&.{1}) },
+            .{ .node = 20, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = ipc.IpcValue.fromInline(&.{2}) },
         },
     ) };
     try sink.send(allocator, msg);

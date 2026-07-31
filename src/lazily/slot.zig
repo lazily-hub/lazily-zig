@@ -156,11 +156,11 @@ pub fn deinitSlotValue(
                     // T is not a pointer, check for deinit method
                     if (comptime @typeInfo(T) == .@"struct" and
                         @hasDecl(T, "deinit"))
-                        {
-                            // For indirect, val should be single_ptr pointing to T
+                    {
+                        // For indirect, val should be single_ptr pointing to T
                         var mutable_value = value;
-                            mutable_value.deinit(_ctx);
-                        }
+                        mutable_value.deinit(_ctx);
+                    }
                 },
             }
         }
@@ -688,7 +688,6 @@ test "lazily/slot: concurrent set+get soak — invalidate-in-place (#lzinplace)"
     try std.testing.expectEqual(@as(u64, 20_000), ops.load(.monotonic));
     if (err) |e| return e;
 }
-
 
 // ---------------------------------------------------------------------------
 // Re-entrant `destroy` from a payload destructor (`#lzspecedgeindex`)

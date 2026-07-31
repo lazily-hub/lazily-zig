@@ -379,10 +379,14 @@ pub fn main() !void {
         \\
     , .{
         control_width,
-        worst[0], worst_w[0],
-        worst[1], worst_w[1],
-        worst[2], worst_w[2],
-        worst[3], worst_w[3],
+        worst[0],
+        worst_w[0],
+        worst[1],
+        worst_w[1],
+        worst[2],
+        worst_w[2],
+        worst[3],
+        worst_w[3],
     });
 
     // Only the shipped arm asserts. The naive arms are expected to blow through

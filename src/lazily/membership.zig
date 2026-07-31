@@ -536,8 +536,7 @@ test "membership conformance: membership_lifecycle" {
             return error.UnknownOp;
         }
 
-        var exp = cj.AssertionKeys.init(
-            "membership expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("membership expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
 
         // Per-peer state assertions.

@@ -448,8 +448,7 @@ test "presence conformance: ephemeral" {
             cell.tick(now);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "presence expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("presence expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("value", cell.value());
         try cj.assertInvalidates(&exp, "value", cell.valueVersion() != pre);
@@ -485,8 +484,7 @@ test "presence conformance: presence" {
             try cell.tick(now);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "presence expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("presence expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("present", cell.presentSig(), struct {
             fn check(actual: []const u8, present: json.Value) !void {
@@ -525,8 +523,7 @@ test "presence conformance: awareness" {
             try cell.tick(now);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "presence expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("presence expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("present", cell.presentSig(), struct {
             fn check(actual: []const u8, present: json.Value) !void {

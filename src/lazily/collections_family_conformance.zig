@@ -440,8 +440,7 @@ fn Engine(comptime Model: type) type {
 
             for (steps.items, 0..) |step, i| {
                 const op = try required(step, "op");
-                var expected = cj.AssertionKeys.init(
-                    "collections-family expected", try required(step, "expected"));
+                var expected = cj.AssertionKeys.init("collections-family expected", try required(step, "expected"));
                 defer expected.finish() catch @panic("conformance assertion-key check failed");
 
                 // Sample every reader class before the op.

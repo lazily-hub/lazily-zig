@@ -769,16 +769,18 @@ pub const LosslessTreeCrdt = struct {
                 .sort_stamp = n.*.sort_stamp,
                 .body = switch (n.*.body) {
                     .element => |k| .{ .element = try self.allocator.dupe(u8, k) },
-                    .leaf => |l| .{ .leaf = .{
-                        .kind = l.kind,
-                        .text = blk: {
-                            const t = try self.allocator.create(TextCrdt);
-                            // Same-peer deep copy: a leaf's text keeps its create
-                            // peer so char ids stay identical across forks.
-                            t.* = try l.text.fork(l.text.peer);
-                            break :blk t;
+                    .leaf => |l| .{
+                        .leaf = .{
+                            .kind = l.kind,
+                            .text = blk: {
+                                const t = try self.allocator.create(TextCrdt);
+                                // Same-peer deep copy: a leaf's text keeps its create
+                                // peer so char ids stay identical across forks.
+                                t.* = try l.text.fork(l.text.peer);
+                                break :blk t;
+                            },
                         },
-                    } },
+                    },
                 },
                 .tomb = n.*.tomb,
                 .text_head = n.*.text_head,

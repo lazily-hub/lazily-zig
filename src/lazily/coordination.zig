@@ -576,8 +576,7 @@ test "coordination conformance: lease" {
             try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), r);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "coordination expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("coordination expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("holder", cell.holderAt(now), struct {
             fn check(actual: ?u64, want: json.Value) !void {
@@ -617,8 +616,7 @@ test "coordination conformance: leader" {
             _ = cell.tick(now);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "coordination expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("coordination expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("role", leaderRoleName(cell.role(now)));
         try exp.assertKeyWith("current_leader", cell.currentLeader(now), struct {
@@ -659,8 +657,7 @@ test "coordination conformance: lock" {
             try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), r);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "coordination expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("coordination expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("is_locked", cell.isLocked(now));
         try exp.assertKey("fence", cell.fenceValue());
@@ -690,8 +687,7 @@ test "coordination conformance: semaphore" {
             cell.release(); // returns: null
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "coordination expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("coordination expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("permits_available", cell.permitsAvailable());
         try cj.assertInvalidates(&exp, "permits_available", cell.permitsVersion() != pre);
@@ -720,8 +716,7 @@ test "coordination conformance: quorum" {
             try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), r);
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "coordination expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("coordination expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("votes", cell.count());
         try exp.assertKey("is_open", cell.isOpen());

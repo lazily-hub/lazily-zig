@@ -475,8 +475,7 @@ test "resilience conformance: circuit_breaker" {
             return error.UnknownOp;
         }
 
-        var exp = cj.AssertionKeys.init(
-            "resilience expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("resilience expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("state", breaker.state().specName());
         try cj.assertInvalidates(&exp, "state", breaker.stateVersion() != pre);
@@ -508,8 +507,7 @@ test "resilience conformance: retry" {
             return error.UnknownOp;
         }
 
-        var exp = cj.AssertionKeys.init(
-            "resilience expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("resilience expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("delay", retry.delay());
         try cj.assertInvalidates(&exp, "delay", retry.delayVersion() != pre);
@@ -544,8 +542,7 @@ test "resilience conformance: bulkhead" {
             return error.UnknownOp;
         }
 
-        var exp = cj.AssertionKeys.init(
-            "resilience expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("resilience expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("in_use", bulkhead.inUse());
         try cj.assertInvalidates(&exp, "in_use", bulkhead.inUseVersion() != pre);
@@ -579,8 +576,7 @@ test "resilience conformance: timeout" {
             return error.UnknownOp;
         }
 
-        var exp = cj.AssertionKeys.init(
-            "resilience expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("resilience expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("is_timed_out", timeout.isTimedOut());
         try cj.assertInvalidates(&exp, "is_timed_out", timeout.timedOutVersion() != pre);

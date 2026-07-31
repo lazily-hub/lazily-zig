@@ -472,8 +472,7 @@ test "temporal conformance: timer_single_shot" {
         const edge = timer.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        var exp = cj.AssertionKeys.init(
-            "temporal expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("temporal expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("fired", timer.hasFired());
         // A single-shot timer's payload is the unit, so the fixture's `"()"`
@@ -510,8 +509,7 @@ test "temporal conformance: interval_periodic" {
         const edge = iv.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        var exp = cj.AssertionKeys.init(
-            "temporal expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("temporal expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("count", iv.count());
         try exp.assertKeyWith("next_fire", iv.nextFire(), struct {
@@ -547,8 +545,7 @@ test "temporal conformance: cron_pattern" {
         const edge = cron.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        var exp = cj.AssertionKeys.init(
-            "temporal expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("temporal expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("count", cron.count());
         try exp.assertKeyWith("next_fire", cron.nextFire(), struct {
@@ -579,8 +576,7 @@ test "temporal conformance: deadline_expiry" {
         const edge = d.tick(now);
 
         try std.testing.expectEqual(try jsonAsBool(try jsonFieldRequired(step, "returns")), edge);
-        var exp = cj.AssertionKeys.init(
-            "temporal expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("temporal expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("state", deadlineStateName(d.state()));
         try exp.assertKey("value", d.value());

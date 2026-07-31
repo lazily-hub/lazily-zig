@@ -229,7 +229,7 @@ test "lazily/state_mirror: snapshot + delta round-trip" {
         3,
         &.{
             .{ .node = 101, .type_tag = "doc.baseline", .state = ipc.NodeState.fromOpaque() },
-            .{ .node = 102, .type_tag = "doc.cycle", .state = ipc.NodeState.fromPayload(&.{1, 2, 3}) },
+            .{ .node = 102, .type_tag = "doc.cycle", .state = ipc.NodeState.fromPayload(&.{ 1, 2, 3 }) },
         },
         &.{.{ .dependent = 102, .dependency = 101 }},
         &.{101},
@@ -240,7 +240,7 @@ test "lazily/state_mirror: snapshot + delta round-trip" {
     try std.testing.expectEqual(@as(usize, 1), mirror.edgeCount());
 
     const delta = ipc.Delta.init(3, 6, &.{
-        .{ .CellSet = .{ .node = 102, .payload = ipc.IpcValue.fromInline(&.{9, 9}) } },
+        .{ .CellSet = .{ .node = 102, .payload = ipc.IpcValue.fromInline(&.{ 9, 9 }) } },
         .{ .NodeAdd = .{ .node = 104, .type_tag = "doc.patch", .state = ipc.NodeState.fromOpaque() } },
         .{ .EdgeAdd = .{ .dependent = 104, .dependency = 102 } },
         .{ .NodeRemove = .{ .node = 101 } },

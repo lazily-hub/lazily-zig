@@ -1059,8 +1059,7 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
-        var expected = cj.AssertionKeys.init(
-            "queue-family expected", try cj.required(step, "expected"));
+        var expected = cj.AssertionKeys.init("queue-family expected", try cj.required(step, "expected"));
         defer expected.finish() catch @panic("conformance assertion-key check failed");
 
         var where_buf: [192]u8 = undefined;
@@ -1608,8 +1607,7 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
-        var expected = cj.AssertionKeys.init(
-            "queue-family expected", try cj.required(step, "expected"));
+        var expected = cj.AssertionKeys.init("queue-family expected", try cj.required(step, "expected"));
         defer expected.finish() catch @panic("conformance assertion-key check failed");
 
         var where_buf: [192]u8 = undefined;

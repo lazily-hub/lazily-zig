@@ -958,7 +958,6 @@ fn assertState(model: anytype, scopes: json.Value, where: []const u8) !void {
         },
         else => return error.ExpectedObject,
     }
-
 }
 
 fn assertReceipts(model: anytype, receipts: json.Value, where: []const u8) !void {
@@ -1174,8 +1173,7 @@ fn replay(
         // runner read it off the step, so it was always absent and the
         // assertion never ran once. Pin the nesting so that cannot recur here.
         if (jsonField(step, "invalidates") != null) return error.InvalidatesMustNestUnderExpected;
-        var expected = cj.AssertionKeys.init(
-            "ingress-family expected", try jsonFieldRequired(step, "expected"));
+        var expected = cj.AssertionKeys.init("ingress-family expected", try jsonFieldRequired(step, "expected"));
         const StateCheck = StateCtx(@TypeOf(model));
         try expected.assertKeyWith(
             "scopes",

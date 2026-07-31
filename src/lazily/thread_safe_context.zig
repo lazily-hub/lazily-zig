@@ -296,7 +296,7 @@ pub const ThreadSafeContext = struct {
             .box = try self.boxValue(T, undefined),
             .free_fn = Free(T).run,
             .compute_ptr = ptr,
-            .compute_erased = @constCast(@ptrCast(compute)),
+            .compute_erased = @ptrCast(@constCast(compute)),
             .recompute_fn = Recompute(T).run,
             .dirty = true,
             .deps = .empty,
@@ -362,7 +362,7 @@ pub const ThreadSafeContext = struct {
                 return f(cc);
             }
         };
-        return self.computedClosure(T, @constCast(@ptrCast(compute)), Wrap.call);
+        return self.computedClosure(T, @ptrCast(@constCast(compute)), Wrap.call);
     }
 
     /// The per-`T` recompute thunk: re-run the slot's compute, rebox the result,

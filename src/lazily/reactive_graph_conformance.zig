@@ -98,12 +98,12 @@ const FIXTURES = [_][]const u8{
 
 /// Ops this runner can drive against every model.
 const SUPPORTED_OPS = [_][]const u8{
-    "cell",         "computed",   "effect",         "read",
-    "set_cell",     "dispose",    "fanout",         "dispose_fanout",
-    "churn",        "begin_scope", "end_scope",     "disarm",
+    "cell",                 "computed",    "effect",         "read",
+    "set_cell",             "dispose",     "fanout",         "dispose_fanout",
+    "churn",                "begin_scope", "end_scope",      "disarm",
     "dispose_stale_handle",
     // Signal eagerness (`#lzsignaleager`).
-    "signal",       "dispose_signal", "batch",
+    "signal",      "dispose_signal", "batch",
     // Arms the next N computes of an existing node to fail, so a fixture can
     // assert on `computes_of` that a failed compute is never cached.
     "fail_next",
@@ -113,10 +113,9 @@ const SUPPORTED_OPS = [_][]const u8{
 /// fails loudly — silently ignoring an assertion is the anti-pattern this
 /// runner exists to kill.
 const SUPPORTED_ASSERTIONS = [_][]const u8{
-    "note",           "value",           "error",   "read",
-    "readable",       "dependents_of",   "dependencies_of",
-    "observed_by",    "observed_count",  "cleanup_order",
-    "scope_owned_count",
+    "note",           "value",         "error",             "read",
+    "readable",       "dependents_of", "dependencies_of",   "observed_by",
+    "observed_count", "cleanup_order", "scope_owned_count",
     // Signal eagerness (`#lzsignaleager`). The *only* observable that
     // distinguishes an eager signal from the lazy memo it is built on, so it is
     // counted for real — one increment per actual invocation of the compute the

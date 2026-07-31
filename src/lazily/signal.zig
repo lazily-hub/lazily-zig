@@ -427,7 +427,6 @@ test "lazily/signal: dispose reverts to lazy semantics" {
     try std.testing.expectEqual(@as(u32, 1), SignalTestState.counter);
 }
 
-
 // ---------------------------------------------------------------------------
 // Destroying a slot that is queued in `pending_recompute` (`#lzspecedgeindex`)
 // ---------------------------------------------------------------------------
@@ -648,7 +647,6 @@ test "lazily/signal: destroying another slot from inside a drain is safe" {
     try std.testing.expectEqual(neighbor_runs_before, ReentrantDestroyState.neighbor_runs);
     try std.testing.expectEqual(@as(usize, 0), ctx.pending_recompute.items.len);
 }
-
 
 // ---------------------------------------------------------------------------
 // The OTHER `deinitPayload` call site (`#lzspecedgeindex`)

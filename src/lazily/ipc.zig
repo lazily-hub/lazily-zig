@@ -1567,7 +1567,7 @@ test "lazily/ipc: CrdtSync IpcMessage round-trip" {
                 .node = 20,
                 .key = null,
                 .stamp = .{ .wall_time = 99, .logical = 3, .peer = 2 },
-                .state = IpcValue.fromInline(&.{ 42 }),
+                .state = IpcValue.fromInline(&.{42}),
             },
         },
     );
@@ -1632,8 +1632,8 @@ test "lazily/ipc: CrdtSync filter_readable drops non-readable ops" {
     const crdt_sync = CrdtSync.init(
         &.{},
         &.{
-            .{ .node = 10, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = IpcValue.fromInline(&.{ 1 }) },
-            .{ .node = 20, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = IpcValue.fromInline(&.{ 2 }) },
+            .{ .node = 10, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = IpcValue.fromInline(&.{1}) },
+            .{ .node = 20, .stamp = .{ .wall_time = 1, .logical = 0, .peer = 1 }, .state = IpcValue.fromInline(&.{2}) },
         },
     );
 

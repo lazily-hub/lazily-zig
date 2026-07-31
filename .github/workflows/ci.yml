@@ -49,6 +49,15 @@ jobs:
         with:
           version: ${{ matrix.zig }}
 
+      # The formatting gate (#lazilydartzig). Deliberately INSIDE the matrix
+      # rather than in a job of its own: `zig fmt` is the formatter for whichever
+      # toolchain runs it, and a gate that disagreed between 0.15.2, 0.16.0 and
+      # master would be a coin flip depending on which one CI happened to use.
+      # Running it on all three is what proves they agree, continuously, instead
+      # of a comment claiming they do.
+      - name: Format gate (make fmt)
+        run: make fmt
+
       # lazily-spec is the canonical cross-language source for the conformance
       # fixtures. Clone it as a sibling BEFORE the test step so the replay
       # tests read the canonical files rather than skipping (#lzspecconf).

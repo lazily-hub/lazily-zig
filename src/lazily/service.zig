@@ -558,8 +558,7 @@ test "service conformance: health" {
         const pre = cell.healthVersion();
         try cell.set(name, up, critical);
 
-        var exp = cj.AssertionKeys.init(
-            "service expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("service expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("health", cell.health().toString());
         try cj.assertInvalidates(&exp, "health", cell.healthVersion() != pre);
@@ -583,8 +582,7 @@ test "service conformance: readiness" {
         const pre = cell.readyVersion();
         try cell.set(name, ready_val);
 
-        var exp = cj.AssertionKeys.init(
-            "service expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("service expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKey("ready", cell.ready());
         try cj.assertInvalidates(&exp, "ready", cell.readyVersion() != pre);
@@ -623,8 +621,7 @@ test "service conformance: discovery" {
             );
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "service expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("service expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         var proj = try cell.discovery(std.testing.allocator);
         defer proj.deinit();
@@ -658,8 +655,7 @@ test "service conformance: service_registry" {
             try reg.replay();
         } else return error.UnknownOp;
 
-        var exp = cj.AssertionKeys.init(
-            "service expected", try jsonFieldRequired(step, "expected"));
+        var exp = cj.AssertionKeys.init("service expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         try exp.assertKeyWith("projection", reg.projectionMap(), expectMapEquals);
         try cj.assertInvalidates(&exp, "projection", reg.projectionVersion() != pre);

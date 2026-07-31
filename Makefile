@@ -10,12 +10,33 @@ CONFORMANCE_MANIFEST ?= $(CURDIR)/build/conformance-fixtures-loaded.txt
 
 .PHONY: \
 	check \
+fmt \
+fmt-fix \
 test \
 test-interop-peer \
 test-lean-formal \
 ci-reach
 
-check: test test-interop-peer test-lean-formal conformance-coverage ci-reach
+check: fmt test test-interop-peer test-lean-formal conformance-coverage ci-reach
+
+# The formatting GATE (#lazilydartzig). This binding had no formatting floor at
+# all — nothing in `check`, nothing in CI — so drift was invisible until someone
+# read a diff.
+#
+# `zig fmt` is canonical and ships with the toolchain, so adopting it costs no new
+# dependency. The one real question was WHICH toolchain's `zig fmt`, because this
+# repo pins three (0.15.2 / 0.16.0 / master) and a formatter that disagreed across
+# them would make the gate a coin flip. It does not: all three flag exactly the
+# same 21 files on the pre-format tree, so `$(ZIG)` needs no pin here. The CI step
+# runs inside the existing three-toolchain matrix, which keeps re-proving that
+# rather than trusting this comment.
+#
+# --check is the gate; the rewriting form is `fmt-fix` and is not in `check`.
+fmt:
+	$(ZIG) fmt --check .
+
+fmt-fix:
+	$(ZIG) fmt .
 
 # Truncate once here, then let every test binary APPEND. The recorder is a no-op
 # when LAZILY_CONFORMANCE_MANIFEST is unset, so a bare `zig build test` (or
