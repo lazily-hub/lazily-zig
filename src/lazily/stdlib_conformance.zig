@@ -272,7 +272,7 @@ fn replayFixture(name: []const u8) !void {
     // fixtures key by `id`, so the ledger records the fixture's own ids.
     var ledger = try corpus.scenarios(name, fixture.value);
     while (ledger.next()) |scenario| {
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         if (std.mem.eql(u8, feature, "stdlib_timer_v1")) {
             try replayTimer(scenario);
         } else if (std.mem.eql(u8, feature, "stdlib_timeout_v1")) {

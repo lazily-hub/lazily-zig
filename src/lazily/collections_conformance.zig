@@ -257,7 +257,7 @@ test "collections conformance: mergecell_algebra.json" {
     var steps_replayed: usize = 0;
     while (ledger.next()) |scenario| {
         const si = ledger.at();
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         const policy = try policyByName(try cj.asStr(try cj.required(scenario, "policy")));
 
         // The transport-selected property flags are part of the contract: they
@@ -412,7 +412,7 @@ test "collections conformance: semtree_incremental.json" {
 
     while (ledger.next()) |scenario| {
         const si = ledger.at();
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         const fold = try foldByName(try cj.asStr(try cj.required(scenario, "fold")));
         var tree = try buildTree(allocator, try cj.required(scenario, "tree"));
         defer tree.deinit();
@@ -531,7 +531,7 @@ test "collections conformance: stableid_alignment.json" {
     var claims: usize = 0;
     while (ledger.next()) |scenario| {
         const si = ledger.at();
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         const expect = try cj.required(scenario, "expect");
 
         // Shape 1: one `blocks` list, with key-identity claims over its indices.

@@ -1931,7 +1931,7 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
     while (ledger.next()) |sc| {
         if (obs_len == obs_bufs.len) return error.TooManyScenarios;
         const name = try asString(field(sc, "name") orelse return error.MissingScenarioName);
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         var label_buf: [96]u8 = undefined;
         const label = try std.fmt.bufPrint(&label_buf, "[{s}]", .{name});
 

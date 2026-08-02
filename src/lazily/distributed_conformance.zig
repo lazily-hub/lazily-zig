@@ -113,7 +113,7 @@ test "distributed conformance: anti_entropy_converge.json" {
 
     var ops_replayed: usize = 0;
     while (ledger.next()) |scenario| {
-        const name = ledger.replaying();
+        const name = try ledger.replaying();
         var expect = cj.AssertionKeys.init(
             "distributed/anti_entropy_converge.json expect",
             try cj.required(scenario, "expect"),

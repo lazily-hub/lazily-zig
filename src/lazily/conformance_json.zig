@@ -210,29 +210,42 @@ test "conformance_json: an absent corpus loads as null rather than failing" {
 // Per-scenario replay accounting (#lzscenariocoverage)
 // ---------------------------------------------------------------------------
 
-/// A scenario id spelled positionally is at most `#` plus 20 digits.
-const POSITIONAL_ID_MAX = 24;
-
 /// Resolve a scenario's identifier in the order every binding uses:
 ///
 ///   1. `id` if present
 ///   2. else `name` if present
-///   3. else the positional index, spelled `#<n>` (0-based)
 ///
-/// The corpus is not uniform — three `stdlib` fixtures key by `id`, 28 by
-/// `name`, and `collections/mergecell_algebra.json` carries no identifier at
-/// all (its scenarios are told apart only by `policy`). The positional fallback
-/// exists so per-scenario accounting is not blocked on a shared-corpus edit;
-/// the coverage guard REPORTS every id that fell back to it, because the
-/// visibility is what makes the corpus gap fixable later.
-pub fn scenarioIdInto(scenario: Value, index: usize, buf: []u8) []const u8 {
+/// There is no third step (`#lzspecscenarioids`). The positional `#<n>` fallback
+/// let the ledger record a scenario BY POSITION, where inserting one ahead of it
+/// silently rebinds that entry — and any excuse naming it — to a different
+/// scenario, with nothing turning red: the guard compares "index 1 was replayed"
+/// against whatever now sits at index 1 and agrees with itself.
+///
+/// It was load-bearing for exactly one fixture,
+/// `collections/mergecell_algebra.json`, whose scenarios were told apart only by
+/// `policy`. They carry ids now, and lazily-spec's `scenario-identity-check`
+/// keeps every scenario identified — so this is a hole with no users, which is
+/// one waiting to become load-bearing again.
+///
+/// A blank identifier is refused for the same reason: it would file every
+/// blank-id scenario under one ledger entry, which reads as "replayed" the moment
+/// any one of them runs. `index` is carried only so the error can name the
+/// offending position.
+pub fn scenarioId(scenario: Value, index: usize) error{ScenarioUnidentified}![]const u8 {
     if (field(scenario, "id")) |v| {
-        if (v == .string and v.string.len > 0) return v.string;
+        if (v == .string and std.mem.trim(u8, v.string, " \t\r\n").len > 0) return v.string;
     }
     if (field(scenario, "name")) |v| {
-        if (v == .string and v.string.len > 0) return v.string;
+        if (v == .string and std.mem.trim(u8, v.string, " \t\r\n").len > 0) return v.string;
     }
-    return std.fmt.bufPrint(buf, "#{d}", .{index}) catch "#?";
+    std.debug.print(
+        "scenario at index {d} carries neither `id` nor `name`. The replay ledger would " ++
+            "have to record it by POSITION, where inserting a scenario ahead of it silently " ++
+            "rebinds that entry to a different scenario. Give it a stable id upstream in " ++
+            "lazily-spec (#lzspecscenarioids).\n",
+        .{index},
+    );
+    return error.ScenarioUnidentified;
 }
 
 /// The shared scenario-iteration helper, and the one place a scenario is
@@ -249,7 +262,6 @@ pub const Scenarios = struct {
     fixture: []const u8,
     items: []const Value,
     index: usize = 0,
-    id_buf: [POSITIONAL_ID_MAX]u8 = undefined,
 
     pub fn len(self: Scenarios) usize {
         return self.items.len;
@@ -269,15 +281,14 @@ pub const Scenarios = struct {
 
     /// The resolved id of the scenario `next()` last yielded, WITHOUT recording
     /// it. For a skip decision that needs to name the scenario it is skipping.
-    /// The slice may borrow `id_buf`, so it does not outlive the iteration.
-    pub fn currentId(self: *Scenarios) []const u8 {
-        return scenarioIdInto(self.items[self.index - 1], self.index - 1, &self.id_buf);
+    pub fn currentId(self: *Scenarios) error{ScenarioUnidentified}![]const u8 {
+        return scenarioId(self.items[self.index - 1], self.index - 1);
     }
 
     /// Record the scenario `next()` last yielded as REPLAYED and return its
     /// resolved id.
-    pub fn replaying(self: *Scenarios) []const u8 {
-        const id = self.currentId();
+    pub fn replaying(self: *Scenarios) error{ScenarioUnidentified}![]const u8 {
+        const id = try self.currentId();
         recordScenario(self.fixture, id);
         return id;
     }
@@ -306,8 +317,8 @@ pub fn replayingScenario(fixture: []const u8, fx: Value, id: []const u8) !Value 
 fn replayingScenarioImpl(fixture: []const u8, fx: Value, id: []const u8, quiet: bool) !Value {
     var it = try scenarios(fixture, fx);
     while (it.next()) |scenario| {
-        if (!std.mem.eql(u8, it.currentId(), id)) continue;
-        _ = it.replaying();
+        if (!std.mem.eql(u8, try it.currentId(), id)) continue;
+        _ = try it.replaying();
         return scenario;
     }
     if (!quiet) std.debug.print(
@@ -721,7 +732,7 @@ pub fn assertionKeys(where: []const u8, value: Value, name: []const u8) ?Asserti
     return AssertionKeys.init(where, block);
 }
 
-test "conformance_json: scenario ids resolve id -> name -> positional" {
+test "conformance_json: scenario ids resolve id -> name, and refuse an unidentified scenario" {
     const allocator = std.testing.allocator;
     var parsed = try json.parseFromSlice(
         Value,
@@ -739,19 +750,35 @@ test "conformance_json: scenario ids resolve id -> name -> positional" {
     var it = try scenarios("fake/fixture.json", parsed.value);
     try std.testing.expectEqual(@as(usize, 3), it.len());
 
-    var seen: [3][]const u8 = undefined;
-    var buf: [3][POSITIONAL_ID_MAX]u8 = undefined;
+    var seen: [2][]const u8 = undefined;
     var n: usize = 0;
     while (it.next()) |sc| {
-        // `currentId` borrows the iterator's buffer for the positional case, so
-        // copy before advancing.
-        const id = scenarioIdInto(sc, it.at(), &buf[n]);
-        seen[n] = id;
-        n += 1;
+        if (n < 2) {
+            seen[n] = try scenarioId(sc, it.at());
+            n += 1;
+            continue;
+        }
+        // The third scenario carries neither `id` nor `name`. There is no
+        // positional fallback (#lzspecscenarioids): a ledger entry recorded BY
+        // POSITION silently rebinds to a different scenario on a corpus reorder,
+        // so resolution refuses rather than inventing an id.
+        try std.testing.expectError(error.ScenarioUnidentified, scenarioId(sc, it.at()));
     }
     try std.testing.expectEqualStrings("by_id", seen[0]);
     try std.testing.expectEqualStrings("by_name", seen[1]);
-    try std.testing.expectEqualStrings("#2", seen[2]);
+
+    // A blank identifier is not an identifier: accepting it would file every
+    // blank-id scenario under one ledger entry.
+    var blank = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"scenarios\":[{\"id\":\"  \",\"name\":\"\"}]}",
+        .{},
+    );
+    defer blank.deinit();
+    var blank_it = try scenarios("fake/blank.json", blank.value);
+    const first = blank_it.next().?;
+    try std.testing.expectError(error.ScenarioUnidentified, scenarioId(first, 0));
 }
 
 test "conformance_json: replayingScenario refuses an id the fixture does not carry" {

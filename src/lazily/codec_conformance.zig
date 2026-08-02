@@ -193,7 +193,7 @@ test "lazily/codec: json frames round-trip through the reference codec" {
     while (scenarios.next()) |scenario| {
         // Record at the point of replay (`#lzscenariocoverage`): a scenario this
         // loop stops reaching stops being recorded.
-        _ = scenarios.replaying();
+        _ = try scenarios.replaying();
         const wire_json = try std.json.Stringify.valueAlloc(
             std.testing.allocator,
             try cj.required(scenario, "wire"),
@@ -313,7 +313,7 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
     var scenarios = try cj.scenarios(MSGPACK_FIXTURE, root);
     var replayed: usize = 0;
     while (scenarios.next()) |scenario| {
-        _ = scenarios.replaying();
+        _ = try scenarios.replaying();
 
         // `wire` is the REFERENCE json form — the fixture's two halves carry
         // byte-identical `wire` blocks on purpose, so the msgpack half starts

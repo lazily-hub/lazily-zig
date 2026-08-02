@@ -580,7 +580,7 @@ test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
     var ledger = try cj.scenarios("familysync/materialize_on_ingest.json", fixture);
     try std.testing.expect(ledger.len() > 0);
     while (ledger.next()) |scenario| {
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         const obj = scenario.object;
         const origin_peer: PeerId = @intCast(obj.get("origin_peer").?.integer);
         const target_peer: PeerId = @intCast(obj.get("target_peer").?.integer);

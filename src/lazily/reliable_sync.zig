@@ -602,7 +602,7 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
     var ledger = try cj.scenarios(RS_OUTBOX_STORE, parsed.value);
     var replayed: usize = 0;
     while (ledger.next()) |scenario| {
-        _ = ledger.replaying();
+        _ = try ledger.replaying();
         const sc = scenario.object;
 
         var store = InMemoryStore.init(allocator);

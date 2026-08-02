@@ -116,7 +116,7 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     while (scenarios.next()) |scenario| {
         // Record at the point of replay (`#lzscenariocoverage`): a scenario
         // this loop stops reaching stops being recorded.
-        _ = scenarios.replaying();
+        _ = try scenarios.replaying();
 
         const expect = try cj.required(scenario, "expect");
         const decimal = try cj.asStr(try cj.required(expect, "node_id_decimal"));

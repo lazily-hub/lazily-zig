@@ -153,7 +153,7 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
 
     var scenarios = try cj.scenarios(FIXTURE, root);
     while (scenarios.next()) |scenario| {
-        _ = scenarios.replaying();
+        _ = try scenarios.replaying();
         replayed += 1;
 
         const expect = try cj.required(scenario, "expect");

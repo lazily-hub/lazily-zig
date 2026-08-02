@@ -256,17 +256,25 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # Resolve a fixture's scenario ids in the order EVERY binding uses:
-#   1. `id` if present, 2. else `name` if present, 3. else `#<index>` (0-based).
+#   1. `id` if present, 2. else `name` if present.
 # Prints nothing for a fixture with no `scenarios` array.
+#
+# There is no positional fallback (#lzspecscenarioids): an id derived from a
+# POSITION silently rebinds to a different scenario when the corpus array is
+# reordered, so an unidentified scenario is marked and reported rather than
+# given an invented id.
 scenario_ids_on_disk() {
-  jq -r '(.scenarios // []) | to_entries[] | (.value.id // .value.name // "#\(.key)")' \
+  jq -r '
+    def identifier: if type == "string" and (gsub("\\s"; "") != "") then . else null end;
+    (.scenarios // [])
+    | to_entries[]
+    | ((.value.id? | identifier) // (.value.name? | identifier) // "!UNIDENTIFIED!\(.key)")' \
     "$SPEC_DIR/$1"
 }
 
 scenario_total=0
 scenario_replayed=0
 scenario_excused=0
-positional=""
 
 # --- forward: every scenario of an OPENED fixture must be in the ledger ------
 while IFS= read -r fixture; do
@@ -274,8 +282,18 @@ while IFS= read -r fixture; do
   while IFS= read -r sid; do
     [ -n "$sid" ] || continue
     scenario_total=$((scenario_total + 1))
+    # An unidentified scenario is a corpus defect, not an id to invent
+    # (#lzspecscenarioids). Booking it by POSITION would silently rebind that
+    # ledger entry to a different scenario on any corpus reorder.
     case "$sid" in
-      '#'*) positional+="$fixture$TAB$sid"$'\n' ;;
+      '!UNIDENTIFIED!'*)
+        echo "ERROR: '$fixture' scenario at index ${sid#!UNIDENTIFIED!} carries neither" >&2
+        echo "       \`id\` nor \`name\`. The ledger would record it by POSITION, which" >&2
+        echo "       silently rebinds on a corpus reorder. Give it a stable id upstream" >&2
+        echo "       in lazily-spec (#lzspecscenarioids)." >&2
+        missing=$((missing + 1))
+        continue
+        ;;
     esac
     if grep -qxF "$fixture$TAB$sid" <<< "$SCENARIO_LEDGER"; then
       scenario_replayed=$((scenario_replayed + 1))
@@ -397,17 +415,6 @@ if [ "$scenario_replayed" -lt "$MIN_SCENARIOS" ]; then
   echo "       A scenario dispatch stopped matching, or the ledger detached." >&2
   echo "       Do not lower MIN_SCENARIOS to fix this." >&2
   exit 1
-fi
-
-# A positional id is NOT a failure — it is the fallback that keeps this check
-# off the critical path of a shared-corpus edit. It is reported because the
-# visibility is what makes the corpus gap fixable later: these scenarios carry
-# neither `id` nor `name` upstream, so the ledger can only tell them apart by
-# position, and a reordering upstream would move the accounting silently.
-if [ -n "$positional" ]; then
-  echo "NOTE: scenario ids that fell back to the POSITIONAL index (no \`id\`, no \`name\`" \
-       "in the corpus — fix belongs upstream in lazily-spec, not here):"
-  printf '%s' "$positional" | sed 's/^/      /'
 fi
 
 echo "conformance coverage OK: $covered/$total canonical fixtures OPENED by the suite" \
