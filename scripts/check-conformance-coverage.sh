@@ -38,15 +38,6 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
-  # msgpack is a protocol.md MUST that lazily-zig does not implement
-  # (#lzmsgpackparity). This binding did not even declare the gap: it
-  # ADVERTISED `msgpack` in the capability handshake with no encoder behind
-  # it, so a peer could negotiate a codec it cannot produce. The handshake
-  # now carve_outs msgpack, and the gap is recorded here beside every other
-  # declared one. The `json` half of the codec obligation IS replayed
-  # (src/lazily/codec_conformance.zig), so this entry names exactly what is
-  # missing rather than the whole obligation.
-  "codec/frame_roundtrip_msgpack.json"
   # No runner at all in this binding.
   "agent-doc/delta_agent_doc_state.json"
   "agent-doc/snapshot_agent_doc_state.json"

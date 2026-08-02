@@ -9,25 +9,34 @@
 //! replay never exercises a codec, so a binding could carve out a MUST-level
 //! codec and stay green on every rung.
 //!
-//! lazily-zig implements the `json` half. `msgpack` is now an explicit
-//! carve-out in `interop_peer.zig` and in
-//! `scripts/check-conformance-coverage.sh`; it used to be ADVERTISED in the
-//! capability handshake with no encoder behind it, which is the fail-open form
-//! of the same gap.
+//! lazily-zig implements BOTH halves (`#lzmsgpackseven`). `msgpack` was a
+//! carve-out here and in `interop_peer.zig`; before that it was ADVERTISED in
+//! the capability handshake with no encoder behind it, which is the fail-open
+//! form of the same gap.
 //!
 //! The runner decodes `wire`, RE-ENCODES the decoded message, decodes again,
 //! and checks every `expect` key against that second decode. Asserting against
 //! the fixture literal would prove nothing: the literal never passed through an
 //! encoder.
+//!
+//! The msgpack half additionally introspects the ENCODED BYTES through
+//! `msgpack.toJsonValue`. The named-field rule is a property of the ENCODING,
+//! so it is invisible to every assertion over a decoded `IpcMessage`: a
+//! positional encoder round-trips each value correctly and is still speaking a
+//! wire no `msgpack` peer can read. `encoded_envelope_key` /
+//! `encoded_body_field_names` / `first_node_encoded_field_names` /
+//! `first_op_encoded_field_names` are the executable form of that rule.
 
 const std = @import("std");
 const cj = @import("conformance_json.zig");
 const ipc = @import("ipc.zig");
+const mp = @import("msgpack.zig");
 
 const Value = std.json.Value;
 const IpcMessage = ipc.IpcMessage;
 
 const JSON_FIXTURE = "codec/frame_roundtrip_json.json";
+const MSGPACK_FIXTURE = "codec/frame_roundtrip_msgpack.json";
 
 fn variantOf(message: IpcMessage) []const u8 {
     return @tagName(std.meta.activeTag(message));
@@ -216,6 +225,181 @@ test "lazily/codec: json frames round-trip through the reference codec" {
         // contents. Both strings come from the SAME encoder, so this is a
         // round-trip claim, not a byte-canonicality claim about the codec.
         try keys.assertKey("round_trip_equals_source", std.mem.eql(u8, encoded, reencoded));
+        try assertValues(&keys, round.message);
+        try keys.finish();
+        replayed += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), replayed);
+}
+
+// ---------------------------------------------------------------------------
+// msgpack — the cross-language binary default
+// ---------------------------------------------------------------------------
+
+/// No frame body, node, or op in the corpus carries more fields than this.
+const MAX_ENCODED_FIELDS = 32;
+
+fn lessThanName(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+/// The field names of an encoded map, SORTED. A MessagePack map's key order is
+/// encoder-defined (§ Frame codecs, "not byte-canonical"), so the fixture's
+/// lists are sorted and a runner MUST sort before comparing. Comparing in
+/// encounter order would pin this encoder's emission order as if it were the
+/// wire, which is exactly the property the spec says peers may not rely on.
+fn sortedFieldNames(value: Value, buf: [][]const u8) ![][]const u8 {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return error.ExpectedNamedFieldMap,
+    };
+    if (object.count() > buf.len) return error.TooManyEncodedFields;
+    const out = buf[0..object.count()];
+    for (object.keys(), out) |name, *slot| slot.* = name;
+    std.mem.sort([]const u8, out, {}, lessThanName);
+    return out;
+}
+
+const Envelope = struct { key: []const u8, body: Value };
+
+/// The externally tagged envelope: exactly ONE entry, keyed by the variant
+/// NAME. An internally tagged `{"type": 0, "value": …}` frame has two entries
+/// and dies here.
+fn envelopeOf(view: Value) !Envelope {
+    const object = switch (view) {
+        .object => |o| o,
+        else => return error.ExpectedExternallyTaggedEnvelope,
+    };
+    if (object.count() != 1) return error.ExpectedExternallyTaggedEnvelope;
+    return .{ .key = object.keys()[0], .body = object.values()[0] };
+}
+
+fn encodedField(value: Value, name: []const u8) !Value {
+    return switch (value) {
+        .object => |o| o.get(name) orelse error.MissingEncodedField,
+        else => error.ExpectedNamedFieldMap,
+    };
+}
+
+fn encodedElements(value: Value, name: []const u8) ![]const Value {
+    return switch (try encodedField(value, name)) {
+        .array => |a| a.items,
+        else => error.ExpectedArray,
+    };
+}
+
+test "lazily/codec: msgpack frames round-trip through the cross-language binary default" {
+    var fixture = (try cj.load(MSGPACK_FIXTURE)) orelse return;
+    defer fixture.deinit();
+    const root = fixture.value;
+
+    try std.testing.expectEqual(@as(u64, 1), try cj.asU64(try cj.required(root, "protocol_version")));
+    try std.testing.expectEqualStrings("FrameCodecRoundTrip", try cj.asStr(try cj.required(root, "kind")));
+    try std.testing.expectEqualStrings("msgpack", try cj.asStr(try cj.required(root, "codec")));
+
+    // `byte_canonical: false` is why this fixture pins decoded values and
+    // sorted field-name lists instead of golden bytes, and `role` is the other
+    // sense of "canonical" protocol.md keeps apart: msgpack is the required
+    // efficient transport, never the reference codec.
+    var meta = cj.AssertionKeys.init(MSGPACK_FIXTURE ++ " assertions", try cj.required(root, "assertions"));
+    try meta.assertKey("codec", "msgpack");
+    try meta.assertKey("self_describing", true);
+    try meta.assertKey("byte_canonical", false);
+    try meta.assertKey("required_of_binding", "MUST");
+    try meta.assertKey("role", "cross_language_binary_default");
+    try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
+    try meta.finish();
+
+    var scenarios = try cj.scenarios(MSGPACK_FIXTURE, root);
+    var replayed: usize = 0;
+    while (scenarios.next()) |scenario| {
+        _ = scenarios.replaying();
+
+        // `wire` is the REFERENCE json form — the fixture's two halves carry
+        // byte-identical `wire` blocks on purpose, so the msgpack half starts
+        // from the same value and differs only in the serialization under test.
+        const wire_json = try std.json.Stringify.valueAlloc(
+            std.testing.allocator,
+            try cj.required(scenario, "wire"),
+            .{},
+        );
+        defer std.testing.allocator.free(wire_json);
+
+        var source = try IpcMessage.decodeJson(std.testing.allocator, wire_json);
+        defer source.deinit();
+        try std.testing.expectEqualStrings(
+            try cj.asStr(try cj.required(scenario, "variant")),
+            variantOf(source.message),
+        );
+
+        // ENCODE the decoded message to msgpack, DECODE those bytes back, and
+        // assert against THAT. The fixture literal never passed through this
+        // codec, so asserting on it would prove nothing about the codec.
+        const frame = try mp.encodeAlloc(std.testing.allocator, source.message);
+        defer std.testing.allocator.free(frame);
+        var round = try mp.decode(std.testing.allocator, frame);
+        defer round.deinit();
+
+        const reframe = try mp.encodeAlloc(std.testing.allocator, round.message);
+        defer std.testing.allocator.free(reframe);
+
+        // Schema-less view of the ENCODED BYTES. Everything below it is
+        // invisible to an assertion over the decoded message.
+        var view = try mp.toJsonValue(std.testing.allocator, frame);
+        defer view.deinit();
+        const envelope = try envelopeOf(view.value);
+
+        var body_names: [MAX_ENCODED_FIELDS][]const u8 = undefined;
+        var first_names: [MAX_ENCODED_FIELDS][]const u8 = undefined;
+        var second_names: [MAX_ENCODED_FIELDS][]const u8 = undefined;
+
+        var keys = cj.AssertionKeys.init(MSGPACK_FIXTURE, try cj.required(scenario, "expect"));
+        // Both frames come from the SAME encoder, so this is a round-trip
+        // claim, not a byte-canonicality claim about the codec — protocol.md
+        // permits two conforming bindings to emit byte-different msgpack for
+        // one `IpcMessage`.
+        try keys.assertKey("round_trip_equals_source", std.mem.eql(u8, frame, reframe));
+        try keys.assertKey("encoded_envelope_key", envelope.key);
+        try keys.assertKeyWith(
+            "encoded_body_field_names",
+            StrList{ .items = try sortedFieldNames(envelope.body, &body_names) },
+            StrList.check,
+        );
+
+        switch (round.message) {
+            .Snapshot => {
+                const nodes = try encodedElements(envelope.body, "nodes");
+                // Carries NO `key`: `NodeSnapshot.key` is absent here and a
+                // self-describing codec OMITS an absent optional
+                // (protocol.md § NodeKey). That is the rule that lets a
+                // pre-`key` decoder read a post-`key` frame, and named-field
+                // encoding is what keeps it identical to the json half.
+                try keys.assertKeyWith(
+                    "first_node_encoded_field_names",
+                    StrList{ .items = try sortedFieldNames(nodes[0], &first_names) },
+                    StrList.check,
+                );
+            },
+            .CrdtSync => {
+                const ops = try encodedElements(envelope.body, "ops");
+                // Both lists DO carry `key`: a `CrdtOp` always writes it, null
+                // when unset, because an anti-entropy op's addressing is part
+                // of its merge identity. The keyless op's absence is asserted
+                // on the DECODED value instead (`first_op_key_absent`).
+                try keys.assertKeyWith(
+                    "first_op_encoded_field_names",
+                    StrList{ .items = try sortedFieldNames(ops[0], &first_names) },
+                    StrList.check,
+                );
+                try keys.assertKeyWith(
+                    "second_op_encoded_field_names",
+                    StrList{ .items = try sortedFieldNames(ops[1], &second_names) },
+                    StrList.check,
+                );
+            },
+            else => {},
+        }
+
         try assertValues(&keys, round.message);
         try keys.finish();
         replayed += 1;

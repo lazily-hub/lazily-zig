@@ -113,7 +113,12 @@ pub const conformance_json = @import("./lazily/conformance_json.zig");
 pub const stdlib_conformance = @import("./lazily/stdlib_conformance.zig");
 pub const collections_conformance = @import("./lazily/collections_conformance.zig");
 pub const distributed_conformance = @import("./lazily/distributed_conformance.zig");
-// Frame-codec round-trip obligation (`#lzmsgpackparity`): the json half of
+// The `msgpack` frame codec (`#lzmsgpackseven`) — the cross-language binary
+// default of protocol.md § Frame codecs, derived from the reference json codec
+// so the two can never disagree about tags, field names, or the
+// omit-when-absent rule.
+pub const msgpack = @import("./lazily/msgpack.zig");
+// Frame-codec round-trip obligation (`#lzmsgpackparity`): both halves of
 // protocol.md § Frame codecs, replayed THROUGH the codec.
 pub const codec_conformance = @import("./lazily/codec_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
