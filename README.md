@@ -4,7 +4,7 @@ A Zig library for lazy evaluation with context caching, reactive graphs, state
 machines, CRDTs, and a distributed state plane — with FFI to use from other
 languages.
 
-Uses similar semantics as [lazily-py](https://github.com/btakita/lazily-py) and
+Uses similar semantics as [lazily-py](https://github.com/lazily-hub/lazily-py) and
 mirrors the wire/logic contracts pinned by
 [lazily-spec](https://github.com/lazily-hub/lazily-spec) and the Lean formal
 model in [lazily-formal](https://github.com/lazily-hub/lazily-formal).
