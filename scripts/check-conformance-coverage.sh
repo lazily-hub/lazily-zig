@@ -22,15 +22,35 @@
 #
 # A missing manifest is missing EVIDENCE and fails. It does not mean "no fixtures
 # were read"; it means the suite ran without the recorder attached, and passing in
-# that state is the vacuous green this guard exists to prevent.
+# that state is the vacuous green this guard exists to prevent. Under CI a missing
+# CORPUS is read the same way (#lzvacuousrun), and the run has to clear an explicit
+# fixture/scenario floor before it may print OK — see the two blocks so marked.
 #
 # Reading is still not asserting. The manifest proves the bytes were opened; it
 # cannot prove the assertions replayed against them mean anything.
 set -euo pipefail
 
 SPEC_DIR="${LAZILY_SPEC_CONFORMANCE_DIR:-../lazily-spec/conformance}"
+
+# A missing corpus is a legitimate LOCAL state (no sibling checkout) and an
+# illegitimate CI state (#lzvacuousrun). Skipping under CI is the vacuous green
+# this guard exists to prevent: every rung below reasons about fixtures the run
+# OPENED, so an absent corpus reports OK over nothing at all — and nothing else
+# in this script can contradict it, because zero opened fixtures also means zero
+# uncovered fixtures and zero stale excuses. Locally it stays a skip, because a
+# contributor without the sibling is not making a false claim. This mirrors how
+# a missing manifest is already handled below: missing EVIDENCE, not evidence of
+# absence.
 if [ ! -d "$SPEC_DIR" ]; then
+  if [ -n "${CI:-}" ]; then
+    echo "ERROR: canonical corpus not found at $SPEC_DIR, and CI is set." >&2
+    echo "       Under CI this is missing EVIDENCE, not evidence of absence: the" >&2
+    echo "       checkout is wrong, not the corpus. Exiting 0 here would report" >&2
+    echo "       conformance OK having examined zero fixtures (#lzvacuousrun)." >&2
+    exit 1
+  fi
   echo "SKIP: canonical corpus not found at $SPEC_DIR (clone the lazily-spec sibling)" >&2
+  echo "      Local checkout only — this would be a hard failure under CI." >&2
   exit 0
 fi
 
@@ -333,6 +353,49 @@ done
 
 if [ "$missing" -gt 0 ]; then
   echo "conformance coverage FAILED: $missing problem(s)" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Positive-evidence floor (#lzvacuousrun).
+# ---------------------------------------------------------------------------
+#
+# Everything above reasons about fixtures this run OPENED, so all of it is
+# vacuously satisfied by an empty population: zero opened fixtures means zero
+# uncovered fixtures, zero unresolvable manifest ids, zero stale excuses and
+# zero unreplayed scenarios. The loops cannot distinguish "nothing is wrong"
+# from "nothing was examined", so assert the MAGNITUDE explicitly before
+# printing OK.
+#
+# Calibrated from a real `make test` run: 114/138 fixtures OPENED and 86/86
+# scenarios REPLAYED. The floors sit just below those, low enough not to trip on
+# a single upstream fixture landing without a runner, high enough that a
+# detached recorder or a short-circuited dispatch cannot slip through. Do NOT
+# lower them to fix a red run — a drop here means the corpus or the recorder
+# shrank, and that is the finding.
+MIN_FIXTURES="${MIN_FIXTURES:-110}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-80}"
+
+if [ "$total" -eq 0 ]; then
+  echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2
+  echo "       Every check above is vacuously green over an empty population." >&2
+  exit 1
+fi
+if [ "$covered" -lt "$MIN_FIXTURES" ]; then
+  echo "ERROR: only $covered distinct canonical fixtures were OPENED, expected >= $MIN_FIXTURES." >&2
+  echo "       A replay was removed, renamed, or short-circuited, or the recorder" >&2
+  echo "       detached mid-run. Do not lower MIN_FIXTURES to fix this." >&2
+  exit 1
+fi
+if [ "$scenario_total" -eq 0 ]; then
+  echo "ERROR: ZERO scenarios were found across the opened fixtures." >&2
+  echo "       The per-scenario rung is vacuously green over an empty population." >&2
+  exit 1
+fi
+if [ "$scenario_replayed" -lt "$MIN_SCENARIOS" ]; then
+  echo "ERROR: only $scenario_replayed distinct scenarios were REPLAYED, expected >= $MIN_SCENARIOS." >&2
+  echo "       A scenario dispatch stopped matching, or the ledger detached." >&2
+  echo "       Do not lower MIN_SCENARIOS to fix this." >&2
   exit 1
 fi
 
