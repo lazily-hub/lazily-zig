@@ -123,6 +123,10 @@ pub const msgpack = @import("./lazily/msgpack.zig");
 pub const codec_conformance = @import("./lazily/codec_conformance.zig");
 pub const nodeid_exact_range_conformance = @import("./lazily/nodeid_exact_range_conformance.zig");
 pub const nodekey_null_leniency_conformance = @import("./lazily/nodekey_null_leniency_conformance.zig");
+// Blob-backend discriminator strictness (`#lzblobbackendstrict`): an omitted
+// `backend` is `shm`, a present token outside the enum is refused by name.
+pub const blob_backend_discriminator_conformance =
+    @import("./lazily/blob_backend_discriminator_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;

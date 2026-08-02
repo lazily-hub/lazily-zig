@@ -35,12 +35,25 @@ pub const CapabilityHandshake = struct {
     }
 };
 
+/// Longest backend token `BlobBackendKind`'s diagnostic slot keeps verbatim.
+/// Comfortably longer than any spelled backend name; see `takeUnknownToken` for
+/// why a longer token is truncated rather than dropped.
+const MAX_BLOB_BACKEND_TOKEN: usize = 64;
+
+/// Thread-local so two decoders on two threads never read each other's token.
+/// `null` length means "no refusal outstanding", which is what makes a stale
+/// token impossible to mistake for a fresh one.
+threadlocal var unknown_blob_backend_buf: [MAX_BLOB_BACKEND_TOKEN]u8 = undefined;
+threadlocal var unknown_blob_backend_len: ?usize = null;
+
 /// Which pluggable blob backend resolves a descriptor (zero-copy transport,
 /// `#lzzcpy`). Mirrors lazily-rs `BlobBackendKind` and lazily-go
 /// `BlobBackendKind`. The discriminant order (`shm=0`, `arrow=1`, `in_process=2`)
 /// is the `BlobRouter` slot index — a receiver routes resolution by this kind
 /// (the `resolve_wrong_backend` theorem). `shm` is the default so every legacy
-/// descriptor (no `backend` field on the wire) validates unchanged.
+/// descriptor (no `backend` field on the wire) validates unchanged. The enum is
+/// CLOSED on the wire (`#lzblobbackendstrict`): a present token outside it is
+/// refused rather than normalized — see `fromString`.
 pub const BlobBackendKind = enum(u2) {
     /// POSIX shared-memory region (`shm_open` + `mmap`) — the default,
     /// cross-process on one host.
@@ -59,31 +72,69 @@ pub const BlobBackendKind = enum(u2) {
         };
     }
 
-    /// Parse a wire discriminator string; unknown values normalize to `.shm`
-    /// (the backward-compatible default).
+    /// Park `text` as the token that made this thread's most recent
+    /// `fromString` fail. A Zig error value carries no payload, so this slot is
+    /// the channel the offending token travels on; without it
+    /// `error.UnknownBlobBackend` would name nothing, which is the defect
+    /// `unreachable` has and this must not repeat.
+    fn recordUnknownToken(text: []const u8) void {
+        const n = @min(text.len, MAX_BLOB_BACKEND_TOKEN);
+        @memcpy(unknown_blob_backend_buf[0..n], text[0..n]);
+        unknown_blob_backend_len = n;
+    }
+
+    /// Take the token that made the most recent `fromString` fail ON THIS
+    /// THREAD, clearing the slot.
     ///
-    /// DELIBERATE LENIENCY (audited). `backend` is an OPTIONAL field on
-    /// `schemas/defs.json#/$defs/ShmBlobRef` whose omitted form means `shm`, and
-    /// the enum is open on the wire by design — the doc comment on
-    /// `BlobBackendKind` names RDMA/verbs and CUDA IPC as backends a future peer
-    /// may add without a protocol major bump. A peer that names a backend this
-    /// build has no code for must still be able to hand us the frame: refusing
-    /// the string would reject the WHOLE message, including every other op in
-    /// it, over one descriptor we merely cannot resolve.
+    /// `null` means nothing has failed since the last take, so a reporter can
+    /// never mistake a stale token for a fresh one. The backing buffer is
+    /// static and thread-local: use the slice before this thread parses another
+    /// bad token. A token longer than `MAX_BLOB_BACKEND_TOKEN` arrives
+    /// truncated rather than dropped — a truncated name still identifies the
+    /// producer, an absent one does not.
+    pub fn takeUnknownToken() ?[]const u8 {
+        const n = unknown_blob_backend_len orelse return null;
+        unknown_blob_backend_len = null;
+        return unknown_blob_backend_buf[0..n];
+    }
+
+    pub const FromStringError = error{UnknownBlobBackend};
+
+    /// Parse a wire discriminator string (`#lzblobbackendstrict`).
     ///
-    /// The consequence of the default is bounded and safe, because `.shm` is not
-    /// a guess at the bytes — it is a routing slot. `BlobRouter.readView` sends
-    /// the descriptor to whatever backend is registered under `.shm`, and that
-    /// backend rejects it: the generation, length, checksum and epoch words in
-    /// the descriptor were minted by a different arena and will not match, so
-    /// resolution returns `null` (the `resolve_wrong_backend` theorem). An
-    /// unknown backend therefore degrades to "this blob does not resolve",
-    /// never to "here are the wrong bytes". Pinned by the
-    /// "unknown backend discriminator" test below.
-    pub fn fromString(text: []const u8) BlobBackendKind {
+    /// A token outside the enum is REFUSED and parked in this thread's
+    /// diagnostic slot (`takeUnknownToken`). ABSENCE is the forward-compatible
+    /// channel, and the only one: `backend` is optional on
+    /// `schemas/defs.json#/$defs/ShmBlobRef`, an omitted field decodes as
+    /// `.shm` at the call site, and `jsonStringify` omits it again for `.shm`,
+    /// so a pre-field descriptor round-trips byte-identically.
+    ///
+    /// This used to normalize an unknown token to `.shm`, on the argument that
+    /// `.shm` is a routing slot rather than a claim about bytes: the shm
+    /// backend would reject the foreign generation/len/checksum/epoch words and
+    /// resolution would return null. That argument INVERTS the
+    /// `resolve_wrong_backend` theorem instead of resting on it. The theorem
+    /// says a descriptor of one kind never resolves against another backend's
+    /// table BECAUSE receivers route by kind — and reading an unknown kind as
+    /// `shm` is exactly routing a non-shm descriptor into the shm table. What
+    /// the theorem discharges structurally the normalization downgrades to a
+    /// 64-bit checksum's word, taken against a backend this build genuinely
+    /// resolves: a collision hands back BYTES, where a refusal is a visible
+    /// protocol error the peer recovers from by resync.
+    ///
+    /// Nor is the enum open on the wire. `docs/zero-copy-transport.md` plugs a
+    /// new backend in by ADDING an enum value — a spec change that arrives with
+    /// a fixture — so an unrecognised token is a corrupt or non-conforming
+    /// producer, never a newer peer.
+    ///
+    /// Never `unreachable` here: it is unchecked UB under ReleaseFast and names
+    /// nothing when it fires.
+    pub fn fromString(text: []const u8) FromStringError!BlobBackendKind {
+        if (std.mem.eql(u8, text, "shm")) return .shm;
         if (std.mem.eql(u8, text, "arrow")) return .arrow;
         if (std.mem.eql(u8, text, "in_process")) return .in_process;
-        return .shm;
+        recordUnknownToken(text);
+        return error.UnknownBlobBackend;
     }
 
     /// Whether this is the default backend (`shm`) — omitted from the wire.
@@ -1175,8 +1226,12 @@ fn parseNodeOnlyOp(value: std.json.Value) !DeltaOp.NodeOnlyOp {
 }
 
 fn parseShmBlobRef(value: std.json.Value) !ShmBlobRef {
+    // Absence is the forward-compatible channel and the only one
+    // (`#lzblobbackendstrict`): an omitted field is `.shm`, a present token
+    // outside the enum fails the whole decode and names itself through
+    // `BlobBackendKind.takeUnknownToken`.
     const backend: BlobBackendKind = if (objectGet(value, "backend")) |b|
-        BlobBackendKind.fromString(try asString(b))
+        try BlobBackendKind.fromString(try asString(b))
     else
         .shm;
     return .{
@@ -1441,39 +1496,68 @@ test "lazily/ipc: ShmBlobRef backend defaults to shm and omits from wire" {
     try std.testing.expect(std.mem.indexOf(u8, arrow_json, "\"backend\":\"arrow\"") != null);
 }
 
-test "lazily/ipc: an unknown backend discriminator is accepted, not rejected" {
-    // Pins the DELIBERATE leniency documented on `BlobBackendKind.fromString`.
-    // An undocumented default and an audited one look identical from outside;
-    // this test is what makes them distinguishable, and what makes a later
-    // "tighten this to an error" a visible decision rather than a silent one.
-    //
-    // `rdma` stands in for any backend a future peer ships that this build has
-    // no code for. The frame as a whole must still decode — one unresolvable
-    // descriptor may not cost us the other ops in the message.
+test "lazily/ipc: a present backend discriminator outside the enum is refused, naming the token" {
+    // `#lzblobbackendstrict`. This test asserted the OPPOSITE until the family
+    // adjudicated the clause: an unknown token used to normalize to `.shm` on
+    // the "routing slot, not a claim about bytes" argument. Normalizing IS
+    // routing — a non-shm descriptor lands in the shm table and the
+    // `resolve_wrong_backend` guarantee stops being structural. See
+    // `BlobBackendKind.fromString`.
     const wire =
         \\{"Delta":{"base_epoch":2,"epoch":3,"ops":[{"CellSet":{"node":1,"payload":
         \\{"SharedBlob":{"offset":32,"len":4,"generation":9,"epoch":3,"checksum":7,
         \\"backend":"rdma"}}}}]}}
     ;
-    var parsed = try IpcMessage.decodeJson(std.testing.allocator, wire);
-    defer parsed.deinit();
-
-    const descriptor = parsed.message.Delta.ops[0].CellSet.payload.SharedBlob;
-    // Normalizes to the omitted-field default rather than erroring...
-    try std.testing.expectEqual(BlobBackendKind.shm, descriptor.backend);
-    // ...and every other word of the descriptor survives intact, which is what
-    // makes the default safe: it is a routing slot, not a claim about bytes.
-    try std.testing.expectEqual(@as(u64, 32), descriptor.offset);
-    try std.testing.expectEqual(@as(u64, 4), descriptor.len);
-    try std.testing.expectEqual(@as(u64, 9), descriptor.generation);
-    try std.testing.expectEqual(@as(u64, 7), descriptor.checksum);
+    _ = BlobBackendKind.takeUnknownToken(); // no stale token may satisfy this
+    try std.testing.expectError(
+        error.UnknownBlobBackend,
+        IpcMessage.decodeJson(std.testing.allocator, wire),
+    );
+    // Refusing is only half the obligation. A decoder that refuses this frame
+    // because it mis-parsed `checksum` passes a bare is-error assertion while
+    // implementing none of the clause, so the error has to name its input.
+    try std.testing.expectEqualStrings("rdma", BlobBackendKind.takeUnknownToken().?);
+    // ...and taking it clears the slot, so the next reader cannot be handed
+    // this one a second time.
+    try std.testing.expect(BlobBackendKind.takeUnknownToken() == null);
 
     // The bare parser agrees, for the same-named field arriving on any frame.
-    try std.testing.expectEqual(BlobBackendKind.shm, BlobBackendKind.fromString("rdma"));
-    try std.testing.expectEqual(BlobBackendKind.shm, BlobBackendKind.fromString(""));
-    // The two named non-default spellings are NOT swallowed by the default.
-    try std.testing.expectEqual(BlobBackendKind.arrow, BlobBackendKind.fromString("arrow"));
-    try std.testing.expectEqual(BlobBackendKind.in_process, BlobBackendKind.fromString("in_process"));
+    try std.testing.expectError(error.UnknownBlobBackend, BlobBackendKind.fromString("rdma"));
+    try std.testing.expectEqualStrings("rdma", BlobBackendKind.takeUnknownToken().?);
+    // An empty token is a present-but-empty string, not an absent field: the
+    // omitted form never reaches `fromString` at all.
+    try std.testing.expectError(error.UnknownBlobBackend, BlobBackendKind.fromString(""));
+    try std.testing.expectEqualStrings("", BlobBackendKind.takeUnknownToken().?);
+    // All three enum spellings parse, including the default one — the omitted
+    // form is the only thing `.shm` is inferred from.
+    try std.testing.expectEqual(BlobBackendKind.shm, try BlobBackendKind.fromString("shm"));
+    try std.testing.expectEqual(BlobBackendKind.arrow, try BlobBackendKind.fromString("arrow"));
+    try std.testing.expectEqual(
+        BlobBackendKind.in_process,
+        try BlobBackendKind.fromString("in_process"),
+    );
+    // A successful parse leaves no diagnostic behind.
+    try std.testing.expect(BlobBackendKind.takeUnknownToken() == null);
+}
+
+test "lazily/ipc: an over-long backend token is truncated into the diagnostic, never dropped" {
+    // The slot is fixed-size, so a pathological token has to go somewhere. A
+    // truncated name still identifies the producer; a dropped one leaves
+    // `error.UnknownBlobBackend` naming nothing, which is the state this whole
+    // channel exists to prevent.
+    //
+    // Built with `@memset` rather than the `"z" ** n` repeat operator: zig
+    // master's formatter reads `**` after a string literal as two `*` tokens
+    // and demands whitespace 0.15.2/0.16.0 reject, so the literal form cannot
+    // satisfy `zig fmt --check` on all three pinned toolchains at once.
+    _ = BlobBackendKind.takeUnknownToken();
+    var long_buf: [MAX_BLOB_BACKEND_TOKEN + 8]u8 = undefined;
+    @memset(&long_buf, 'z');
+    const long: []const u8 = &long_buf;
+    try std.testing.expectError(error.UnknownBlobBackend, BlobBackendKind.fromString(long));
+    const token = BlobBackendKind.takeUnknownToken().?;
+    try std.testing.expectEqual(MAX_BLOB_BACKEND_TOKEN, token.len);
+    try std.testing.expectEqualStrings(long[0..MAX_BLOB_BACKEND_TOKEN], token);
 }
 
 test "lazily/ipc: ShmBlobArena write/read round-trip" {

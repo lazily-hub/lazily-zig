@@ -385,7 +385,7 @@ fi
 # from "nothing was examined", so assert the MAGNITUDE explicitly before
 # printing OK.
 #
-# Calibrated from a real `make test` run: 114/138 fixtures OPENED and 86/86
+# Calibrated from a real `make test` run: 115/139 fixtures OPENED and 94/94
 # scenarios REPLAYED. The floors sit just below those, low enough not to trip on
 # a single upstream fixture landing without a runner, high enough that a
 # detached recorder or a short-circuited dispatch cannot slip through. Do NOT

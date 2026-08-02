@@ -235,7 +235,16 @@ fn readEnv(name: []const u8, buf: []u8) ?[:0]const u8 {
 /// and are exactly the bytes the suite replays", not "a runner opened them".
 /// A vendored copy drifting from upstream now fails here instead of silently
 /// replaying yesterday's corpus.
+///
+/// `codec/blob_backend_discriminator.json` is the one entry NOT replayed from
+/// its embed — its runner reads the canonical file like every other
+/// `codec/` replay. It is mirrored anyway because lazily-spec's
+/// `scripts/sync-conformance-fixtures.mjs` reconciles a fixture change for
+/// every binding from the CORPUS side, and it can only reconcile files a mirror
+/// actually carries. Listing it here is what makes the copy checked rather than
+/// merely present.
 const VENDORED_MIRRORS = [_][]const u8{
+    "codec/blob_backend_discriminator.json",
     "crdt-tree/algebra.json",
     "reliable-sync/idempotent_redelivery.json",
     "reliable-sync/liveness_orset_lww.json",
