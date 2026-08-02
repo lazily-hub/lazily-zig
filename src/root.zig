@@ -121,6 +121,7 @@ pub const msgpack = @import("./lazily/msgpack.zig");
 // Frame-codec round-trip obligation (`#lzmsgpackparity`): both halves of
 // protocol.md § Frame codecs, replayed THROUGH the codec.
 pub const codec_conformance = @import("./lazily/codec_conformance.zig");
+pub const nodeid_exact_range_conformance = @import("./lazily/nodeid_exact_range_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
