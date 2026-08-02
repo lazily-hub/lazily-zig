@@ -183,6 +183,16 @@ fn resolveManifestPath() ?[:0]const u8 {
     return manifest_path;
 }
 
+/// True when `name` is present in the environment with a non-empty value.
+///
+/// Shares `readEnv`'s toolchain-stable `/proc/self/environ` path so callers do
+/// not each reinvent it. Used by the conformance runners to gate routine
+/// progress output (see `reactive_graph_conformance.zig`, `#lzzigfailedcommand`).
+pub fn envFlagSet(name: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    return readEnv(name, &buf) != null;
+}
+
 /// Zig 0.17-dev's std reorganized env access behind the new Io interface (no
 /// stable `std.posix.getenv`/`std.process.getenv`), so read `/proc/self/environ`
 /// via raw Linux syscalls — the one path that stays stable across the toolchain

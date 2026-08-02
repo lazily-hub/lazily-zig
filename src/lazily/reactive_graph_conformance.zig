@@ -32,6 +32,16 @@
 //! fixture. The observed set is asserted to equal the ledger *exactly*, so a new
 //! divergence fails the build and a fixed one fails it until its entry is
 //! deleted. Both directions are load-bearing.
+//!
+//! ## Output (`#lzzigfailedcommand`)
+//!
+//! Routine progress — per-fixture counts, ledgered skips, ledgered divergences,
+//! the summary line — is SILENT unless `LAZILY_CONFORMANCE_VERBOSE` is set.
+//! Findings always print and always return an error. This is not cosmetic: Zig's
+//! build runner prints `failed command: <argv>` for any step whose captured
+//! stderr is non-empty, *including steps that succeeded*, so routine chatter on
+//! a green run puts a failure line under a passing summary. See the `note`
+//! helper for the two upstream mechanisms that combine to cause it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1173,23 +1183,90 @@ const Report = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Routine-output gate (`#lzzigfailedcommand`)
+// ---------------------------------------------------------------------------
+//
+// Zig's build runner replays a step's captured stderr and then prints
+// `failed command: <argv>` whenever that capture is non-empty — on SUCCESS as
+// well as on failure. Two upstream facts combine to produce that:
+//
+//   * `build_runner.zig` enters the error printer under the comment "No matter
+//     the result, we want to display error/warning messages", guarded only by
+//     `result_stderr.len > 0` (plus the error bundles) — not by step status.
+//   * `Step.Run` populates `result_failed_command` for EVERY run, up front, as
+//     a record in case the step later fails. The error printer prints it
+//     unconditionally, so a passing step reaches it with the field set.
+//
+// So any routine chatter on a green run makes `zig build test` print a failure
+// line underneath `24/24 steps succeeded`. That trains a reader to skim past
+// the next such line, which will be real.
+//
+// Routine progress therefore goes through `note`, silent unless
+// LAZILY_CONFORMANCE_VERBOSE is set. Everything that reports an actual finding
+// keeps using `std.debug.print` and is always paired with a returned error, so
+// captured stderr is non-empty exactly when the step genuinely fails — and the
+// `failed command:` line then means what it says.
+
+var verbose_cache: ?bool = null;
+
+fn verbose() bool {
+    if (verbose_cache) |v| return v;
+    const v = @import("conformance_manifest.zig").envFlagSet("LAZILY_CONFORMANCE_VERBOSE");
+    verbose_cache = v;
+    return v;
+}
+
+/// Routine progress output. Silent unless LAZILY_CONFORMANCE_VERBOSE is set.
+/// Never use this for a finding — findings must always print and always error.
+fn note(comptime fmt: []const u8, args: anytype) void {
+    if (verbose()) std.debug.print(fmt, args);
+}
+
+// ---------------------------------------------------------------------------
 // Divergence ledger accounting
 // ---------------------------------------------------------------------------
 
 var observed_divergences: std.ArrayList([]const u8) = .empty;
+/// Parallel to `observed_divergences`: the full "got X, want Y" text for each
+/// entry. The ledger compares ids, but an UNDOCUMENTED divergence is a real
+/// finding and must print its detail even though the routine `DIVERGENCE` line
+/// is gated behind `note`.
+var observed_divergence_details: std.ArrayList([]const u8) = .empty;
 
-fn recordDivergence(a: std.mem.Allocator, entry: []const u8) void {
+fn recordDivergence(a: std.mem.Allocator, entry: []const u8, detail: []const u8) void {
     for (observed_divergences.items) |e| {
         if (std.mem.eql(u8, e, entry)) return;
     }
     const owned = a.dupe(u8, entry) catch return;
-    observed_divergences.append(a, owned) catch a.free(owned);
+    observed_divergences.append(a, owned) catch {
+        a.free(owned);
+        return;
+    };
+    const owned_detail = a.dupe(u8, detail) catch "";
+    observed_divergence_details.append(a, owned_detail) catch {
+        if (owned_detail.len > 0) a.free(owned_detail);
+    };
+}
+
+/// Detail text recorded alongside `entry`, or an empty slice when none was kept.
+fn divergenceDetail(entry: []const u8) []const u8 {
+    for (observed_divergences.items, 0..) |e, i| {
+        if (!std.mem.eql(u8, e, entry)) continue;
+        if (i < observed_divergence_details.items.len) return observed_divergence_details.items[i];
+        return "";
+    }
+    return "";
 }
 
 fn clearDivergences(a: std.mem.Allocator) void {
     for (observed_divergences.items) |e| a.free(e);
     observed_divergences.deinit(a);
     observed_divergences = .empty;
+    for (observed_divergence_details.items) |d| {
+        if (d.len > 0) a.free(d);
+    }
+    observed_divergence_details.deinit(a);
+    observed_divergence_details = .empty;
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,8 +1321,10 @@ fn Engine(comptime Model: type) type {
             const entry = std.fmt.bufPrint(&entry_buf, "{s}/{s}{s}#{d}:{s}", .{
                 Model.NAME, self.fixture, self.label, self.step, key,
             }) catch "<entry too long>";
-            std.debug.print("  DIVERGENCE {s} — got {any}, want {any}\n", .{ entry, got, want });
-            recordDivergence(self.allocator, entry);
+            var detail_buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "got {any}, want {any}", .{ got, want }) catch "<detail too long>";
+            note("  DIVERGENCE {s} — {s}\n", .{ entry, detail });
+            recordDivergence(self.allocator, entry, detail);
         }
 
         /// Create a node, dispatching into a scope when the op names one.
@@ -1902,11 +1981,15 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
             const entry = std.fmt.bufPrint(&entry_buf, "{s}/{s}#expected:observationally_equal", .{
                 Model.NAME, fixture_name,
             }) catch "<entry too long>";
-            std.debug.print(
-                "  DIVERGENCE {s} — scenarios `{s}` and `{s}` differ\n    {s}\n    {s}\n",
-                .{ entry, obs_names[first.?], obs_names[idx], lhs, rhs },
+            var detail_buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "scenarios `{s}` and `{s}` differ", .{
+                obs_names[first.?], obs_names[idx],
+            }) catch "<detail too long>";
+            note(
+                "  DIVERGENCE {s} — {s}\n    {s}\n    {s}\n",
+                .{ entry, detail, lhs, rhs },
             );
-            recordDivergence(a, entry);
+            recordDivergence(a, entry, detail);
         }
     }
 }
@@ -1945,8 +2028,9 @@ fn runCorpus(comptime Model: type) !void {
         const fx = parsed.value;
 
         if (modelSkipReason(name, fixture_name)) |reason| {
-            // Loud, named, per-model skip. Silent skipping is the anti-pattern.
-            std.debug.print(
+            // Named, per-model skip. Silent skipping is the anti-pattern, but
+            // these are ledgered, so they are routine — see the note() header.
+            note(
                 "SKIP reactive-graph[{s}] {s}: {s}\n",
                 .{ name, fixture_name, reason },
             );
@@ -1955,8 +2039,9 @@ fn runCorpus(comptime Model: type) !void {
         }
 
         if (try firstUnsupported(fx)) |blocking| {
-            // Loud, named skip. Silent skipping is the anti-pattern.
-            std.debug.print(
+            // Named skip. Routine while it stays in EXPECTED_SKIPS; the
+            // undocumented case below is the finding and prints unconditionally.
+            note(
                 "SKIP reactive-graph[{s}] {s}: unsupported `{s}`\n",
                 .{ name, fixture_name, blocking },
             );
@@ -1969,8 +2054,9 @@ fn runCorpus(comptime Model: type) !void {
             }
             if (!documented) {
                 std.debug.print(
-                    "  {s} is not in EXPECTED_SKIPS — a fixture stopped being replayable\n",
-                    .{fixture_name},
+                    "  reactive-graph[{s}] {s} is not in EXPECTED_SKIPS — a fixture stopped " ++
+                        "being replayable (unsupported `{s}`)\n",
+                    .{ name, fixture_name, blocking },
                 );
                 return error.UndocumentedSkip;
             }
@@ -1997,7 +2083,7 @@ fn runCorpus(comptime Model: type) !void {
         if (per_fixture.checks == 0) return error.ReplayedZeroAssertions;
         if (EffectLog.dropped) return error.EffectLogDropped;
 
-        std.debug.print(
+        note(
             "reactive-graph[{s}] {s}: {d} ops, {d} assertions\n",
             .{ name, fixture_name, per_fixture.ops, per_fixture.checks },
         );
@@ -2007,7 +2093,7 @@ fn runCorpus(comptime Model: type) !void {
         replayed += 1;
     }
 
-    std.debug.print(
+    note(
         "reactive-graph[{s}]: {d} fixtures replayed, {d} skipped, {d} ops, {d} assertions\n",
         .{ name, replayed, skipped, total.ops, total.checks },
     );
@@ -2030,9 +2116,10 @@ fn runCorpus(comptime Model: type) !void {
         }
         if (!documented) {
             std.debug.print(
-                "  undocumented divergence {s} — this is a finding against lazily-zig; fix it " ++
-                    "or record it in EXPECTED_DIVERGENCES (never edit the fixture)\n",
-                .{d},
+                "  undocumented divergence {s} — {s}\n" ++
+                    "  this is a finding against lazily-zig; fix it or record it in " ++
+                    "EXPECTED_DIVERGENCES (never edit the fixture)\n",
+                .{ d, divergenceDetail(d) },
             );
             return error.UndocumentedDivergence;
         }
