@@ -152,8 +152,10 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
     var keys_decoded: usize = 0;
 
     var scenarios = try cj.scenarios(FIXTURE, root);
-    while (scenarios.next()) |scenario| {
-        _ = try scenarios.replaying();
+    while (scenarios.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
+        const scenario = try sc.replay();
         replayed += 1;
 
         const expect = try cj.required(scenario, "expect");

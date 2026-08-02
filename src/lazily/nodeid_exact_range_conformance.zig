@@ -113,10 +113,10 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     var accepted: usize = 0;
 
     var scenarios = try cj.scenarios(FIXTURE, root);
-    while (scenarios.next()) |scenario| {
-        // Record at the point of replay (`#lzscenariocoverage`): a scenario
-        // this loop stops reaching stops being recorded.
-        _ = try scenarios.replaying();
+    while (scenarios.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
+        const scenario = try sc.replay();
 
         const expect = try cj.required(scenario, "expect");
         const decimal = try cj.asStr(try cj.required(expect, "node_id_decimal"));

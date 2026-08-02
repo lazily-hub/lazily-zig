@@ -267,11 +267,18 @@ pub const Scenarios = struct {
         return self.items.len;
     }
 
-    /// Yield the next scenario without recording it.
-    pub fn next(self: *Scenarios) ?Value {
+    /// Yield the next scenario, unbooked.
+    ///
+    /// Yielding is NOT replaying (`#lzscenariobodyskip`). The returned handle
+    /// hands the payload over only through `replay()`, which is what books, so a
+    /// body that `continue`s, `break`s, matches no dispatch arm, or returns
+    /// before taking the payload books nothing. This used to be a `replaying()`
+    /// statement the runner had to remember at the top of the body, which books
+    /// a scenario whose body then does nothing.
+    pub fn next(self: *Scenarios) ?Scenario {
         if (self.index >= self.items.len) return null;
         self.index += 1;
-        return self.items[self.index - 1];
+        return .{ .ledger = self, .index = self.index - 1 };
     }
 
     /// 0-based index of the scenario `next()` last yielded.
@@ -284,13 +291,33 @@ pub const Scenarios = struct {
     pub fn currentId(self: *Scenarios) error{ScenarioUnidentified}![]const u8 {
         return scenarioId(self.items[self.index - 1], self.index - 1);
     }
+};
 
-    /// Record the scenario `next()` last yielded as REPLAYED and return its
-    /// resolved id.
-    pub fn replaying(self: *Scenarios) error{ScenarioUnidentified}![]const u8 {
-        const id = try self.currentId();
-        recordScenario(self.fixture, id);
-        return id;
+/// One scenario, handed over unbooked (`#lzscenariobodyskip`).
+///
+/// `id()` and `peek()` are LABEL reads and stay silent: a dispatch chain that
+/// names the scenario, matches no arm and falls through has replayed nothing.
+/// `replay()` is the PAYLOAD handoff, which only a runner about to replay
+/// performs, so that is where the ledger books.
+pub const Scenario = struct {
+    ledger: *Scenarios,
+    index: usize,
+
+    /// The resolved id. Silent.
+    pub fn id(self: Scenario) error{ScenarioUnidentified}![]const u8 {
+        return scenarioId(self.ledger.items[self.index], self.index);
+    }
+
+    /// The scenario object WITHOUT booking. For a runner that must inspect a
+    /// scenario it is not replaying.
+    pub fn peek(self: Scenario) Value {
+        return self.ledger.items[self.index];
+    }
+
+    /// Book this scenario as REPLAYED and hand over its payload.
+    pub fn replay(self: Scenario) error{ScenarioUnidentified}!Value {
+        recordScenario(self.ledger.fixture, try self.id());
+        return self.ledger.items[self.index];
     }
 };
 
@@ -316,10 +343,12 @@ pub fn replayingScenario(fixture: []const u8, fx: Value, id: []const u8) !Value 
 /// build runner surfaces any stderr from a test binary as a failed command.
 fn replayingScenarioImpl(fixture: []const u8, fx: Value, id: []const u8, quiet: bool) !Value {
     var it = try scenarios(fixture, fx);
-    while (it.next()) |scenario| {
-        if (!std.mem.eql(u8, try it.currentId(), id)) continue;
-        _ = try it.replaying();
-        return scenario;
+    while (it.next()) |sc| {
+        // Selecting is not replaying (`#lzscenariobodyskip`): `id()` is a label
+        // read, and the walk past every scenario ahead of the match must not
+        // book those. `replay()` books only the one handed back.
+        if (!std.mem.eql(u8, try sc.id(), id)) continue;
+        return try sc.replay();
     }
     if (!quiet) std.debug.print(
         "{s}: no scenario resolves to id '{s}' — the corpus renamed or dropped it, " ++
@@ -754,7 +783,7 @@ test "conformance_json: scenario ids resolve id -> name, and refuse an unidentif
     var n: usize = 0;
     while (it.next()) |sc| {
         if (n < 2) {
-            seen[n] = try scenarioId(sc, it.at());
+            seen[n] = try sc.id();
             n += 1;
             continue;
         }
@@ -762,7 +791,7 @@ test "conformance_json: scenario ids resolve id -> name, and refuse an unidentif
         // positional fallback (#lzspecscenarioids): a ledger entry recorded BY
         // POSITION silently rebinds to a different scenario on a corpus reorder,
         // so resolution refuses rather than inventing an id.
-        try std.testing.expectError(error.ScenarioUnidentified, scenarioId(sc, it.at()));
+        try std.testing.expectError(error.ScenarioUnidentified, sc.id());
     }
     try std.testing.expectEqualStrings("by_id", seen[0]);
     try std.testing.expectEqualStrings("by_name", seen[1]);
@@ -778,7 +807,7 @@ test "conformance_json: scenario ids resolve id -> name, and refuse an unidentif
     defer blank.deinit();
     var blank_it = try scenarios("fake/blank.json", blank.value);
     const first = blank_it.next().?;
-    try std.testing.expectError(error.ScenarioUnidentified, scenarioId(first, 0));
+    try std.testing.expectError(error.ScenarioUnidentified, first.id());
 }
 
 test "conformance_json: replayingScenario refuses an id the fixture does not carry" {

@@ -190,10 +190,10 @@ test "lazily/codec: json frames round-trip through the reference codec" {
 
     var scenarios = try cj.scenarios(JSON_FIXTURE, root);
     var replayed: usize = 0;
-    while (scenarios.next()) |scenario| {
-        // Record at the point of replay (`#lzscenariocoverage`): a scenario this
-        // loop stops reaching stops being recorded.
-        _ = try scenarios.replaying();
+    while (scenarios.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
+        const scenario = try sc.replay();
         const wire_json = try std.json.Stringify.valueAlloc(
             std.testing.allocator,
             try cj.required(scenario, "wire"),
@@ -312,8 +312,10 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
 
     var scenarios = try cj.scenarios(MSGPACK_FIXTURE, root);
     var replayed: usize = 0;
-    while (scenarios.next()) |scenario| {
-        _ = try scenarios.replaying();
+    while (scenarios.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
+        const scenario = try sc.replay();
 
         // `wire` is the REFERENCE json form — the fixture's two halves carry
         // byte-identical `wire` blocks on purpose, so the msgpack half starts

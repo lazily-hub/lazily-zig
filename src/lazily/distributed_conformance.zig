@@ -112,8 +112,11 @@ test "distributed conformance: anti_entropy_converge.json" {
     try testing.expect(ledger.len() > 0);
 
     var ops_replayed: usize = 0;
-    while (ledger.next()) |scenario| {
-        const name = try ledger.replaying();
+    while (ledger.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip); `id()` is
+        // a label read and books nothing on its own.
+        const scenario = try sc.replay();
+        const name = try sc.id();
         var expect = cj.AssertionKeys.init(
             "distributed/anti_entropy_converge.json expect",
             try cj.required(scenario, "expect"),

@@ -601,8 +601,10 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
     // Per-scenario replay accounting (#lzscenariocoverage).
     var ledger = try cj.scenarios(RS_OUTBOX_STORE, parsed.value);
     var replayed: usize = 0;
-    while (ledger.next()) |scenario| {
-        _ = try ledger.replaying();
+    while (ledger.next()) |view| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
+        const scenario = try view.replay();
         const sc = scenario.object;
 
         var store = InMemoryStore.init(allocator);

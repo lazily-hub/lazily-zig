@@ -1928,10 +1928,13 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
         m.deinit(a);
     };
 
-    while (ledger.next()) |sc| {
+    while (ledger.next()) |handle| {
         if (obs_len == obs_bufs.len) return error.TooManyScenarios;
-        const name = try asString(field(sc, "name") orelse return error.MissingScenarioName);
-        _ = try ledger.replaying();
+        // `name` is a LABEL read, taken off peek() so it books nothing
+        // (#lzscenariobodyskip); the early return above must not credit a
+        // replay that never happened.
+        const name = try asString(field(handle.peek(), "name") orelse return error.MissingScenarioName);
+        const sc = try handle.replay();
         var label_buf: [96]u8 = undefined;
         const label = try std.fmt.bufPrint(&label_buf, "[{s}]", .{name});
 

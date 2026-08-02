@@ -255,9 +255,11 @@ test "collections conformance: mergecell_algebra.json" {
     try testing.expect(ledger.len() > 0);
 
     var steps_replayed: usize = 0;
-    while (ledger.next()) |scenario| {
+    while (ledger.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
         const si = ledger.at();
-        _ = try ledger.replaying();
+        const scenario = try sc.replay();
         const policy = try policyByName(try cj.asStr(try cj.required(scenario, "policy")));
 
         // The transport-selected property flags are part of the contract: they
@@ -410,9 +412,11 @@ test "collections conformance: semtree_incremental.json" {
     var ledger = try cj.scenarios("collections/semtree_incremental.json", parsed.value);
     try testing.expect(ledger.len() > 0);
 
-    while (ledger.next()) |scenario| {
+    while (ledger.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
         const si = ledger.at();
-        _ = try ledger.replaying();
+        const scenario = try sc.replay();
         const fold = try foldByName(try cj.asStr(try cj.required(scenario, "fold")));
         var tree = try buildTree(allocator, try cj.required(scenario, "tree"));
         defer tree.deinit();
@@ -529,9 +533,11 @@ test "collections conformance: stableid_alignment.json" {
     try testing.expect(ledger.len() > 0);
 
     var claims: usize = 0;
-    while (ledger.next()) |scenario| {
+    while (ledger.next()) |sc| {
+        // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
+        // body that stops short of replaying stops being booked.
         const si = ledger.at();
-        _ = try ledger.replaying();
+        const scenario = try sc.replay();
         const expect = try cj.required(scenario, "expect");
 
         // Shape 1: one `blocks` list, with key-identity claims over its indices.
