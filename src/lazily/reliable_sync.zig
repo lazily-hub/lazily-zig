@@ -640,8 +640,14 @@ test "OutboxStore protocol replays canonical ordered, monotone, and restart case
                 const epoch: u64 = @intCast(save.object.get("epoch").?.integer);
                 if (std.mem.eql(u8, handle, "current")) {
                     try outbox.ackThrough(epoch);
-                } else {
+                } else if (std.mem.eql(u8, handle, "stale")) {
                     try stale.?.ackThrough(epoch);
+                } else {
+                    // `stale` used to be the bare `else`, so a fixture naming a
+                    // third handle had its save applied to the stale one and the
+                    // scenario booked green (#lzscenariobodyskip).
+                    std.debug.print("reliable-sync: unknown save_cursor handle `{s}`\n", .{handle});
+                    return error.UnknownCursorHandle;
                 }
             }
             // The stale handle refreshes to the newer persisted cursor rather
@@ -781,8 +787,12 @@ test "StoredOutbox replays canonical stale-handle cursor serialization" {
         const epoch: u64 = @intCast(save.object.get("epoch").?.integer);
         if (std.mem.eql(u8, handle, "current")) {
             try current.ackThrough(epoch);
-        } else {
+        } else if (std.mem.eql(u8, handle, "stale")) {
             try stale.ackThrough(epoch);
+        } else {
+            // Same fail-open as the in-memory replay above (#lzscenariobodyskip).
+            std.debug.print("reliable-sync: unknown save_cursor handle `{s}`\n", .{handle});
+            return error.UnknownCursorHandle;
         }
     }
     try std.testing.expectEqual(expected, stale.ackedThrough());

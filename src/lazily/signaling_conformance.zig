@@ -346,7 +346,13 @@ test "signaling conformance: anti_spoof_session.json" {
                         .offer, .answer => |sig| sig.from,
                         .ice => |i| i.from,
                         .relay => |r| r.from,
-                        else => unreachable,
+                        // The enclosing prong already narrowed the tag, so this
+                        // is compiler-narrowed rather than fixture-driven — but
+                        // `unreachable` is UNCHECKED undefined behaviour in
+                        // ReleaseFast/ReleaseSmall, so a runner must not spell a
+                        // refusal that way in any build mode
+                        // (#lzscenariobodyskip).
+                        else => return error.UnexpectedForwardedFrameVariant,
                     };
                     // The load-bearing invariant: `from` is the SENDER's
                     // server-registered peer id, not anything in `recv`.

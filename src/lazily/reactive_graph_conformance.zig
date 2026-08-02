@@ -1343,10 +1343,19 @@ fn Engine(comptime Model: type) type {
                 try self.model.addComputed(idx, deps, offset);
             } else if (std.mem.eql(u8, op_type, "signal")) {
                 try self.model.addSignal(idx, deps, offset);
-            } else {
+            } else if (std.mem.eql(u8, op_type, "effect")) {
                 // Effects read at most one node in this corpus.
                 if (deps.len > 1) return error.MultiParentNodeUnsupported;
                 try self.model.addEffect(idx, if (deps.len == 1) deps[0] else null);
+            } else {
+                // `effect` used to be the bare `else` (#lzscenariobodyskip). The
+                // caller's four-way test and `SUPPORTED_OPS` both gate this
+                // today, so it is a latent fail-open rather than a live one —
+                // but the moment a fifth creation op joins that gate without an
+                // arm here, it would silently be replayed as an effect and the
+                // scenario would still be booked.
+                std.debug.print("  unknown creation op `{s}`\n", .{op_type});
+                return error.UnknownCreateOpType;
             }
 
             if (field(op, "scope")) |s| {

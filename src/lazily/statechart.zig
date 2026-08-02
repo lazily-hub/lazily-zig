@@ -392,8 +392,26 @@ fn parseState(a: std.mem.Allocator, index_of: *const std.StringHashMapUnmanaged(
             if (std.mem.eql(u8, hs, "deep")) break :blk .history_deep;
             return error.UnknownHistoryKind;
         }
-        if (o.get("parallel")) |pv| if (pv == .bool and pv.bool) break :blk .parallel;
-        if (o.get("kind")) |kv| if (kv == .string and std.mem.eql(u8, kv.string, "final")) break :blk .final;
+        // `parallel` and `kind` fail closed the same way `history` above already
+        // does (#lzscenariobodyskip). Both used to be "match the one spelling I
+        // know, otherwise fall through": a `parallel` that was not a bool, or a
+        // `kind` other than `final`, silently produced a compound/atomic state
+        // and the chart replayed green against a shape the fixture never named.
+        if (o.get("parallel")) |pv| {
+            const parallel = switch (pv) {
+                .bool => |b| b,
+                else => return error.UnknownParallelFlag,
+            };
+            if (parallel) break :blk .parallel;
+        }
+        if (o.get("kind")) |kv| {
+            const ks = switch (kv) {
+                .string => |s| s,
+                else => return error.UnknownStateKind,
+            };
+            if (!std.mem.eql(u8, ks, "final")) return error.UnknownStateKind;
+            break :blk .final;
+        }
         if (initial != null) break :blk .compound;
         break :blk .atomic;
     };

@@ -81,7 +81,7 @@ fn replayTimer(scenario: corpus.Value) !void {
                 continue;
             };
             actual = .{ .outcome = "pending", .deadline = timer.?.deadline };
-        } else {
+        } else if (std.mem.eql(u8, op, "observe")) {
             const observation = timer.?.observe(try u64Field(step, "now")) catch |err| {
                 actual = .{
                     .outcome = "unavailable",
@@ -95,6 +95,15 @@ fn replayTimer(scenario: corpus.Value) !void {
                 .pending => .{ .outcome = "pending", .deadline = observation.deadline },
                 .fired => .{ .outcome = "fired", .fired_at = observation.fired_at },
             };
+        } else {
+            // Fail closed on an op the fixture names and this runner does not
+            // (#lzscenariobodyskip). The `observe` arm used to be a bare `else`,
+            // so ANY unrecognised op — a corpus that grows `cancel`, or a typo —
+            // was replayed as an observe and the scenario booked green. The
+            // ledger cannot see it: the payload was handed over, so the scenario
+            // counts as replayed, just as something the fixture never asked for.
+            std.debug.print("stdlib timer: unknown op `{s}`\n", .{op});
+            return error.UnsupportedTimerStep;
         }
         try assertExpected(try corpus.required(step, "expect"), actual);
     }
@@ -170,7 +179,7 @@ fn replayTimeout(scenario: corpus.Value) !void {
                 try u64Field(step, "duration"),
             );
             actual = .{ .outcome = "pending", .deadline = timeout.?.deadline };
-        } else {
+        } else if (std.mem.eql(u8, op, "poll")) {
             var operation = OperationContext{
                 .state = try stringField(step, "operation"),
                 .value = try corpus.optStr(step, "value"),
@@ -191,6 +200,12 @@ fn replayTimeout(scenario: corpus.Value) !void {
                 .operation_calls = operation.calls,
                 .cancellation_calls = cancellation.calls,
             };
+        } else {
+            // Same fail-open as `replayTimer`, closed the same way
+            // (#lzscenariobodyskip): `poll` was the bare `else`, so an
+            // unrecognised op was polled and booked instead of refused.
+            std.debug.print("stdlib timeout: unknown op `{s}`\n", .{op});
+            return error.UnsupportedTimeoutStep;
         }
         try assertExpected(try corpus.required(step, "expect"), actual);
     }

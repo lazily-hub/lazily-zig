@@ -503,7 +503,16 @@ fn applyOp(comptime Model: type, model: *Model, op: json.Value) !void {
         if (field(op, "at")) |at| {
             switch (at) {
                 .integer => |n| model.moveTo(key, @intCast(n)),
-                else => {},
+                // "end" is where a fresh key already lands, so it is a no-op —
+                // but only "end". A bare `else => {}` swallowed every other
+                // spelling, so an `at` the fixture meant as a real position was
+                // silently not applied and the step still booked
+                // (#lzscenariobodyskip).
+                .string => |s| if (!std.mem.eql(u8, s, "end")) {
+                    std.debug.print("unknown insert position `{s}`\n", .{s});
+                    return error.UnknownInsertPosition;
+                },
+                else => return error.UnknownInsertPosition,
             }
         }
     } else if (std.mem.eql(u8, ty, "remove")) {

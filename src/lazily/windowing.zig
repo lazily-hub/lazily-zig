@@ -461,6 +461,18 @@ fn config(fx: json.Value) !json.Value {
     return jsonFieldRequired(fx, "config");
 }
 
+/// Refuse an op whose `type` this replay does not name (#lzscenariobodyskip).
+/// A single-op-kind fixture still has to prove the kind it carries is the one
+/// the replay performs — otherwise a fixture that grows an op silently gets
+/// that op replayed as the only shape the runner knows.
+fn expectOpType(op: json.Value, want: []const u8) !void {
+    const got = try jsonAsString(try jsonFieldRequired(op, "type"));
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("windowing: unknown op type `{s}` (want `{s}`)\n", .{ got, want });
+        return error.UnknownOpType;
+    }
+}
+
 test "windowing conformance: tumbling_count" {
     if (!specFixturesPresent()) return error.SkipZigTest;
     const ctx = try Context.init(std.testing.allocator);
@@ -474,6 +486,11 @@ test "windowing conformance: tumbling_count" {
 
     for (try steps(fx)) |step| {
         const op = try jsonFieldRequired(step, "op");
+        // `tumbling_count` is all `push` ops — CHECKED, not assumed
+        // (#lzscenariobodyskip). Ignoring `type` outright is the same fail-open
+        // as a bare `else`: a fixture that grows a second op would have it
+        // replayed as a push and the step booked green.
+        try expectOpType(op, "push");
         const v = try jsonAsI64(try jsonFieldRequired(op, "value"));
         const pre = w.outputVersion();
         const emit = w.push(v);
@@ -510,8 +527,13 @@ test "windowing conformance: tumbling_time" {
         var emit: ?i64 = null;
         if (std.mem.eql(u8, op_type, "push")) {
             w.push(now, try jsonAsI64(try jsonFieldRequired(op, "value")));
-        } else {
+        } else if (std.mem.eql(u8, op_type, "tick")) {
             emit = w.tick(now);
+        } else {
+            // `tick` used to be the bare `else`, so an unrecognised op type was
+            // replayed as a tick and booked green (#lzscenariobodyskip).
+            std.debug.print("windowing tumbling_time: unknown op type `{s}`\n", .{op_type});
+            return error.UnknownOpType;
         }
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);
@@ -542,6 +564,9 @@ test "windowing conformance: sliding_count" {
 
     for (try steps(fx)) |step| {
         const op = try jsonFieldRequired(step, "op");
+        // `sliding_count` is all `push` ops — CHECKED, not assumed
+        // (#lzscenariobodyskip).
+        try expectOpType(op, "push");
         const v = try jsonAsI64(try jsonFieldRequired(op, "value"));
         const pre = w.outputVersion();
         const emit = try w.push(v);
@@ -578,8 +603,12 @@ test "windowing conformance: session" {
         var emit: ?i64 = null;
         if (std.mem.eql(u8, op_type, "push")) {
             emit = w.push(now, try jsonAsI64(try jsonFieldRequired(op, "value")));
-        } else {
+        } else if (std.mem.eql(u8, op_type, "flush")) {
             emit = w.flush(now);
+        } else {
+            // `flush` used to be the bare `else` (#lzscenariobodyskip).
+            std.debug.print("windowing session: unknown op type `{s}`\n", .{op_type});
+            return error.UnknownOpType;
         }
 
         try std.testing.expectEqual(try optI64(try jsonFieldRequired(step, "returns")), emit);

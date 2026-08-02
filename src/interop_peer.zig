@@ -220,8 +220,15 @@ pub const Peer = struct {
             try self.timerStepAlloc(step)
         else if (std.mem.eql(u8, feature, "stdlib_timeout_v1"))
             try self.timeoutStepAlloc(step)
+        else if (std.mem.eql(u8, feature, "stdlib_revision_barrier_v1"))
+            try self.barrierStepAlloc(step)
         else
-            try self.barrierStepAlloc(step);
+            // The barrier arm used to be the bare `else`. `supportedFeature`
+            // gates this today, so it was a latent fail-open — but the two lists
+            // are separate, and a feature added to the gate without an arm here
+            // would be replayed as a barrier and answered `ok`
+            // (#lzscenariobodyskip).
+            return self.errorAlloc("unsupported feature");
         self.last_feature = feature;
         self.last_observation = observation;
         return std.fmt.allocPrint(

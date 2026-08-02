@@ -552,9 +552,16 @@ test "rateshape conformance: debounce" {
             const now = try jsonAsU64(try jsonFieldRequired(op, "now"));
             const v = try jsonAsString(try jsonFieldRequired(op, "value"));
             cell.input(now, v);
-        } else {
+        } else if (std.mem.eql(u8, ty, "tick")) {
             const now = try jsonAsU64(try jsonFieldRequired(op, "now"));
             emitted = cell.tick(now);
+        } else {
+            // Fail closed on an op type the fixture names and this replay does
+            // not (#lzscenariobodyskip). `tick` used to be the bare `else`, so
+            // any unrecognised type was silently replayed as a tick and the
+            // step reported green against an op the fixture never asked for.
+            std.debug.print("rateshape debounce: unknown op type `{s}`\n", .{ty});
+            return error.UnknownOpType;
         }
         try expectStep(step, emitted, cell.output(), cell.outputVersion() != pre);
     }
@@ -587,8 +594,14 @@ fn runThrottle(name: []const u8, edge: ThrottleEdge) !void {
         const pre = cell.outputVersion();
         const emitted = if (std.mem.eql(u8, ty, "input"))
             cell.input(now, try jsonAsString(try jsonFieldRequired(op, "value")))
-        else
-            cell.tick(now);
+        else if (std.mem.eql(u8, ty, "tick"))
+            cell.tick(now)
+        else {
+            // Same fail-open as the debounce replay, closed the same way
+            // (#lzscenariobodyskip).
+            std.debug.print("rateshape throttle: unknown op type `{s}`\n", .{ty});
+            return error.UnknownOpType;
+        };
         try expectStep(step, emitted, cell.output(), cell.outputVersion() != pre);
     }
 }
@@ -607,7 +620,15 @@ test "rateshape conformance: sample_count" {
     for (try steps(fx)) |step| {
         const op = try jsonFieldRequired(step, "op");
         const pre = cell.outputVersion();
-        // sample_count is all `input` ops.
+        // sample_count is all `input` ops — but CHECK that rather than assume
+        // it (#lzscenariobodyskip). This replay used to ignore `type` entirely,
+        // so a fixture that grew a `tick` would have had it replayed as an
+        // input and booked green.
+        const ty = try jsonAsString(try jsonFieldRequired(op, "type"));
+        if (!std.mem.eql(u8, ty, "input")) {
+            std.debug.print("rateshape sample_count: unknown op type `{s}`\n", .{ty});
+            return error.UnknownOpType;
+        }
         const emitted = cell.input(try jsonAsString(try jsonFieldRequired(op, "value")));
         try expectStep(step, emitted, cell.output(), cell.outputVersion() != pre);
     }
@@ -631,8 +652,13 @@ test "rateshape conformance: sample_time" {
         var emitted: ?Value = null;
         if (std.mem.eql(u8, ty, "input")) {
             _ = cell.input(try jsonAsString(try jsonFieldRequired(op, "value")));
-        } else {
+        } else if (std.mem.eql(u8, ty, "tick")) {
             emitted = cell.tick(try jsonAsU64(try jsonFieldRequired(op, "now")));
+        } else {
+            // Same fail-open as the debounce replay, closed the same way
+            // (#lzscenariobodyskip).
+            std.debug.print("rateshape sample: unknown op type `{s}`\n", .{ty});
+            return error.UnknownOpType;
         }
         try expectStep(step, emitted, cell.output(), cell.outputVersion() != pre);
     }
