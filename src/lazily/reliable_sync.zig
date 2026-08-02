@@ -753,7 +753,7 @@ test "StoredOutbox replays canonical stale-handle cursor serialization" {
     const scenario = (try cj.replayingScenario(
         RS_OUTBOX_STORE,
         parsed.value,
-        "stale handle cannot regress serialized cursor",
+        "stale_handle_cannot_regress_cursor",
     )).object;
     const saves = scenario.get("save_cursor").?.array.items;
     const expected: u64 = @intCast(scenario.get("expect").?.object.get("loaded_cursor").?.integer);

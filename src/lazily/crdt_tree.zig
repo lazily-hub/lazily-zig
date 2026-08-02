@@ -75,7 +75,7 @@ test "CrdtTree replays canonical merge, snapshot, and frontier algebra" {
     _ = try cj.replayingScenario(
         ALGEBRA_FIXTURE,
         parsed.value,
-        "merge algebra is order and duplication independent",
+        "merge_is_order_and_duplication_independent",
     );
     var base = try text_crdt.TextCrdt.fromStr(allocator, 1, "root\n");
     defer base.deinit();
@@ -122,7 +122,7 @@ test "CrdtTree replays canonical merge, snapshot, and frontier algebra" {
     _ = try cj.replayingScenario(
         ALGEBRA_FIXTURE,
         parsed.value,
-        "empty frontier snapshot preserves lineage",
+        "empty_frontier_snapshot_preserves_lineage",
     );
     var source = try text_crdt.TextCrdt.fromStr(allocator, 7, "snapshot\n");
     defer source.deinit();
@@ -155,7 +155,7 @@ test "CrdtTree replays canonical merge, snapshot, and frontier algebra" {
     _ = try cj.replayingScenario(
         ALGEBRA_FIXTURE,
         parsed.value,
-        "own frontier emits an empty delta",
+        "own_frontier_emits_empty_delta",
     );
     var steady = try text_crdt.TextCrdt.fromStr(allocator, 9, "steady\n");
     defer steady.deinit();
