@@ -61,6 +61,25 @@ pub const BlobBackendKind = enum(u2) {
 
     /// Parse a wire discriminator string; unknown values normalize to `.shm`
     /// (the backward-compatible default).
+    ///
+    /// DELIBERATE LENIENCY (audited). `backend` is an OPTIONAL field on
+    /// `schemas/defs.json#/$defs/ShmBlobRef` whose omitted form means `shm`, and
+    /// the enum is open on the wire by design — the doc comment on
+    /// `BlobBackendKind` names RDMA/verbs and CUDA IPC as backends a future peer
+    /// may add without a protocol major bump. A peer that names a backend this
+    /// build has no code for must still be able to hand us the frame: refusing
+    /// the string would reject the WHOLE message, including every other op in
+    /// it, over one descriptor we merely cannot resolve.
+    ///
+    /// The consequence of the default is bounded and safe, because `.shm` is not
+    /// a guess at the bytes — it is a routing slot. `BlobRouter.readView` sends
+    /// the descriptor to whatever backend is registered under `.shm`, and that
+    /// backend rejects it: the generation, length, checksum and epoch words in
+    /// the descriptor were minted by a different arena and will not match, so
+    /// resolution returns `null` (the `resolve_wrong_backend` theorem). An
+    /// unknown backend therefore degrades to "this blob does not resolve",
+    /// never to "here are the wrong bytes". Pinned by the
+    /// "unknown backend discriminator" test below.
     pub fn fromString(text: []const u8) BlobBackendKind {
         if (std.mem.eql(u8, text, "arrow")) return .arrow;
         if (std.mem.eql(u8, text, "in_process")) return .in_process;
@@ -1420,6 +1439,41 @@ test "lazily/ipc: ShmBlobRef backend defaults to shm and omits from wire" {
     );
     defer std.testing.allocator.free(arrow_json);
     try std.testing.expect(std.mem.indexOf(u8, arrow_json, "\"backend\":\"arrow\"") != null);
+}
+
+test "lazily/ipc: an unknown backend discriminator is accepted, not rejected" {
+    // Pins the DELIBERATE leniency documented on `BlobBackendKind.fromString`.
+    // An undocumented default and an audited one look identical from outside;
+    // this test is what makes them distinguishable, and what makes a later
+    // "tighten this to an error" a visible decision rather than a silent one.
+    //
+    // `rdma` stands in for any backend a future peer ships that this build has
+    // no code for. The frame as a whole must still decode — one unresolvable
+    // descriptor may not cost us the other ops in the message.
+    const wire =
+        \\{"Delta":{"base_epoch":2,"epoch":3,"ops":[{"CellSet":{"node":1,"payload":
+        \\{"SharedBlob":{"offset":32,"len":4,"generation":9,"epoch":3,"checksum":7,
+        \\"backend":"rdma"}}}}]}}
+    ;
+    var parsed = try IpcMessage.decodeJson(std.testing.allocator, wire);
+    defer parsed.deinit();
+
+    const descriptor = parsed.message.Delta.ops[0].CellSet.payload.SharedBlob;
+    // Normalizes to the omitted-field default rather than erroring...
+    try std.testing.expectEqual(BlobBackendKind.shm, descriptor.backend);
+    // ...and every other word of the descriptor survives intact, which is what
+    // makes the default safe: it is a routing slot, not a claim about bytes.
+    try std.testing.expectEqual(@as(u64, 32), descriptor.offset);
+    try std.testing.expectEqual(@as(u64, 4), descriptor.len);
+    try std.testing.expectEqual(@as(u64, 9), descriptor.generation);
+    try std.testing.expectEqual(@as(u64, 7), descriptor.checksum);
+
+    // The bare parser agrees, for the same-named field arriving on any frame.
+    try std.testing.expectEqual(BlobBackendKind.shm, BlobBackendKind.fromString("rdma"));
+    try std.testing.expectEqual(BlobBackendKind.shm, BlobBackendKind.fromString(""));
+    // The two named non-default spellings are NOT swallowed by the default.
+    try std.testing.expectEqual(BlobBackendKind.arrow, BlobBackendKind.fromString("arrow"));
+    try std.testing.expectEqual(BlobBackendKind.in_process, BlobBackendKind.fromString("in_process"));
 }
 
 test "lazily/ipc: ShmBlobArena write/read round-trip" {

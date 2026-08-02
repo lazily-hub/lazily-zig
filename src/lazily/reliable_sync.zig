@@ -423,9 +423,17 @@ pub const InMemoryStore = struct {
     }
 };
 
-const file_record_put: u8 = 1;
-const file_record_delete: u8 = 2;
-const file_record_cursor: u8 = 3;
+/// The journal record opcodes, as an enum so the readers below dispatch
+/// exhaustively. A byte outside this set is a corrupt or foreign journal, not a
+/// record to skip: `nextFileRecord` refuses it with `error.UnknownOutboxRecordOp`
+/// rather than stepping over it. Skipping was the fail-open shape — an
+/// unreadable `delete` record replayed frames the peer had already acked, and a
+/// truncated journal read as "no frames" instead of an error.
+const FileRecordOp = enum(u8) {
+    put = 1,
+    delete = 2,
+    cursor = 3,
+};
 const file_record_header_len = 17;
 
 /// Durable append-only binary journal adapter. Every write takes an OS-level
@@ -449,15 +457,15 @@ pub const FileOutboxStore = struct {
     }
 
     pub fn put(self: *FileOutboxStore, epoch: u64, frame: []const u8) !void {
-        try self.appendRecord(file_record_put, epoch, frame);
+        try self.appendRecord(.put, epoch, frame);
     }
 
     pub fn deleteThrough(self: *FileOutboxStore, epoch: u64) !void {
-        try self.appendRecord(file_record_delete, epoch, &.{});
+        try self.appendRecord(.delete, epoch, &.{});
     }
 
     pub fn saveCursor(self: *FileOutboxStore, epoch: u64) !void {
-        try self.appendRecord(file_record_cursor, epoch, &.{});
+        try self.appendRecord(.cursor, epoch, &.{});
     }
 
     pub fn loadCursor(self: *FileOutboxStore) !u64 {
@@ -465,8 +473,8 @@ pub const FileOutboxStore = struct {
         defer self.allocator.free(data);
         var cursor: u64 = 0;
         var offset: usize = 0;
-        while (nextFileRecord(data, &offset)) |record| {
-            if (record.op == file_record_cursor) cursor = @max(cursor, record.epoch);
+        while (try nextFileRecord(data, &offset)) |record| {
+            if (record.op == .cursor) cursor = @max(cursor, record.epoch);
         }
         return cursor;
     }
@@ -478,10 +486,12 @@ pub const FileOutboxStore = struct {
         defer entries.deinit();
         var deleted_through: u64 = 0;
         var offset: usize = 0;
-        while (nextFileRecord(data, &offset)) |record| switch (record.op) {
-            file_record_put => try entries.put(record.epoch, record.frame),
-            file_record_delete => deleted_through = @max(deleted_through, record.epoch),
-            else => {},
+        while (try nextFileRecord(data, &offset)) |record| switch (record.op) {
+            .put => try entries.put(record.epoch, record.frame),
+            .delete => deleted_through = @max(deleted_through, record.epoch),
+            // A cursor record is an acknowledgement watermark, read by
+            // `loadCursor`; it carries no frame for this scan.
+            .cursor => {},
         };
         const cursor = @max(cursor_arg, deleted_through);
         var out = std.ArrayList(StoredOutboxFrame).empty;
@@ -502,9 +512,9 @@ pub const FileOutboxStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn appendRecord(self: *FileOutboxStore, op: u8, epoch: u64, frame: []const u8) !void {
+    fn appendRecord(self: *FileOutboxStore, op: FileRecordOp, epoch: u64, frame: []const u8) !void {
         var header: [file_record_header_len]u8 = undefined;
-        header[0] = op;
+        header[0] = @intFromEnum(op);
         std.mem.writeInt(u64, header[1..9], epoch, .little);
         std.mem.writeInt(u64, header[9..17], frame.len, .little);
         var file = try std.Io.Dir.cwd().createFile(self.io, self.path, .{
@@ -534,18 +544,35 @@ pub const FileOutboxStore = struct {
 
 pub const FileOutbox = StoredOutbox(FileOutboxStore);
 
-const FileRecord = struct { op: u8, epoch: u64, frame: []const u8 };
+const FileRecord = struct { op: FileRecordOp, epoch: u64, frame: []const u8 };
 
-fn nextFileRecord(data: []const u8, offset: *usize) ?FileRecord {
+/// Errors a journal read can report on top of the I/O and allocation errors.
+pub const OutboxJournalError = error{UnknownOutboxRecordOp};
+
+/// Decode the record at `offset.*`, advancing `offset` past it. `null` at the
+/// end of the journal (including a trailing partial record, which is a torn
+/// append the writer never flushed). An opcode byte outside `FileRecordOp` is
+/// `error.UnknownOutboxRecordOp` — see `FileRecordOp`.
+fn nextFileRecord(data: []const u8, offset: *usize) OutboxJournalError!?FileRecord {
     if (data.len - offset.* < file_record_header_len) return null;
     const start = offset.*;
     const len = std.mem.readInt(u64, data[start + 9 ..][0..8], .little);
     const frame_start = start + file_record_header_len;
     const frame_end = std.math.add(usize, frame_start, @intCast(len)) catch return null;
     if (frame_end > data.len) return null;
+    // Written as an explicit switch rather than an int-to-enum helper: the
+    // spelling of that helper moved between the three pinned toolchains, and
+    // this one is exhaustive over `FileRecordOp` so a new opcode is a compile
+    // error here rather than a runtime surprise.
+    const op: FileRecordOp = switch (data[start]) {
+        @intFromEnum(FileRecordOp.put) => .put,
+        @intFromEnum(FileRecordOp.delete) => .delete,
+        @intFromEnum(FileRecordOp.cursor) => .cursor,
+        else => return error.UnknownOutboxRecordOp,
+    };
     offset.* = frame_end;
     return .{
-        .op = data[start],
+        .op = op,
         .epoch = std.mem.readInt(u64, data[start + 1 ..][0..8], .little),
         .frame = data[frame_start..frame_end],
     };
@@ -2007,4 +2034,48 @@ test "sync_driver: full-duplex gap then snapshot converges" {
     // A ResyncRequest{from:2} and an OutboxAck{through:4} crossed the wire.
     try testing.expect(h.wire.sawResyncRequest(2));
     try testing.expect(h.wire.sawOutboxAck(4));
+}
+
+test "outbox journal: an unknown record opcode is refused, not skipped" {
+    // The journal is durable state read back by a LATER process — possibly a
+    // later build. Silently stepping over a record whose opcode this build does
+    // not know is the fail-open shape: a `delete` we could not read replays
+    // frames the peer already acked, and a corrupt file reads as "no frames"
+    // instead of an error. This is a `nextFileRecord` test rather than a
+    // `FileOutboxStore` one on purpose — it needs no `std.Io`, so it runs on all
+    // three pinned toolchains instead of skipping on 0.15.2.
+    const header_of = struct {
+        fn build(op: u8, epoch: u64, frame_len: u64) [file_record_header_len]u8 {
+            var h: [file_record_header_len]u8 = undefined;
+            h[0] = op;
+            std.mem.writeInt(u64, h[1..9], epoch, .little);
+            std.mem.writeInt(u64, h[9..17], frame_len, .little);
+            return h;
+        }
+    }.build;
+
+    // Every opcode the writer can emit decodes.
+    for ([_]struct { byte: u8, want: FileRecordOp }{
+        .{ .byte = 1, .want = .put },
+        .{ .byte = 2, .want = .delete },
+        .{ .byte = 3, .want = .cursor },
+    }) |known| {
+        const header = header_of(known.byte, 7, 0);
+        var offset: usize = 0;
+        const record = (try nextFileRecord(&header, &offset)).?;
+        try testing.expectEqual(known.want, record.op);
+        try testing.expectEqual(@as(u64, 7), record.epoch);
+    }
+
+    // 0 and 4 bracket the known range on both sides.
+    for ([_]u8{ 0, 4, 0xff }) |unknown| {
+        const header = header_of(unknown, 7, 0);
+        var offset: usize = 0;
+        try testing.expectError(
+            error.UnknownOutboxRecordOp,
+            nextFileRecord(&header, &offset),
+        );
+        // ...and the cursor did not advance past the record we refused.
+        try testing.expectEqual(@as(usize, 0), offset);
+    }
 }

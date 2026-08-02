@@ -335,3 +335,76 @@ test "lazily/command_plane: enums round-trip wire names" {
         });
     }
 }
+
+test "lazily/command_plane: a non-bool wire boolean is refused, not read as false" {
+    // `false` is a meaningful value on all three boolean wire fields, so a
+    // decode failure that returns `false` is indistinguishable from the peer
+    // having said `false`. `terminal` is the sharp one: reading it as `false`
+    // downgrades a settled command back to in-flight, and the projection then
+    // accepts a second, different terminal outcome instead of reporting the
+    // conflict.
+    const cases = [_]struct { name: []const u8, wire: []const u8 }{
+        .{
+            .name = "terminal",
+            .wire =
+            \\{"CommandProjection":{"generation":1,"commands":[{"command_id":"c1",
+            \\"status":"applied","terminal":"true","generation":1,"reason":null,
+            \\"terminal_receipt_id":null,"last_event_id":null}]}}
+            ,
+        },
+        .{
+            .name = "supersede",
+            .wire =
+            \\{"CommandSubmit":{"command_id":"c1","causation_id":"c1","source":"s",
+            \\"target":"t","namespace":"n","name":"do","authority_generation":1,
+            \\"idempotency_key":"k","deadline_ms":1000,
+            \\"policy":{"dedupe":"none","supersede":1,"cancel_on_preempt":false},
+            \\"payload_type":"p","payload_hash":"h","payload":"{}",
+            \\"required_features":[]}}
+            ,
+        },
+        .{
+            .name = "cancel_on_preempt",
+            .wire =
+            \\{"CommandSubmit":{"command_id":"c1","causation_id":"c1","source":"s",
+            \\"target":"t","namespace":"n","name":"do","authority_generation":1,
+            \\"idempotency_key":"k","deadline_ms":1000,
+            \\"policy":{"dedupe":"none","supersede":false,"cancel_on_preempt":null},
+            \\"payload_type":"p","payload_hash":"h","payload":"{}",
+            \\"required_features":[]}}
+            ,
+        },
+    };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), case.wire, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        std.testing.expectError(
+            error.ExpectedBool,
+            cp.commandMessageFromJson(arena.allocator(), parsed.value),
+        ) catch |err| {
+            std.debug.print("field `{s}` did not fail closed\n", .{case.name});
+            return err;
+        };
+    }
+
+    // The well-typed forms still decode — the tightening did not close the door
+    // on the shapes a conforming peer actually emits.
+    const ok_wire =
+        \\{"CommandProjection":{"generation":1,"commands":[{"command_id":"c1",
+        \\"status":"applied","terminal":true,"generation":1,"reason":null,
+        \\"terminal_receipt_id":null,"last_event_id":null}]}}
+    ;
+    var ok_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ok_arena.deinit();
+    var ok_parsed = try std.json.parseFromSlice(std.json.Value, ok_arena.allocator(), ok_wire, .{
+        .allocate = .alloc_always,
+    });
+    defer ok_parsed.deinit();
+    const decoded = try cp.commandMessageFromJson(ok_arena.allocator(), ok_parsed.value);
+    try std.testing.expect(decoded.CommandProjection.commands[0].terminal);
+}

@@ -589,9 +589,25 @@ fn isProperDescendant(def: *const ChartDef, desc: Index, anc: Index) bool {
     return false;
 }
 
+/// DELIBERATE LENIENCY (audited). A transition naming a guard the host did not
+/// supply does not fire.
+///
+/// The two halves come from different places: the chart (with its guard NAMES)
+/// is wire/fixture data, while the guard VALUES are a runtime map the embedding
+/// host fills per step. Nothing in the protocol lets the chart author enumerate
+/// what a given host implements, so "named but not supplied" is a normal state
+/// of the world, not a malformed chart — a host that evaluates a subset of the
+/// guards is a supported deployment.
+///
+/// The default is `false`, which is the conservative outcome: an unsupplied
+/// guard is indistinguishable from a guard the host evaluated to false, and in
+/// both cases the transition is blocked and the machine stays where it is. The
+/// alternative default would let an unimplemented guard *authorize* a
+/// transition, which is how a guard becomes decorative. This is the leniency
+/// that must not drift to `true`; the test below is what pins it.
 fn guardPasses(t: Transition, guards: *const std.StringHashMap(bool)) bool {
     const name = t.guard orelse return true;
-    return guards.get(name) orelse false; // fail-closed
+    return guards.get(name) orelse false;
 }
 
 fn historyChildOf(def: *const ChartDef, region: Index) ?Index {
@@ -902,6 +918,52 @@ test "lazily/statechart conformance: history_deep" {
 
 test "lazily/statechart conformance: entry_exit_actions" {
     try runFixture(@embedFile("test/statechart/entry_exit_actions.json"));
+}
+
+test "lazily/statechart: a guard the host did not supply blocks the transition" {
+    // Pins the DELIBERATE leniency documented on `guardPasses`. The chart names
+    // `unlocked`; the host supplies a valuation that does not mention it, which
+    // is the supported "this host evaluates a subset of the guards" case.
+    //
+    // Three valuations of the SAME chart and the SAME event, so the test cannot
+    // pass by the transition being unreachable for some other reason:
+    //   absent  -> blocked (the leniency under audit)
+    //   false   -> blocked (must be indistinguishable from absent)
+    //   true    -> taken   (proves the transition is otherwise live)
+    const chart_json =
+        \\{"initial":"closed","states":{
+        \\"root":{"initial":"closed"},
+        \\"closed":{"parent":"root","on":{"OPEN":{"target":"open","guard":"unlocked"}}},
+        \\"open":{"parent":"root"}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), chart_json, .{});
+
+    const Case = struct { supply: ?bool, want_accepted: bool, want_open: bool };
+    for ([_]Case{
+        .{ .supply = null, .want_accepted = false, .want_open = false },
+        .{ .supply = false, .want_accepted = false, .want_open = false },
+        .{ .supply = true, .want_accepted = true, .want_open = true },
+    }) |case| {
+        var def = try ChartDef.parse(std.testing.allocator, parsed.value);
+        defer def.deinit();
+        var ctx = try Context.init(std.testing.allocator);
+        defer ctx.deinit();
+        var sc = try StateChart.init(ctx, &def);
+        defer sc.deinit();
+
+        var guards = std.StringHashMap(bool).init(std.testing.allocator);
+        defer guards.deinit();
+        if (case.supply) |v| try guards.put("unlocked", v);
+        // An unrelated guard is always present, so "the map was empty" is never
+        // what the absent case is really testing.
+        try guards.put("some_other_guard", true);
+
+        try std.testing.expectEqual(case.want_accepted, sc.send("OPEN", &guards));
+        try std.testing.expectEqual(case.want_open, sc.matches("open"));
+        try std.testing.expectEqual(!case.want_open, sc.matches("closed"));
+    }
 }
 
 test "lazily/statechart: rejects unsupported features explicitly" {

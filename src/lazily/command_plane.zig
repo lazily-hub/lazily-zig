@@ -731,15 +731,22 @@ fn jarray(value: std.json.Value) ![]const std.json.Value {
 fn parsePolicy(value: std.json.Value) !CommandPolicy {
     return .{
         .dedupe = try DedupePolicy.fromWireName(try jstr(try jfield(value, "dedupe"))),
-        .supersede = jbool(try jfield(value, "supersede")),
-        .cancel_on_preempt = jbool(try jfield(value, "cancel_on_preempt")),
+        .supersede = try jbool(try jfield(value, "supersede")),
+        .cancel_on_preempt = try jbool(try jfield(value, "cancel_on_preempt")),
     };
 }
 
-fn jbool(value: std.json.Value) bool {
+/// Wire booleans fail closed, like every other scalar reader in this file
+/// (`jstr`, `ju64`). This used to return `false` for anything that was not a
+/// JSON bool, which is a decode failure wearing the costume of a legitimate
+/// value: a `"terminal": "true"` string read as a NON-terminal projection
+/// entry, and an unparsed `supersede` / `cancel_on_preempt` read as the policy
+/// being off. `false` is a meaningful value on all three fields, so there is no
+/// way for a caller to tell "the peer said false" from "we could not read it".
+fn jbool(value: std.json.Value) !bool {
     return switch (value) {
         .bool => |b| b,
-        else => false,
+        else => error.ExpectedBool,
     };
 }
 
@@ -797,7 +804,7 @@ fn parseEntry(allocator: std.mem.Allocator, value: std.json.Value) !CommandProje
     return .{
         .command_id = try allocator.dupe(u8, try jstr(try jfield(value, "command_id"))),
         .status = try CommandStatus.fromWireName(try jstr(try jfield(value, "status"))),
-        .terminal = jbool(try jfield(value, "terminal")),
+        .terminal = try jbool(try jfield(value, "terminal")),
         .generation = try ju64(try jfield(value, "generation")),
         .reason = try joptStr(allocator, try jfield(value, "reason")),
         .terminal_receipt_id = try joptStr(allocator, try jfield(value, "terminal_receipt_id")),
