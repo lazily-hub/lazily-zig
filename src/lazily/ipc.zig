@@ -447,7 +447,13 @@ pub const NodeSnapshot = struct {
             .node = try asU64(try field(value, "node")),
             .type_tag = try asString(try field(value, "type_tag")),
             .state = try NodeState.fromJson(allocator, try field(value, "state")),
-            .key = if (objectGet(value, "key")) |k| try asString(k) else null,
+            // Omit-when-absent is an ENCODER rule (protocol.md § NodeKey,
+            // `#lzkeynullstrict`); a conforming peer may still send an explicit
+            // `key: null`, and a decoder MUST read both forms as absent. The
+            // previous `objectGet(...) |k| asString(k)` saw the JSON null and
+            // returned error.ExpectedString. `CrdtOp.fromJson` below already
+            // switches on `.null` for exactly this reason.
+            .key = try keyFieldOrNull(value),
         };
     }
 
@@ -575,12 +581,15 @@ pub const DeltaOp = union(enum) {
             return .{ .Invalidate = try parseNodeOnlyOp(tagged.value) };
         }
         if (std.mem.eql(u8, tagged.name, "NodeAdd")) {
-            return .{ .NodeAdd = .{
-                .node = try asU64(try field(tagged.value, "node")),
-                .type_tag = try asString(try field(tagged.value, "type_tag")),
-                .state = try NodeState.fromJson(allocator, try field(tagged.value, "state")),
-                .key = if (objectGet(tagged.value, "key")) |k| try asString(k) else null,
-            } };
+            return .{
+                .NodeAdd = .{
+                    .node = try asU64(try field(tagged.value, "node")),
+                    .type_tag = try asString(try field(tagged.value, "type_tag")),
+                    .state = try NodeState.fromJson(allocator, try field(tagged.value, "state")),
+                    // Same leniency as NodeSnapshot.fromJson (`#lzkeynullstrict`).
+                    .key = try keyFieldOrNull(tagged.value),
+                },
+            };
         }
         if (std.mem.eql(u8, tagged.name, "NodeRemove")) {
             return .{ .NodeRemove = try parseNodeOnlyOp(tagged.value) };
@@ -752,10 +761,7 @@ pub const CrdtOp = struct {
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !CrdtOp {
         return .{
             .node = try asU64(try field(value, "node")),
-            .key = switch (objectGet(value, "key") orelse std.json.Value{ .null = {} }) {
-                .null => null,
-                else => |k| try asString(k),
-            },
+            .key = try keyFieldOrNull(value),
             .stamp = try WireStamp.fromJson(try field(value, "stamp")),
             .state = try IpcValue.fromJson(allocator, try field(value, "state")),
         };
@@ -1052,6 +1058,22 @@ fn asString(value: std.json.Value) ![]const u8 {
     return switch (value) {
         .string => |s| s,
         else => error.ExpectedString,
+    };
+}
+
+/// Read an optional `NodeKey` field, treating BOTH an omitted field and an
+/// explicit JSON `null` as absent (`#lzkeynullstrict`).
+///
+/// protocol.md § NodeKey makes omit-when-absent an obligation on the ENCODER.
+/// It says nothing that lets a decoder refuse the null form, and a peer that
+/// simply did not apply `skip_serializing_if` emits it — so refusing made this
+/// binding stricter than the reference implementation on a frame the reference
+/// implementation produces. Anything other than a string or null is still an
+/// error: leniency here is about ABSENCE, not about types.
+fn keyFieldOrNull(value: std.json.Value) !?[]const u8 {
+    return switch (objectGet(value, "key") orelse std.json.Value{ .null = {} }) {
+        .null => null,
+        else => |k| try asString(k),
     };
 }
 
