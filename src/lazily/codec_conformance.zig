@@ -26,6 +26,11 @@
 //! wire no `msgpack` peer can read. `encoded_envelope_key` /
 //! `encoded_body_field_names` / `first_node_encoded_field_names` /
 //! `first_op_encoded_field_names` are the executable form of that rule.
+//!
+//! Both fixtures declare `note` a PARAGRAPH (`#lzprosekeyconvention`). It is the
+//! one reserved annotation name the corpus reclaims: everywhere else `note`
+//! annotates and is exempt by name, and here it states an obligation, so it is
+//! discharged by the assertions that carry it instead of being skipped.
 
 const std = @import("std");
 const cj = @import("conformance_json.zig");
@@ -179,14 +184,28 @@ test "lazily/codec: json frames round-trip through the reference codec" {
     // senses of "canonical" protocol.md keeps apart (`role` = the required
     // interop floor, `byte_canonical` = one deterministic byte form per
     // message).
+    // `note` is a PARAGRAPH here, not an annotation: the corpus declares it in
+    // `assertions.prose`, which strips the reserved-name exemption every other
+    // block's `note` keeps (`#lzprosekeyconvention`).
+    var prose = cj.ProseLedger.init(JSON_FIXTURE);
+    defer prose.deinit();
+    errdefer prose.disarm();
+
     var meta = cj.AssertionKeys.init(JSON_FIXTURE ++ " assertions", try cj.required(root, "assertions"));
+    try meta.trackProse(&prose);
     try meta.assertKey("codec", "json");
     try meta.assertKey("self_describing", true);
     try meta.assertKey("byte_canonical", true);
     try meta.assertKey("required_of_binding", "MUST");
     try meta.assertKey("role", "reference");
     try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
+    // The paragraph's own claim is that `role` and `byte_canonical` are the two
+    // senses of "canonical" protocol.md keeps distinct and that BOTH are pinned
+    // here — so it is discharged by exactly those two assertions, and a fixture
+    // that stopped pinning one would fail rather than keep a true-sounding note.
+    try meta.proseKey("note", &.{ "role", "byte_canonical" });
     try meta.finish();
+    try cj.verifyProse(&prose);
 
     var scenarios = try cj.scenarios(JSON_FIXTURE, root);
     var replayed: usize = 0;
@@ -301,13 +320,25 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
     // sorted field-name lists instead of golden bytes, and `role` is the other
     // sense of "canonical" protocol.md keeps apart: msgpack is the required
     // efficient transport, never the reference codec.
+    // `note` is a PARAGRAPH here (`#lzprosekeyconvention`), and the key that
+    // discharges it — `encoded_body_field_names` — is asserted three scenarios
+    // later, which is why the ledger is fixture-scoped and verified at the end.
+    var prose = cj.ProseLedger.init(MSGPACK_FIXTURE);
+    defer prose.deinit();
+    errdefer prose.disarm();
+
     var meta = cj.AssertionKeys.init(MSGPACK_FIXTURE ++ " assertions", try cj.required(root, "assertions"));
+    try meta.trackProse(&prose);
     try meta.assertKey("codec", "msgpack");
     try meta.assertKey("self_describing", true);
     try meta.assertKey("byte_canonical", false);
     try meta.assertKey("required_of_binding", "MUST");
     try meta.assertKey("role", "cross_language_binary_default");
     try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
+    // Its two claims, in its own words: "`byte_canonical: false` is the whole
+    // reason this fixture pins decoded values instead of golden bytes", and the
+    // named-field encoding "is what `encoded_body_field_names` below verifies".
+    try meta.proseKey("note", &.{ "byte_canonical", "encoded_body_field_names" });
     try meta.finish();
 
     var scenarios = try cj.scenarios(MSGPACK_FIXTURE, root);
@@ -356,6 +387,9 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
         var second_names: [MAX_ENCODED_FIELDS][]const u8 = undefined;
 
         var keys = cj.AssertionKeys.init(MSGPACK_FIXTURE, try cj.required(scenario, "expect"));
+        // Into the SAME ledger as the `assertions` block, so `note`'s discharge
+        // of `encoded_body_field_names` is checkable (`#lzprosekeyconvention`).
+        try keys.trackProse(&prose);
         // Both frames come from the SAME encoder, so this is a round-trip
         // claim, not a byte-canonicality claim about the codec — protocol.md
         // permits two conforming bindings to emit byte-different msgpack for
@@ -406,5 +440,6 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
         try keys.finish();
         replayed += 1;
     }
+    try cj.verifyProse(&prose);
     try std.testing.expectEqual(@as(usize, 3), replayed);
 }

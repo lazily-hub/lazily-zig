@@ -164,15 +164,20 @@ if [ ! -s "$MANIFEST" ]; then
   echo "      manifest is missing evidence, not evidence of absence." >&2
   exit 1
 fi
-# Two evidence channels share one file. A corpus-relative fixture id can never
+# THREE evidence channels share one file. A corpus-relative fixture id can never
 # begin with `@`, so the split is a single grep and needs no second manifest,
 # no second environment variable, and no second build.zig wiring.
 TAB=$'\t'
 SCENARIO_MARK="@scenario$TAB"
-OPENED="$({ grep -v "^$SCENARIO_MARK" "$MANIFEST" || true; } | sort -u)"
+PROSE_MARK="@prose$TAB"
+OPENED="$({ grep -v "^@" "$MANIFEST" || true; } | sort -u)"
 # `fixture<TAB>scenario-id`, one line per scenario the suite actually replayed.
 SCENARIO_LEDGER="$({ grep "^$SCENARIO_MARK" "$MANIFEST" || true; } \
   | sed "s|^$SCENARIO_MARK||" | sort -u)"
+# One line per fixture whose prose discharges reached verifyProse
+# (#lzprosekeyconvention, rule 8).
+PROSE_LEDGER="$({ grep "^$PROSE_MARK" "$MANIFEST" || true; } \
+  | sed "s|^$PROSE_MARK||" | sort -u)"
 
 missing=0
 total=0
@@ -369,6 +374,63 @@ for entry in "${SCENARIO_EXCUSES[@]:-}"; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# Prose-verification accounting (#lzprosekeyconvention, rule 8).
+# ---------------------------------------------------------------------------
+#
+# Rules 1-7 of the prose-key convention are all satisfied over an EMPTY
+# population: a fixture whose bytes are opened and whose blocks are never built
+# declares paragraphs that nothing has to discharge, and its tracker never runs.
+# That is the same vacuity `anti_vacuity` exists to name, reappearing inside the
+# guard meant to enforce it.
+#
+# So the required set is derived from the CORPUS, never from a hand-kept list:
+# every fixture that declares `assertions.prose` and whose bytes this suite
+# opened must appear in the prose ledger. A tenth paragraph landing upstream
+# reddens here on its own.
+prose_required=0
+prose_verified=0
+
+declares_prose() {
+  jq -e '(.assertions.prose? // []) | type == "array" and length > 0' "$SPEC_DIR/$1" \
+    >/dev/null 2>&1
+}
+
+while IFS= read -r fixture; do
+  [ -n "$fixture" ] || continue
+  declares_prose "$fixture" || continue
+  prose_required=$((prose_required + 1))
+  if grep -qxF "$fixture" <<< "$PROSE_LEDGER"; then
+    prose_verified=$((prose_verified + 1))
+    continue
+  fi
+  echo "ERROR: '$fixture' declares \`assertions.prose\` and this run never reached" >&2
+  echo "       verifyProse for it. Every prose rule holds vacuously over a fixture" >&2
+  echo "       that was opened and not replayed, so a green suite would prove" >&2
+  echo "       nothing about its paragraphs (#lzprosekeyconvention, rule 8)." >&2
+  missing=$((missing + 1))
+done <<< "$OPENED"
+
+# The channel guards itself, in both directions: a verification recorded for a
+# fixture the manifest never opened, or for one carrying no declaration, means
+# the recorder is writing claims rather than observations.
+while IFS= read -r fixture; do
+  [ -n "$fixture" ] || continue
+  if ! grep -qxF "$fixture" <<< "$OPENED"; then
+    echo "ERROR: prose ledger records '$fixture', which the fixture manifest says" >&2
+    echo "       was never opened. Verification computed from this ledger cannot be" >&2
+    echo "       trusted (#lzprosekeyconvention)." >&2
+    missing=$((missing + 1))
+    continue
+  fi
+  if ! declares_prose "$fixture"; then
+    echo "ERROR: prose ledger records '$fixture', which declares no" >&2
+    echo "       \`assertions.prose\`. The runner is verifying a declaration the" >&2
+    echo "       corpus dropped (#lzprosekeyconvention)." >&2
+    missing=$((missing + 1))
+  fi
+done <<< "$PROSE_LEDGER"
+
 if [ "$missing" -gt 0 ]; then
   echo "conformance coverage FAILED: $missing problem(s)" >&2
   exit 1
@@ -425,7 +487,17 @@ if [ "$scenario_replayed" -lt "$MIN_SCENARIOS" ]; then
   exit 1
 fi
 
+if [ "$prose_required" -eq 0 ]; then
+  echo "ERROR: NO opened fixture declares \`assertions.prose\`." >&2
+  echo "       The corpus carries five that do, so either the manifest detached or" >&2
+  echo "       the declaration was dropped upstream — and rule 8 is vacuously green" >&2
+  echo "       either way (#lzprosekeyconvention)." >&2
+  exit 1
+fi
+
 echo "conformance coverage OK: $covered/$total canonical fixtures OPENED by the suite" \
      "(${#KNOWN_UNCOVERED[@]} listed as known-uncovered; runtime manifest — these bytes were really read)"
 echo "scenario coverage OK: $scenario_replayed/$scenario_total scenarios of those fixtures REPLAYED" \
      "($scenario_excused excused; runtime ledger — these scenarios really ran)"
+echo "prose-key coverage OK: $prose_verified/$prose_required fixtures declaring \`assertions.prose\`" \
+     "reached verifyProse (runtime ledger — the discharges were really checked)"

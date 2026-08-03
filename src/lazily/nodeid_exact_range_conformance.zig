@@ -19,6 +19,12 @@
 //! 9007199254740993 while loading the file, but the contract is uniform across
 //! the nine bindings on purpose: the double-backed ones would, and a fixture
 //! that reads differently per runtime is not one fixture.
+//!
+//! The three PARAGRAPHS in `assertions` are discharged, not excused
+//! (`#lzprosekeyconvention`). `outcomes` left that list with them and became a
+//! real assertion: it is a gloss MAP, not a paragraph, so the assertion is over
+//! its key set — checked against the outcomes this run actually replayed, which
+//! is also what discharges `anti_vacuity`.
 
 const std = @import("std");
 const cj = @import("conformance_json.zig");
@@ -67,13 +73,81 @@ fn checkU8List(context: U8List, expected: Value) anyerror!void {
     for (want, context.items) |w, got| try std.testing.expectEqual(try cj.asU64(w), @as(u64, got));
 }
 
-/// `outcome` is the corpus-wide statement of what a decoder may do. lazily-zig
-/// reads it as a constraint on the FIXTURE: both branches oblige it to decode,
-/// because a u64 covers the whole wire range.
-fn checkOutcome(_: void, expected: Value) anyerror!void {
+/// A small deduplicating set of borrowed strings, for the declared-vs-OBSERVED
+/// outcome-vocabulary check.
+const StrSet = struct {
+    items: [8][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *StrSet, s: []const u8) void {
+        if (self.has(s)) return;
+        if (self.len == self.items.len) @panic("StrSet capacity exceeded");
+        self.items[self.len] = s;
+        self.len += 1;
+    }
+
+    fn has(self: *const StrSet, s: []const u8) bool {
+        for (self.items[0..self.len]) |item| {
+            if (std.mem.eql(u8, item, s)) return true;
+        }
+        return false;
+    }
+};
+
+/// What this run actually did with one scenario's frame.
+const Verdict = struct {
+    observed: *StrSet,
+    /// The decode returned a message rather than an error.
+    accepted: bool,
+    /// The decoded identifier equals `expect.node_id_decimal` exactly.
+    exact: bool,
+};
+
+/// `outcome` against what the run actually DID, not against a hand-written copy
+/// of the vocabulary.
+///
+/// The membership check this replaces was satisfied by any two-element
+/// vocabulary and by a runner that decoded nothing — the shape
+/// `anti_vacuity` exists to name, and a discharge naming it would have
+/// discharged nothing (`#lzprosekeyconvention`). Both branches are now claims
+/// about the observed decode: `exact` obliges an exact accept, and
+/// `exact_or_reject` forbids the third outcome — an accept yielding a
+/// NEIGHBOURING identifier, which is precisely what a rounding decoder produces.
+fn checkOutcome(v: Verdict, expected: Value) anyerror!void {
     const outcome = try cj.asStr(expected);
-    if (!std.mem.eql(u8, outcome, "exact") and !std.mem.eql(u8, outcome, "exact_or_reject")) {
+    if (std.mem.eql(u8, outcome, "exact")) {
+        if (!v.accepted) return error.ExactScenarioWasRejected;
+        if (!v.exact) return error.ExactScenarioDecodedInexactly;
+    } else if (std.mem.eql(u8, outcome, "exact_or_reject")) {
+        if (v.accepted and !v.exact) return error.BoundaryValueDecodedInexactly;
+    } else {
         return error.UnknownOutcome;
+    }
+    // Banked for the `outcomes` gloss-map key-set assertion after the loop.
+    v.observed.add(outcome);
+}
+
+/// The `outcomes` gloss map's KEY SET against the outcomes this run replayed.
+fn checkOutcomeVocabulary(observed: *const StrSet, expected: Value) anyerror!void {
+    const object = switch (expected) {
+        .object => |o| o,
+        else => return error.ExpectedObject,
+    };
+    for (object.keys()) |name| {
+        if (!observed.has(name)) {
+            std.debug.print(
+                "{s}: outcome '{s}' is declared but no scenario in this run replayed it\n",
+                .{ FIXTURE, name },
+            );
+            return error.DeclaredOutcomeNeverObserved;
+        }
+    }
+    if (object.count() != observed.len) {
+        std.debug.print(
+            "{s}: this run replayed {d} distinct outcomes against {d} declared\n",
+            .{ FIXTURE, observed.len, object.count() },
+        );
+        return error.ObservedOutcomeNotDeclared;
     }
 }
 
@@ -92,18 +166,26 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     try std.testing.expectEqual(@as(u64, 1), try cj.asU64(try cj.required(root, "protocol_version")));
     try std.testing.expectEqualStrings("NodeIdExactRange", try cj.asStr(try cj.required(root, "kind")));
 
+    // The fixture-scoped prose ledger (`#lzprosekeyconvention`). The three
+    // paragraphs are discharged after the loop, because every key they name is
+    // asserted in a per-scenario `expect` block.
+    var prose = cj.ProseLedger.init(FIXTURE);
+    defer prose.deinit();
+    errdefer prose.disarm();
+
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
+    try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
     try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
     try meta.assertKeyWith("codecs", {}, checkCodecs);
-    for ([_][]const u8{ "clause", "wire_encoding", "outcomes", "anti_vacuity", "generator" }) |prose| {
-        try meta.excuseKey(
-            prose,
-            "prose: it states WHY the fixture is shaped this way; the behaviour it " ++
-                "describes is asserted by the per-scenario decode below",
-        );
-    }
-    try meta.finish();
+    try meta.excuseKey(
+        "generator",
+        "names the lazily-spec script that emits this fixture. It is a fact about the " ++
+            "CORPUS's build, not about this binding, so there is nothing here to compare " ++
+            "it against — lazily-spec's own regeneration check owns it",
+    );
+    // `outcomes` is asserted AFTER the loop, against the outcomes this run
+    // actually replayed, so `meta` stays open until then.
 
     // Anti-vacuity. `exact_or_reject` is satisfied by a runner that decodes
     // nothing, so the count of scenarios this run actually ACCEPTED is the
@@ -111,6 +193,7 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     // corpus, so the expected value is every scenario — anything less is a
     // narrowing of the binding, not of the test.
     var accepted: usize = 0;
+    var observed_outcomes: StrSet = .{};
 
     var scenarios = try cj.scenarios(FIXTURE, root);
     while (scenarios.next()) |sc| {
@@ -133,7 +216,9 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         try std.testing.expectEqualStrings("Snapshot", try cj.asStr(try cj.required(scenario, "variant")));
 
         var keys = cj.AssertionKeys.init(FIXTURE, expect);
-        try keys.assertKeyWith("outcome", {}, checkOutcome);
+        // Into the SAME ledger as the `assertions` block: a discharge names keys
+        // by name in any block of this fixture (`#lzprosekeyconvention`).
+        try keys.trackProse(&prose);
         try keys.assertKey("epoch", snapshot.epoch);
         try keys.assertKey("node_count", snapshot.nodes.len);
 
@@ -143,6 +228,15 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         // different node, so the exact comparison is the only check that sees
         // the substitution.
         try std.testing.expectEqual(expected, node.node);
+
+        // Asserted HERE, not before the decode: `outcome` is checked against the
+        // verdict this run reached, so it cannot be satisfied by a runner that
+        // decodes nothing.
+        try keys.assertKeyWith(
+            "outcome",
+            Verdict{ .observed = &observed_outcomes, .accepted = true, .exact = node.node == expected },
+            checkOutcome,
+        );
 
         var node_decimal_buf: [24]u8 = undefined;
         const node_decimal = try std.fmt.bufPrint(&node_decimal_buf, "{d}", .{node.node});
@@ -159,6 +253,37 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         try keys.assertKey("root_id_decimal", root_decimal);
         try keys.finish();
     }
+
+    // The gloss map's key set, against the outcomes this run replayed.
+    try meta.assertKeyWith("outcomes", &observed_outcomes, checkOutcomeVocabulary);
+
+    // The three paragraphs, DISCHARGED (`#lzprosekeyconvention`).
+    try meta.proseKey("clause", &.{
+        // "a decoder that cannot represent a received NodeId/PeerId exactly MUST
+        // reject the frame; it MUST NOT round, truncate, saturate, or wrap" —
+        // the decimal comparison is the only check that sees a substitution, and
+        // it is made on both identifier fields the frame carries.
+        "node_id_decimal",
+        "root_id_decimal",
+        "outcome",
+    });
+    // PROXY (`#lzprosekeyconvention`). Half of `wire_encoding` is a claim about
+    // how the CORPUS carries its bytes, which no run can observe. The half a run
+    // CAN carry is its consequence: "a runner MUST ... compare the decoded
+    // identifier by its decimal RENDERING", and these two are that comparison —
+    // made against a string, so a double-backed runtime cannot round the
+    // expectation before the test reads it.
+    try meta.proseKey("wire_encoding", &.{ "node_id_decimal", "root_id_decimal" });
+    try meta.proseKey("anti_vacuity", &.{
+        // "the two `exact` scenarios are the control" — the declared outcome
+        // vocabulary checked against what this run actually replayed is what
+        // proves the control branch ran, and the decimal is what it produced.
+        "outcomes",
+        "outcome",
+        "node_id_decimal",
+    });
+    try meta.finish();
+    try cj.verifyProse(&prose);
 
     try std.testing.expectEqual(@as(usize, 6), accepted);
 }

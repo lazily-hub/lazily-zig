@@ -113,6 +113,32 @@ pub fn recordScenario(fixture: []const u8, scenario_id: []const u8) void {
     append(line);
 }
 
+/// Marks a prose-verification line (`#lzprosekeyconvention`). Same split as
+/// `SCENARIO_LINE_PREFIX`: a corpus-relative fixture id can never begin with
+/// `@`, so one manifest carries all three evidence channels.
+pub const PROSE_LINE_PREFIX = "@prose\t";
+
+/// Record that a fixture's prose discharges were VERIFIED
+/// (`#lzprosekeyconvention`, rule 8).
+///
+/// Rules 1-7 are all satisfied over an empty population: a fixture whose bytes
+/// are opened and whose scenarios are never replayed declares paragraphs, and a
+/// tracker that never sees a block never fails on one. That is the same vacuity
+/// the corpus's own `anti_vacuity` keys exist to name, reappearing inside the
+/// guard meant to enforce them.
+///
+/// So the required set is derived from the CORPUS —
+/// `scripts/check-conformance-coverage.sh` walks every fixture declaring
+/// `assertions.prose` and demands a line here for each one the suite opened.
+/// A hand-kept count would rot the moment lazily-spec declared a tenth
+/// paragraph.
+pub fn recordProseVerified(fixture: []const u8) void {
+    const id = canonicalFixtureId(fixture);
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, PROSE_LINE_PREFIX ++ "{s}", .{id}) catch return;
+    append(line);
+}
+
 /// `path` reduced to its corpus-relative id, or returned unchanged when it is
 /// already one.
 fn canonicalFixtureId(path: []const u8) []const u8 {

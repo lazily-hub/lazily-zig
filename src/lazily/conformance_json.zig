@@ -395,14 +395,32 @@ fn replayingScenarioImpl(fixture: []const u8, fx: Value, id: []const u8, quiet: 
 pub const AssertionKeys = struct {
     pub const MAX_KEYS = 64;
 
-    /// Prose keys that carry no assertion and are documentation only. Exempt
-    /// from all three checks: unconsumed, read-but-not-asserted, stale excuse.
+    /// RESERVED ANNOTATION NAMES (`#lzprosekeyconvention`). Exempt BY NAME from
+    /// all three checks: unconsumed, read-but-not-asserted, stale excuse.
+    ///
+    /// The exemption is only safe while these names ANNOTATE. A reserved name is
+    /// a place no runner can be made to discharge anything, so an annotation that
+    /// states an obligation is invisible by construction — lazily-spec's
+    /// `scripts/check-prose-keys.mjs` is the half that keeps new instances out.
+    /// A name the corpus DECLARES prose in `assertions.prose` loses the exemption
+    /// here: see `finish()`.
     pub const NARRATIVE = [_][]const u8{ "note", "notes", "comment", "description", "why" };
 
     const Excuse = struct { name: []const u8, reason: []const u8 };
 
     where: []const u8,
     object: Value,
+    /// The fixture-scoped prose ledger this block reports into, when the fixture
+    /// declares `assertions.prose` (`#lzprosekeyconvention`). Null for the blocks
+    /// of a fixture that declares none — which is every fixture the convention
+    /// has not reached, so attaching one is opt-in per fixture and forgetting it
+    /// fails as an unconsumed `prose` key rather than passing quietly.
+    ledger: ?*ProseLedger = null,
+    /// This block carries its own `prose` array. Inside such a block the
+    /// reserved-annotation exemption is OFF ENTIRELY: the corpus wins, so a
+    /// `note` sitting in a declaring block but absent from its array needs an
+    /// assertion or an excuse like any other key.
+    declares_prose: bool = false,
     consumed: [MAX_KEYS][]const u8 = undefined,
     len: usize = 0,
     asserted: [MAX_KEYS][]const u8 = undefined,
@@ -430,12 +448,91 @@ pub const AssertionKeys = struct {
 
     fn markAsserted(self: *AssertionKeys, name: []const u8) void {
         self.mark(name);
+        // The fixture-scoped half. `epoch_disambiguation` is discharged by
+        // `expect.frame_epoch` / `expect.blob_epoch`, asserted in a per-scenario
+        // block long after the `assertions` block is finished, so rule 6 can only
+        // be checked against a set that outlives this block.
+        if (self.ledger) |l| l.recordAsserted(name);
         for (self.asserted[0..self.asserted_len]) |seen| {
             if (std.mem.eql(u8, seen, name)) return;
         }
         if (self.asserted_len == MAX_KEYS) @panic("AssertionKeys.MAX_KEYS exceeded");
         self.asserted[self.asserted_len] = name;
         self.asserted_len += 1;
+    }
+
+    /// Attach this block to the fixture's prose ledger and fold in whatever the
+    /// block has already recorded, so the call site is free to sit anywhere after
+    /// `init`.
+    ///
+    /// Reading `prose` here marks it consumed; it is `verifyProse`'s
+    /// discharged-set comparison that ASSERTS it (rule 4), which is why
+    /// `finish()` stops short of the read-but-not-asserted check for it.
+    pub fn trackProse(self: *AssertionKeys, fixture: *ProseLedger) !void {
+        self.ledger = fixture;
+        for (self.asserted[0..self.asserted_len]) |name| fixture.recordAsserted(name);
+        for (self.excused[0..self.excused_len]) |e| fixture.recordExcused(e.name);
+        // Every key this block CARRIES, so a discharge naming one the corpus
+        // does not carry at all reads as a rotted claim rather than as an
+        // unasserted one.
+        switch (self.object) {
+            .object => |o| for (o.keys()) |name| fixture.recordPresent(name),
+            else => {},
+        }
+        // The declaration is read off the RAW block, BEFORE any name-based
+        // exemption. A tracker that subtracts its reserved-name set first makes
+        // a declared `note` invisible — exempt from the unread guard, exempt
+        // from the unasserted guard, never discharged — and both
+        // `frame_roundtrip_*.json` fixtures would skip the convention entirely
+        // while this binding still reported conforming.
+        const declaration = switch (self.object) {
+            .object => |o| o.get("prose"),
+            else => null,
+        };
+        if (declaration) |v| {
+            self.mark("prose");
+            self.declares_prose = true;
+            try fixture.declare(self.where, v);
+        }
+    }
+
+    /// Discharge a PROSE key by naming the executable assertion keys that carry
+    /// its obligation (`#lzprosekeyconvention`).
+    ///
+    /// A prose key is discharged, never asserted and never excused. Asserting it
+    /// compares a paragraph — or a tally derived from one — to an English string,
+    /// which pins wording rather than behaviour: a copy-edit reddens the run and a
+    /// library regression does not. Excusing it with free text ("prose: it states
+    /// why the fixture is shaped this way") is unfalsifiable, and that is what
+    /// this replaces: the named keys are a claim about the run, and
+    /// `verifyProse` checks it.
+    pub fn proseKey(
+        self: *AssertionKeys,
+        name: []const u8,
+        discharged_by: []const []const u8,
+    ) !void {
+        const ledger = self.ledger orelse {
+            if (!self.quiet) std.debug.print(
+                "{s}: proseKey('{s}') without a ledger — call trackProse(&fixture) on this " ++
+                    "block first, and verifyProse(&fixture) when the replay finishes " ++
+                    "(#lzprosekeyconvention)\n",
+                .{ self.where, name },
+            );
+            return error.ProseKeyWithoutLedger;
+        };
+        if (discharged_by.len == 0) {
+            if (!self.quiet) std.debug.print(
+                "{s}: prose key '{s}' is discharged by NOTHING. A discharge that names no " ++
+                    "key is the free-text excuse again, with the reason removed " ++
+                    "(#lzprosekeyconvention)\n",
+                .{ self.where, name },
+            );
+            return error.ProseDischargeNamesNothing;
+        }
+        // Discharging a key the block does not carry is a stale claim: the corpus
+        // dropped or renamed the paragraph and this runner still speaks for it.
+        _ = try self.required(name);
+        ledger.discharge(self.where, name, discharged_by);
     }
 
     fn isNarrative(name: []const u8) bool {
@@ -545,6 +642,9 @@ pub const AssertionKeys = struct {
     pub fn excuseKey(self: *AssertionKeys, name: []const u8, reason: []const u8) !void {
         if (reason.len == 0) return error.EmptyExcuseReason;
         self.mark(name);
+        // Fixture-scoped, so rule 2 sees an excuse written in ANY block of the
+        // fixture for a key the `assertions` block declares prose.
+        if (self.ledger) |l| l.recordExcused(name);
         for (self.excused[0..self.excused_len]) |e| {
             if (std.mem.eql(u8, e.name, name)) return;
         }
@@ -663,6 +763,9 @@ pub const AssertionKeys = struct {
     ///    (`#lzconsumednotasserted`);
     /// 3. an excuse for a key the same run also asserted — stale, hiding
     ///    nothing (`#lzconsumednotasserted`).
+    ///
+    /// Keys the corpus declares PROSE are none of this block's business and are
+    /// skipped here; `verifyProse` owns them (`#lzprosekeyconvention`).
     pub fn finish(self: *const AssertionKeys) !void {
         for (self.excused[0..self.excused_len]) |e| {
             if (!self.wasAsserted(e.name)) continue;
@@ -683,7 +786,20 @@ pub const AssertionKeys = struct {
         var it = obj.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
-            if (isNarrative(name)) continue;
+            // A key the CORPUS declared prose belongs to the fixture-scoped
+            // ledger, not to this block: it is discharged, and the discharge is
+            // verified when the replay finishes — which is also where a missing
+            // one fails. The declaration itself (`prose`) is consumed by that
+            // same comparison. Both checks below would be wrong here: rule 1
+            // forbids asserting a paragraph, and rule 2 forbids excusing one.
+            //
+            // The order matters. This runs BEFORE the narrative exemption, so a
+            // declared `note` — `codec/frame_roundtrip_*.json` declares exactly
+            // that — stops being exempt by name and has to be discharged.
+            if (self.ledger) |l| {
+                if (std.mem.eql(u8, name, "prose") or l.isDeclaredBy(self.where, name)) continue;
+            }
+            if (!self.declares_prose and isNarrative(name)) continue;
 
             var seen = false;
             for (self.consumed[0..self.len]) |c| {
@@ -720,6 +836,395 @@ pub const AssertionKeys = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Prose assertion keys (#lzprosekeyconvention)
+// ---------------------------------------------------------------------------
+
+/// The FIXTURE-SCOPED discharge ledger for prose assertion keys.
+///
+/// An `assertions` block mixes two kinds of key. Most carry a value a runner can
+/// compare against observed behaviour. A few carry an English paragraph that
+/// states an obligation and nothing comparable — `clause`, `anti_vacuity`,
+/// `null_form`, `theorem`, `note`. Replaying
+/// `codec/blob_backend_discriminator.json` v2 produced FOUR different treatments
+/// of the same four keys across the nine bindings, and this binding's was the
+/// individually-worded excuse: `excuseKey("null_form", "prose: the two null
+/// scenarios assert the behaviour it describes")`. That names the discharging
+/// assertion, which was the right instinct — and nothing checked it. The reason
+/// text could name a key this run never asserted, a key that does not exist, or
+/// nothing at all, and `finish()` would still be satisfied.
+///
+/// So the naming becomes machine-checked. `proseKey` records a CLAIM about the
+/// run ("`epoch_disambiguation` is discharged by `frame_epoch` and `blob_epoch`")
+/// and `verifyProse` checks it against what the fixture's replay actually
+/// asserted.
+///
+/// WHY FIXTURE-SCOPED. The obligation stated in `assertions` is routinely carried
+/// by a per-scenario `expect` key: `frame_epoch` and `blob_epoch` are asserted
+/// fourteen scenarios after the `assertions` block is finished. A block-scoped
+/// ledger could only ever check a discharge naming a sibling of the paragraph,
+/// which is the minority case. A named key is therefore matched BY NAME in any
+/// block of the fixture, and verification happens once the replay is done.
+///
+/// OWNERSHIP. Every name the ledger stores is duplicated into its own allocation.
+/// Declared names are slices into the fixture's parse arena, and a ledger torn
+/// down after `fixture.deinit()` would read freed memory to report what went
+/// wrong — the failure path is exactly where that must not happen.
+pub const ProseLedger = struct {
+    pub const MAX_DECLARED = 32;
+    pub const MAX_ASSERTED = 192;
+    pub const MAX_EXCUSED = 64;
+    pub const MAX_PRESENT = 192;
+    pub const MAX_CLAIMS = 32;
+    pub const MAX_DISCHARGED_BY = 8;
+
+    /// A declaration, and the BLOCK that made it. Rules 3 and 4 compare a
+    /// block's discharged set against that block's own `prose` array; only the
+    /// name matching of rules 6 and 7 is fixture-wide, because that is the half
+    /// that has to reach a per-scenario `expect` key.
+    const Declared = struct { name: []const u8, block: []const u8 };
+
+    const Claim = struct {
+        key: []const u8,
+        block: []const u8,
+        by: [MAX_DISCHARGED_BY][]const u8 = undefined,
+        by_len: usize = 0,
+    };
+
+    allocator: std.mem.Allocator,
+    /// Corpus-relative fixture id, for the diagnostics and for the runtime
+    /// verification ledger. Borrowed, not owned: every call site passes a literal.
+    fixture: []const u8,
+    declared: [MAX_DECLARED]Declared = undefined,
+    declared_len: usize = 0,
+    asserted: [MAX_ASSERTED][]const u8 = undefined,
+    asserted_len: usize = 0,
+    excused: [MAX_EXCUSED][]const u8 = undefined,
+    excused_len: usize = 0,
+    /// Every key name PRESENT in a tracked block of this fixture. Lets rule 6
+    /// tell "carried but never compared" from "the corpus does not carry this at
+    /// all" — a rotted discharge, exactly as a stale excuse is.
+    present: [MAX_PRESENT][]const u8 = undefined,
+    present_len: usize = 0,
+    claims: [MAX_CLAIMS]Claim = undefined,
+    claims_len: usize = 0,
+    verified: bool = false,
+    /// Cleared by `disarm()` when an error is already on its way out, so the
+    /// teardown check does not mask the real failure with its own.
+    armed: bool = true,
+    /// Suppress the diagnostics. Only for this module's own self-tests, which
+    /// assert the failures and must not pollute the suite's stderr.
+    quiet: bool = false,
+
+    pub fn init(fixture: []const u8) ProseLedger {
+        return .{ .allocator = std.testing.allocator, .fixture = fixture };
+    }
+
+    /// Free the owned names, then FAIL when the replay never verified.
+    ///
+    /// An unverified discharge claim is as bad as an unconsumed key: the run
+    /// wrote down what discharges each paragraph and nothing read it back. A
+    /// `defer` cannot return an error, so this aborts — which is the same
+    /// "the suite is red" outcome, arrived at loudly.
+    ///
+    /// The arming pair is:
+    ///
+    ///     var fixture = cj.ProseLedger.init(FIXTURE);
+    ///     defer fixture.deinit();
+    ///     errdefer fixture.disarm();
+    ///
+    /// `errdefer` is declared second, so it runs FIRST on the error path and the
+    /// original failure propagates untouched.
+    pub fn deinit(self: *ProseLedger) void {
+        const unverified = self.armed and !self.verified;
+        for (self.declared[0..self.declared_len]) |d| {
+            self.allocator.free(d.name);
+            self.allocator.free(d.block);
+        }
+        for (self.asserted[0..self.asserted_len]) |s| self.allocator.free(s);
+        for (self.excused[0..self.excused_len]) |s| self.allocator.free(s);
+        for (self.present[0..self.present_len]) |s| self.allocator.free(s);
+        for (self.claims[0..self.claims_len]) |c| {
+            self.allocator.free(c.key);
+            self.allocator.free(c.block);
+            for (c.by[0..c.by_len]) |s| self.allocator.free(s);
+        }
+        self.declared_len = 0;
+        self.asserted_len = 0;
+        self.excused_len = 0;
+        self.present_len = 0;
+        self.claims_len = 0;
+        if (!unverified) return;
+        if (!self.quiet) std.debug.print(
+            "{s}: the replay finished without calling verifyProse. The discharge claims this " ++
+                "run wrote down were never checked against what it asserted, so an obligation " ++
+                "could name a key nothing in the fixture proves (#lzprosekeyconvention)\n",
+            .{self.fixture},
+        );
+        @panic("ProseLedger: replay ended without verifyProse (#lzprosekeyconvention)");
+    }
+
+    /// Stand the teardown check down. For the error path, where a failure is
+    /// already propagating and a second one would only hide it.
+    pub fn disarm(self: *ProseLedger) void {
+        self.armed = false;
+    }
+
+    fn own(self: *ProseLedger, name: []const u8) []const u8 {
+        return self.allocator.dupe(u8, name) catch @panic("ProseLedger: out of memory");
+    }
+
+    fn contains(haystack: []const []const u8, name: []const u8) bool {
+        for (haystack) |item| {
+            if (std.mem.eql(u8, item, name)) return true;
+        }
+        return false;
+    }
+
+    /// Fixture-wide. Used by rules 6/7's name matching and by the block-level
+    /// exemption, both of which are about "is this name a paragraph anywhere in
+    /// this fixture".
+    pub fn isDeclared(self: *const ProseLedger, name: []const u8) bool {
+        for (self.declared[0..self.declared_len]) |d| {
+            if (std.mem.eql(u8, d.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// The prose-name set, SEEDED WITH `prose` ITSELF. Without the seed, rule 7
+    /// misses `proseKey(k, &.{"prose"})`: the declaration never lists itself, so
+    /// it is not "declared", and a tracker that marked `prose` asserted when it
+    /// consumed the declaration would let rule 6 wave the discharge through. A
+    /// paragraph discharged by the declaration that it is a paragraph proves
+    /// nothing.
+    fn isProseName(self: *const ProseLedger, name: []const u8) bool {
+        return std.mem.eql(u8, name, "prose") or self.isDeclared(name);
+    }
+
+    /// Block-local — rules 3 and 4.
+    fn isDeclaredBy(self: *const ProseLedger, block: []const u8, name: []const u8) bool {
+        for (self.declared[0..self.declared_len]) |d| {
+            if (std.mem.eql(u8, d.block, block) and std.mem.eql(u8, d.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn wasAsserted(self: *const ProseLedger, name: []const u8) bool {
+        return contains(self.asserted[0..self.asserted_len], name);
+    }
+
+    fn wasExcused(self: *const ProseLedger, name: []const u8) bool {
+        return contains(self.excused[0..self.excused_len], name);
+    }
+
+    fn isPresent(self: *const ProseLedger, name: []const u8) bool {
+        return contains(self.present[0..self.present_len], name);
+    }
+
+    fn claimBy(self: *const ProseLedger, block: []const u8, name: []const u8) ?Claim {
+        for (self.claims[0..self.claims_len]) |c| {
+            if (std.mem.eql(u8, c.block, block) and std.mem.eql(u8, c.key, name)) return c;
+        }
+        return null;
+    }
+
+    /// Record the corpus's own `assertions.prose` declaration, and which block
+    /// made it. The BINDING never decides which keys are prose — nine trackers
+    /// deciding independently is what produced four answers to one question.
+    pub fn declare(self: *ProseLedger, where: []const u8, value: Value) !void {
+        const names = asArray(value) catch {
+            if (!self.quiet) std.debug.print(
+                "{s}: `assertions.prose` must be an array of sibling key names " ++
+                    "(#lzprosekeyconvention)\n",
+                .{where},
+            );
+            return error.ProseDeclarationNotAnArray;
+        };
+        for (names) |item| {
+            const name = try asStr(item);
+            if (std.mem.eql(u8, name, "prose")) {
+                if (!self.quiet) std.debug.print(
+                    "{s}: `assertions.prose` lists ITSELF. The declaration is not one of the " ++
+                        "paragraphs it declares (#lzprosekeyconvention)\n",
+                    .{where},
+                );
+                return error.ProseDeclarationSelfListed;
+            }
+            if (self.isDeclaredBy(where, name)) continue;
+            if (self.declared_len == MAX_DECLARED) @panic("ProseLedger.MAX_DECLARED exceeded");
+            self.declared[self.declared_len] = .{ .name = self.own(name), .block = self.own(where) };
+            self.declared_len += 1;
+        }
+    }
+
+    fn recordPresent(self: *ProseLedger, name: []const u8) void {
+        if (self.isPresent(name)) return;
+        if (self.present_len == MAX_PRESENT) @panic("ProseLedger.MAX_PRESENT exceeded");
+        self.present[self.present_len] = self.own(name);
+        self.present_len += 1;
+    }
+
+    fn recordAsserted(self: *ProseLedger, name: []const u8) void {
+        if (self.wasAsserted(name)) return;
+        if (self.asserted_len == MAX_ASSERTED) @panic("ProseLedger.MAX_ASSERTED exceeded");
+        self.asserted[self.asserted_len] = self.own(name);
+        self.asserted_len += 1;
+    }
+
+    fn recordExcused(self: *ProseLedger, name: []const u8) void {
+        if (self.wasExcused(name)) return;
+        if (self.excused_len == MAX_EXCUSED) @panic("ProseLedger.MAX_EXCUSED exceeded");
+        self.excused[self.excused_len] = self.own(name);
+        self.excused_len += 1;
+    }
+
+    fn discharge(
+        self: *ProseLedger,
+        block: []const u8,
+        name: []const u8,
+        by: []const []const u8,
+    ) void {
+        if (by.len > MAX_DISCHARGED_BY) @panic("ProseLedger.MAX_DISCHARGED_BY exceeded");
+        if (self.claimBy(block, name) != null) return;
+        if (self.claims_len == MAX_CLAIMS) @panic("ProseLedger.MAX_CLAIMS exceeded");
+        var claim = Claim{ .key = self.own(name), .block = self.own(block) };
+        for (by) |n| {
+            claim.by[claim.by_len] = self.own(n);
+            claim.by_len += 1;
+        }
+        self.claims[self.claims_len] = claim;
+        self.claims_len += 1;
+    }
+
+    fn fail(
+        self: *const ProseLedger,
+        comptime fmt: []const u8,
+        args: anytype,
+        err: anyerror,
+    ) anyerror {
+        if (self.quiet) return err;
+        std.debug.print("{s}: ", .{self.fixture});
+        std.debug.print(fmt ++ " (#lzprosekeyconvention)\n", args);
+        return err;
+    }
+
+    /// The seven rules. See `verifyProse`.
+    fn verify(self: *ProseLedger) !void {
+        // Set FIRST: a rule below firing is a verified failure, not a missing
+        // verification, and the teardown must not turn one into the other.
+        self.verified = true;
+
+        for (self.claims[0..self.claims_len]) |claim| {
+            // Rule 3, BLOCK-LOCAL: each block owns its own `prose` array, so a
+            // declaration in one block cannot license a discharge in another.
+            if (!self.isDeclaredBy(claim.block, claim.key)) return self.fail(
+                "'{s}' is discharged but `{s}` does not list it in `assertions.prose`. " ++
+                    "Only the corpus decides which keys are paragraphs; an executable key " ++
+                    "must be ASSERTED",
+                .{ claim.key, claim.block },
+                error.ProseKeyNotDeclared,
+            );
+            // Rule 5, again — `proseKey` refuses an empty list, and a ledger
+            // built by hand must not be able to route around it.
+            if (claim.by_len == 0) return self.fail(
+                "prose key '{s}' is discharged by nothing",
+                .{claim.key},
+                error.ProseDischargeNamesNothing,
+            );
+            for (claim.by[0..claim.by_len]) |named| {
+                // Rule 7, over the SEEDED prose-name set — `prose` included.
+                if (self.isProseName(named)) return self.fail(
+                    "prose key '{s}' is discharged by '{s}', which is ITSELF a paragraph (or " ++
+                        "the declaration that they are). Two prose keys cannot discharge each " ++
+                        "other — the obligation has to land on something the run compares",
+                    .{ claim.key, named },
+                    error.ProseDischargeNamesProse,
+                );
+                // A discharge naming a key the fixture does not carry AT ALL has
+                // rotted, exactly as a stale excuse does — a distinct failure
+                // from one naming a key that is carried and never compared.
+                if (!self.isPresent(named)) return self.fail(
+                    "prose key '{s}' is discharged by '{s}', which no block of this fixture " ++
+                        "carries. The corpus renamed or dropped it and the discharge still " ++
+                        "speaks for it",
+                    .{ claim.key, named },
+                    error.ProseDischargeNamesAbsentKey,
+                );
+                // Rule 6 — the whole convention. The excuse is falsifiable
+                // because this is a claim about the run. ASSERTED, not merely
+                // satisfied: an excused key discharges nothing, because an excuse
+                // is precisely the absence of a comparison.
+                if (!self.wasAsserted(named)) return self.fail(
+                    "prose key '{s}' is discharged by '{s}', which this fixture's run never " ++
+                        "ASSERTED. Either the key is read without reaching a comparison, or " ++
+                        "the paragraph is discharged by something else — name that instead",
+                    .{ claim.key, named },
+                    error.ProseDischargeNamesUnassertedKey,
+                );
+            }
+        }
+
+        for (self.declared[0..self.declared_len]) |declaration| {
+            const name = declaration.name;
+            // Rule 1.
+            if (self.wasAsserted(name)) return self.fail(
+                "'{s}' is a paragraph and this run ASSERTS it. Comparing English — or a tally " ++
+                    "derived from it — to a fixture string pins wording, not behaviour: a " ++
+                    "copy-edit reddens the run and a library regression does not. Discharge " ++
+                    "it with proseKey instead",
+                .{name},
+                error.ProseKeyAsserted,
+            );
+            // Rule 2.
+            if (self.wasExcused(name)) return self.fail(
+                "'{s}' is a paragraph and this run EXCUSES it with free text. An unfalsifiable " ++
+                    "reason is indistinguishable from the undocumented default this clause " ++
+                    "removes — name the assertion keys that discharge it with proseKey",
+                .{name},
+                error.ProseKeyExcused,
+            );
+            // Rule 4, BLOCK-LOCAL. This comparison is what CONSUMES and asserts
+            // `prose` itself, and it is what makes a forgotten paragraph fail
+            // rather than vanish.
+            if (self.claimBy(declaration.block, name) == null) return self.fail(
+                "'{s}' is listed in `{s}`'s `assertions.prose` and nothing discharged it. " ++
+                    "The declaration is the corpus telling this runner the paragraph exists; " ++
+                    "a key it never answers for is one the run silently dropped",
+                .{ name, declaration.block },
+                error.ProseKeyNotDischarged,
+            );
+        }
+
+        // RULE 8, the vacuity floor. Rules 1-7 are all satisfied over an empty
+        // population, so a fixture opened and then never replayed passes every
+        // one of them while proving nothing. The required verifications are
+        // derived from the CORPUS by `scripts/check-conformance-coverage.sh`,
+        // which reads this ledger line back: any fixture whose block declares
+        // `prose` and whose bytes the suite opened must appear here.
+        // `quiet` is this module's own self-tests, whose fixture ids are not in
+        // the corpus. Recording them would make the guard's own evidence channel
+        // carry claims about files nothing ever opened.
+        if (!self.quiet) @import("conformance_manifest.zig").recordProseVerified(self.fixture);
+    }
+};
+
+/// Verify a fixture's prose discharges once its replay is finished
+/// (`#lzprosekeyconvention`). Fails when:
+///
+///   1. a key listed in `assertions.prose` is ASSERTED;
+///   2. a key listed in `assertions.prose` is EXCUSED with free text;
+///   3. a key NOT listed in `assertions.prose` is discharged;
+///   4. the discharged set differs from `assertions.prose` — the comparison that
+///      consumes `prose` itself;
+///   5. a discharge names no keys;
+///   6. a discharge names a key this fixture's run did not assert;
+///   7. a discharge names a key that is itself prose.
+///
+/// A run that never gets here fails from `ProseLedger.deinit`.
+pub fn verifyProse(fixture: *ProseLedger) !void {
+    return fixture.verify();
+}
 
 /// `[]const u8`, `[]u8`, and string literals (`*const [N:0]u8`).
 fn isStringLike(comptime T: type) bool {
@@ -877,6 +1382,406 @@ test "conformance_json: an excuse for a key the same run asserts is stale" {
     try keys.excuseKey("a", "proven elsewhere");
     try keys.assertKey("a", @as(i64, 1));
     try std.testing.expectError(error.StaleAssertionExcuse, keys.finish());
+}
+
+// ---------------------------------------------------------------------------
+// Prose assertion keys — the seven rules (#lzprosekeyconvention)
+// ---------------------------------------------------------------------------
+
+/// `{"prose":["clause"],"clause":"…a paragraph…","backends":["shm"]}` plus
+/// whatever the caller adds, parsed. The block always carries a non-prose key:
+/// a block that is entirely prose has nothing that could discharge it.
+fn proseFixtureJson(comptime extra: []const u8) []const u8 {
+    return "{\"prose\":[\"clause\"],\"clause\":\"a paragraph\",\"backends\":[\"shm\"]" ++ extra ++ "}";
+}
+
+fn checkAnything(_: void, _: Value) anyerror!void {}
+
+test "conformance_json: a discharged prose key satisfies both the block and the ledger" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    // `prose` and `clause` are both consumed without being asserted or excused
+    // here: the ledger owns them.
+    try keys.finish();
+    try verifyProse(&fixture);
+}
+
+test "conformance_json: rule 1 — asserting a declared prose key fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    // A tally compared to the paragraph's own text pins wording, not behaviour.
+    try keys.assertKey("clause", "a paragraph");
+    try std.testing.expectError(error.ProseKeyAsserted, verifyProse(&fixture));
+}
+
+test "conformance_json: rule 2 — excusing a declared prose key with free text fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    try keys.excuseKey("clause", "prose: the scenarios below assert what it describes");
+    try std.testing.expectError(error.ProseKeyExcused, verifyProse(&fixture));
+}
+
+test "conformance_json: rule 3 — discharging a key the corpus did not declare fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    // `backends` carries a comparable value; a binding does not get to reclassify
+    // it as a paragraph.
+    try keys.proseKey("backends", &.{"clause"});
+    try std.testing.expectError(error.ProseKeyNotDeclared, verifyProse(&fixture));
+}
+
+test "conformance_json: rule 4 — a declared prose key nothing discharges fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"prose\":[\"clause\",\"theorem\"],\"clause\":\"a\",\"theorem\":\"b\",\"backends\":[\"shm\"]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    // `theorem` is declared and forgotten. The block's own `finish()` cannot see
+    // it — the ledger skipped it there — so this comparison is what makes a
+    // forgotten paragraph fail rather than vanish.
+    try keys.finish();
+    try std.testing.expectError(error.ProseKeyNotDischarged, verifyProse(&fixture));
+}
+
+test "conformance_json: rule 5 — a discharge naming nothing fails at the call site" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    const empty: []const []const u8 = &.{};
+    try std.testing.expectError(error.ProseDischargeNamesNothing, keys.proseKey("clause", empty));
+    // The ledger still has to be answered for, or this test's own teardown fails.
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    try verifyProse(&fixture);
+}
+
+test "conformance_json: rule 6 — a discharge naming a never-asserted key fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    // `backends` is READ, never compared — the `#lzconsumednotasserted` hole,
+    // which is exactly the state a discharge must not be able to name.
+    _ = keys.field("backends");
+    try keys.proseKey("clause", &.{"backends"});
+    try std.testing.expectError(error.ProseDischargeNamesUnassertedKey, verifyProse(&fixture));
+}
+
+test "conformance_json: rule 6 — a discharge is satisfied from ANOTHER block of the fixture" {
+    const allocator = std.testing.allocator;
+    var block = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer block.deinit();
+    // The per-scenario `expect`, asserted long after the `assertions` block is
+    // finished. Block-scoped verification could not see this.
+    var expect = try json.parseFromSlice(Value, allocator, "{\"frame_epoch\":9}", .{});
+    defer expect.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var meta = AssertionKeys.init("fake/prose.json assertions", block.value);
+    meta.quiet = true;
+    try meta.trackProse(&fixture);
+    try meta.assertKeyWith("backends", {}, checkAnything);
+    try meta.proseKey("clause", &.{"frame_epoch"});
+    try meta.finish();
+
+    var keys = AssertionKeys.init("fake/prose.json", expect.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKey("frame_epoch", @as(i64, 9));
+    try keys.finish();
+
+    try verifyProse(&fixture);
+}
+
+test "conformance_json: rule 7 — a discharge naming another prose key fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"prose\":[\"clause\",\"theorem\"],\"clause\":\"a\",\"theorem\":\"b\",\"backends\":[\"shm\"]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("theorem", &.{"backends"});
+    try keys.proseKey("clause", &.{"theorem"});
+    try std.testing.expectError(error.ProseDischargeNamesProse, verifyProse(&fixture));
+}
+
+test "conformance_json: an untracked block still fails on the unconsumed `prose` key" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    // No ledger. This is the rollout's self-enforcing half: the declaration is a
+    // key of the block, so the existing consumption guard sees it.
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.excuseKey("clause", "prose");
+    try std.testing.expectError(error.UnconsumedAssertionKey, keys.finish());
+
+    // And `proseKey` without a ledger refuses rather than recording into thin air.
+    var untracked = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    untracked.quiet = true;
+    try std.testing.expectError(
+        error.ProseKeyWithoutLedger,
+        untracked.proseKey("clause", &.{"backends"}),
+    );
+}
+
+test "conformance_json: a declared `note` loses the reserved-annotation exemption" {
+    const allocator = std.testing.allocator;
+    // `codec/frame_roundtrip_json.json` declares exactly this: `note` is a
+    // reserved annotation name everywhere else and a paragraph here.
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"prose\":[\"note\"],\"note\":\"a paragraph\",\"role\":\"reference\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var forgotten = ProseLedger.init("fake/note.json");
+    defer forgotten.deinit();
+    errdefer forgotten.disarm();
+    forgotten.quiet = true;
+
+    var keys = AssertionKeys.init("fake/note.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&forgotten);
+    try keys.assertKey("role", "reference");
+    try keys.finish();
+    // Exempt by name would have let this pass silently.
+    try std.testing.expectError(error.ProseKeyNotDischarged, verifyProse(&forgotten));
+
+    var fixture = ProseLedger.init("fake/note.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var ok = AssertionKeys.init("fake/note.json assertions", parsed.value);
+    ok.quiet = true;
+    try ok.trackProse(&fixture);
+    try ok.assertKey("role", "reference");
+    try ok.proseKey("note", &.{"role"});
+    try ok.finish();
+    try verifyProse(&fixture);
+}
+
+test "conformance_json: rule 7 — a discharge naming `prose` itself fails" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    // `prose` never lists itself, so it is not "declared" — without seeding the
+    // prose-name set with it, rule 7 misses this and rule 6 waves it through on
+    // the strength of the declaration having been consumed. A paragraph
+    // discharged by the declaration that it IS a paragraph proves nothing.
+    try keys.proseKey("clause", &.{"prose"});
+    try std.testing.expectError(error.ProseDischargeNamesProse, verifyProse(&fixture));
+}
+
+test "conformance_json: a discharge naming a key the fixture does not carry has rotted" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    // Distinct from rule 6: this key is not merely unasserted, it is gone.
+    try keys.proseKey("clause", &.{"backends_renamed_upstream"});
+    try std.testing.expectError(error.ProseDischargeNamesAbsentKey, verifyProse(&fixture));
+}
+
+test "conformance_json: rules 3 and 4 are BLOCK-local, rules 6 and 7 are fixture-wide" {
+    const allocator = std.testing.allocator;
+    var declaring = try json.parseFromSlice(Value, allocator, proseFixtureJson(""), .{});
+    defer declaring.deinit();
+    // A second block carrying the same key NAME and no declaration of its own.
+    var other = try json.parseFromSlice(Value, allocator, "{\"clause\":\"a paragraph\"}", .{});
+    defer other.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var meta = AssertionKeys.init("fake/prose.json assertions", declaring.value);
+    meta.quiet = true;
+    try meta.trackProse(&fixture);
+    try meta.assertKeyWith("backends", {}, checkAnything);
+
+    var expect = AssertionKeys.init("fake/prose.json expect", other.value);
+    expect.quiet = true;
+    try expect.trackProse(&fixture);
+    // Each block owns its own `prose` array. This block declared nothing, so it
+    // cannot discharge on the strength of a sibling block's declaration.
+    try expect.proseKey("clause", &.{"backends"});
+    try std.testing.expectError(error.ProseKeyNotDeclared, verifyProse(&fixture));
+}
+
+test "conformance_json: inside a declaring block the annotation exemption is off entirely" {
+    const allocator = std.testing.allocator;
+    // `note` is NOT in this block's array — but the block declares `prose`, so
+    // the corpus wins and the reserved name buys nothing.
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"prose\":[\"clause\"],\"clause\":\"a\",\"backends\":[\"shm\"],\"note\":\"x\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    errdefer fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try keys.trackProse(&fixture);
+    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.proseKey("clause", &.{"backends"});
+    try std.testing.expectError(error.AssertionKeyReadButNotAsserted, keys.finish());
+    try verifyProse(&fixture);
+
+    // Everywhere else the exemption stands as-is: a block with no declaration
+    // keeps skipping its annotations.
+    var plain = try json.parseFromSlice(Value, allocator, "{\"a\":1,\"note\":\"x\"}", .{});
+    defer plain.deinit();
+    var annotated = AssertionKeys.init("fake/plain.json expect", plain.value);
+    annotated.quiet = true;
+    try annotated.assertKey("a", @as(i64, 1));
+    try annotated.finish();
+}
+
+test "conformance_json: a prose declaration that lists itself is refused" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"prose\":[\"prose\"],\"backends\":[\"shm\"]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var fixture = ProseLedger.init("fake/prose.json");
+    defer fixture.deinit();
+    fixture.disarm();
+    fixture.quiet = true;
+
+    var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
+    keys.quiet = true;
+    try std.testing.expectError(error.ProseDeclarationSelfListed, keys.trackProse(&fixture));
 }
 
 test "conformance_json: assertKey compares against the fixture's own value" {

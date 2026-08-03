@@ -54,6 +54,14 @@
 //!     reading either satisfied one `expect.epoch`. This one read the BLOB's.
 //!     Both are now read, from their own sources.
 //!
+//! The nine PARAGRAPHS in `assertions` are discharged, not excused
+//! (`#lzprosekeyconvention`). This runner used to excuse each of them with an
+//! individually-worded reason naming the assertion that carried it — the right
+//! instinct, checked by nothing: the text could have named a key this run never
+//! asserts, or one the corpus no longer carries, and `finish()` would still have
+//! been satisfied. `proseKey` makes the same statement machine-checkable, and
+//! `verifyProse` refuses the run when a named key never reached a comparison.
+//!
 //! ONE VERDICT, NOT TWO. `msgpack.decode` unpacks to the same `std.json.Value`
 //! DOM the json decoder consumes and hands it to `ipc.IpcMessage.fromJson`, so
 //! the msgpack half of every scenario pair re-proves the UNPACKER and the
@@ -96,6 +104,42 @@ fn decodeScenario(allocator: std.mem.Allocator, scenario: Value) !ipc.ParsedMess
         return mp.decode(allocator, frame);
     }
     return error.UnknownCodec;
+}
+
+/// The scenario's wire frame as a schema-less `Value`, WITHOUT the typed
+/// decoder.
+///
+/// This is the control `wire_encoding` needs (`#lzprosekeyconvention`). The
+/// paragraph's obligation is that an ABSENT map entry, an explicit null and a
+/// present short string stay TELLABLE APART on their way into the runner — and
+/// every one of them decodes to `backend == .shm`, so no assertion over a
+/// decoded message can see the difference. Reading the raw slot before the
+/// decoder runs is what makes the three forms distinguishable at all.
+fn rawWire(allocator: std.mem.Allocator, scenario: Value) !std.json.Parsed(Value) {
+    const codec = try cj.asStr(try cj.required(scenario, "codec"));
+    if (std.mem.eql(u8, codec, "msgpack")) {
+        const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
+        defer allocator.free(frame);
+        return mp.toJsonValue(allocator, frame);
+    }
+    return std.json.parseFromSlice(
+        Value,
+        allocator,
+        try cj.asStr(try cj.required(scenario, "wire_json")),
+        .{ .allocate = .alloc_always },
+    );
+}
+
+/// The `backend` slot's WIRE form, read off the raw frame. The vocabulary is the
+/// fixture's own: `omitted` / `null` / `non_string` / the token itself.
+fn wireBackendForm(scenario: Value, frame: Value) ![]const u8 {
+    const blob = try blobOf(scenario, frame);
+    const entry = cj.field(blob, "backend") orelse return "omitted";
+    return switch (entry) {
+        .null => "null",
+        .string => |token| token,
+        else => "non_string",
+    };
 }
 
 /// Re-encode under the scenario's own codec and read the produced frame back
@@ -203,7 +247,16 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
 
     const scenarios_array = try cj.asArray(try cj.required(root, "scenarios"));
 
+    // The fixture-scoped prose ledger (`#lzprosekeyconvention`). Every discharge
+    // below names keys asserted in the per-scenario `expect` blocks, which are
+    // reached long after this block is finished — `epoch_disambiguation` is the
+    // canonical case — so verification cannot be block-scoped.
+    var prose = cj.ProseLedger.init(FIXTURE);
+    defer prose.deinit();
+    errdefer prose.disarm();
+
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
+    try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
     try meta.assertKey("scenario_count", scenarios_array.len);
     try meta.assertKeyWith("codecs", @as([]const []const u8, &.{ "json", "msgpack" }), checkStrList);
@@ -212,40 +265,11 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         @as([]const []const u8, &.{ "accept", "reject" }),
         checkStrList,
     );
-    for ([_][]const u8{
-        "clause",
-        "wire_encoding",
-        "reject_obligation",
-        "anti_vacuity",
-        "theorem",
+    try meta.excuseKey(
         "generator",
-    }) |prose| {
-        try meta.excuseKey(
-            prose,
-            "prose: it states WHY the fixture is shaped this way; the behaviour it " ++
-                "describes is asserted by the per-scenario decode, refusal and re-encode below",
-        );
-    }
-    try meta.excuseKey(
-        "backend_form_vocabulary",
-        "prose: it states the completeness obligation rather than a value to compare. " ++
-            "The obligation itself is asserted — `backend_forms` and `backends` are both " ++
-            "checked declared-against-OBSERVED after the loop, which is the check it names",
-    );
-    try meta.excuseKey(
-        "null_form",
-        "prose: the two null scenarios assert the behaviour it describes — decoded as " ++
-            "`shm`, and re-encoded WITHOUT a `backend` entry, so the null does not survive",
-    );
-    try meta.excuseKey(
-        "non_string_form",
-        "prose: the two non_string scenarios assert both halves it describes — the " ++
-            "refusal, and that the refusal is a member of `ipc.BlobDescriptorDecodeError`",
-    );
-    try meta.excuseKey(
-        "epoch_disambiguation",
-        "prose: the accept scenarios assert `frame_epoch` against the Delta frame and " ++
-            "`blob_epoch` against the ShmBlobRef descriptor, from their own sources",
+        "names the lazily-spec script that emits this fixture. It is a fact about the " ++
+            "CORPUS's build, not about this binding, so there is nothing here to compare " ++
+            "it against — lazily-spec's own regeneration check owns it",
     );
     // `backends`, `backend_forms` and `rejection_kinds` are asserted AFTER the
     // loop, against what this run actually observed, so `meta` stays open until
@@ -282,9 +306,32 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         const expect = try cj.required(scenario, "expect");
         const outcome = try cj.asStr(try cj.required(scenario, "outcome"));
         const form = try cj.asStr(try cj.required(scenario, "backend_form"));
+
+        // The wire-form control. The scenario's `backend_form` is a LABEL; what
+        // discharges `wire_encoding` is that the raw slot really has that shape,
+        // because the three `shm` forms are indistinguishable everywhere else in
+        // this fixture. Only a label the wire CONFIRMS is banked, so the
+        // vocabulary assertion after the loop is an observation rather than a
+        // reading-back of the fixture's own labelling.
+        {
+            var raw = try rawWire(std.testing.allocator, scenario);
+            defer raw.deinit();
+            const wire_form = try wireBackendForm(scenario, raw.value);
+            if (!std.mem.eql(u8, wire_form, form)) {
+                std.debug.print(
+                    "{s}: scenario '{s}' is labelled backend_form '{s}' but its raw wire " ++
+                        "carries '{s}'\n",
+                    .{ FIXTURE, try sc.id(), form, wire_form },
+                );
+                return error.WireFormContradictsLabel;
+            }
+        }
         observed_forms.add(form);
         if (std.mem.eql(u8, form, "null")) null_form_replayed += 1;
         var keys = cj.AssertionKeys.init(FIXTURE, expect);
+        // Into the SAME ledger as the `assertions` block: a discharge names keys
+        // by name in any block of this fixture (`#lzprosekeyconvention`).
+        try keys.trackProse(&prose);
 
         // A token left over from an earlier scenario must never be able to
         // satisfy `error_names_token` for a later one.
@@ -429,7 +476,91 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
     try meta.assertKeyWith("backends", &decoded_backends, checkDeclaredWereObserved);
     try meta.assertKeyWith("backend_forms", &observed_forms, checkDeclaredWereObserved);
     try meta.assertKeyWith("rejection_kinds", &observed_rejection_kinds, checkDeclaredWereObserved);
+
+    // The nine paragraphs, DISCHARGED (`#lzprosekeyconvention`). Each names the
+    // executable keys this run actually asserted — which is why they are written
+    // here, after the loop: every name below has by now reached a comparison, and
+    // `verifyProse` fails the run if one has not. That is the difference between
+    // this and the free-text excuses it replaces, which said the same things and
+    // were checked by nothing.
+    try meta.proseKey("clause", &.{
+        // omitted / null / explicit-shm decode as `shm`, arrow and in_process as
+        // themselves — the field is READ rather than defaulted...
+        "decoded_backend",
+        // ...and a present token outside the enum is refused, by name, rather
+        // than normalized.
+        "rejected",
+        "rejection_kind",
+        "error_names_token",
+    });
+    // PROXY (`#lzprosekeyconvention`). `wire_encoding` is a claim about how the
+    // CORPUS carries its bytes — raw text and hex rather than a pre-parsed
+    // object — which no assertion a run makes can observe directly. The honest
+    // proxy is the form vocabulary, and it is only honest because
+    // `observed_forms` is now banked from the RAW WIRE SLOT: the three `shm`
+    // forms decode identically, so a label-derived set would have discharged
+    // this with nothing.
+    try meta.proseKey("wire_encoding", &.{
+        // An ABSENT map entry, an explicit null and a present short string,
+        // observed as distinct forms in the raw frame...
+        "backend_forms",
+        // ...and read back off the RE-ENCODED frame, which is the only place
+        // "emitted `shm`" and "omitted `shm`" differ.
+        "reencoded_backend_field_present",
+        // The two schema-INVALID reject frames reached a decoder at all.
+        "rejected",
+    });
+    try meta.proseKey("backend_form_vocabulary", &.{
+        // Its own words: "every backend in `assertions.backends` appears as the
+        // `decoded_backend` of some accept scenario". `backends` is asserted
+        // declared-against-OBSERVED over exactly that set.
+        "backends",
+        "decoded_backend",
+        "backend_forms",
+    });
+    try meta.proseKey("reject_obligation", &.{
+        // "`error_names_token` is the assertion that separates them" — refused
+        // for the stated reason, not merely refused.
+        "error_names_token",
+        "rejection_kind",
+    });
+    try meta.proseKey("null_form", &.{
+        // An explicit null is the ABSENT form: decoded as `shm`...
+        "decoded_backend",
+        // ...re-encoded WITHOUT a `backend` entry, so the null does not survive...
+        "reencoded_backend_field_present",
+        // ...and the `null` form was really among the ones replayed.
+        "backend_forms",
+    });
+    try meta.proseKey("non_string_form", &.{
+        // Both halves: the refusal...
+        "rejected",
+        // ...and that it arrives through the documented decode-error family,
+        // which is the half that makes it visible to a caller's handler.
+        "rejection_is_decode_error",
+        "rejection_kind",
+    });
+    // The spec's own worked example. Both are asserted in the per-scenario
+    // `expect` blocks, fourteen scenarios after this one — the case that makes
+    // the ledger fixture-scoped rather than block-scoped.
+    try meta.proseKey("epoch_disambiguation", &.{ "frame_epoch", "blob_epoch" });
+    try meta.proseKey("anti_vacuity", &.{
+        // (4) vocabulary completeness...
+        "backends",
+        // (1) a real decode of every form...
+        "backend_forms",
+        // (2) the field really READ...
+        "decoded_backend",
+        // (3) the ENCODER half.
+        "reencoded_backend_field_present",
+    });
+    // PROXY (`#lzprosekeyconvention`). `theorem` names `resolve_wrong_backend`, a
+    // Lean theorem in lazily-formal; no run in this repo can prove it. What the
+    // run can prove is its CONSEQUENCE — an unknown kind is refused rather than
+    // routed into the shm table, which is the same fact as "never normalized".
+    try meta.proseKey("theorem", &.{ "rejected", "decoded_backend" });
     try meta.finish();
+    try cj.verifyProse(&prose);
 
     try std.testing.expectEqual(@as(usize, 14), replayed);
     try std.testing.expectEqual(@as(usize, 10), accepted);
