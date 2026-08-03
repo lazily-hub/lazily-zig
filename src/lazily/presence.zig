@@ -397,31 +397,17 @@ fn steps(fx: json.Value) ![]const json.Value {
 /// Canonical signature of the fixture's `expected.present` object, sorted by
 /// numeric peer key — the reference the cell's `presentSig()` is checked
 /// against.
-fn expectedPresentSig(allocator: std.mem.Allocator, present: json.Value) ![]u8 {
-    const obj = switch (present) {
+fn assertPresent(cell: *PresentMapCell, present: *cj.AssertionKeys) !void {
+    const object = switch (present.object) {
         .object => |o| o,
         else => return error.ExpectedObject,
     };
-    var keys = std.ArrayList(u64).empty;
-    defer keys.deinit(allocator);
-    var it = obj.iterator();
-    while (it.next()) |e| {
-        try keys.append(allocator, try std.fmt.parseInt(u64, e.key_ptr.*, 10));
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const peer = try std.fmt.parseInt(u64, entry.key_ptr.*, 10);
+        const actual = cell.core.map.get(peer) orelse return error.MissingKey;
+        try present.assertKey(entry.key_ptr.*, actual.value);
     }
-    std.mem.sort(u64, keys.items, {}, std.sort.asc(u64));
-
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    for (keys.items) |k| {
-        var numbuf: [20]u8 = undefined;
-        const ks = try std.fmt.bufPrint(&numbuf, "{d}", .{k});
-        const v = obj.get(ks) orelse return error.MissingKey;
-        try buf.appendSlice(allocator, ks);
-        try buf.append(allocator, '=');
-        try buf.appendSlice(allocator, try jsonAsString(v));
-        try buf.append(allocator, ';');
-    }
-    return buf.toOwnedSlice(allocator);
 }
 
 test "presence conformance: ephemeral" {
@@ -486,13 +472,7 @@ test "presence conformance: presence" {
 
         var exp = cj.AssertionKeys.init("presence expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
-        try exp.assertKeyWith("present", cell.presentSig(), struct {
-            fn check(actual: []const u8, present: json.Value) !void {
-                const want = try expectedPresentSig(std.testing.allocator, present);
-                defer std.testing.allocator.free(want);
-                try std.testing.expectEqualStrings(want, actual);
-            }
-        }.check);
+        try exp.assertObjectWith("present", &cell, assertPresent);
         try cj.assertInvalidates(&exp, "present", cell.presentVersion() != pre);
     }
 }
@@ -525,13 +505,7 @@ test "presence conformance: awareness" {
 
         var exp = cj.AssertionKeys.init("presence expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
-        try exp.assertKeyWith("present", cell.presentSig(), struct {
-            fn check(actual: []const u8, present: json.Value) !void {
-                const want = try expectedPresentSig(std.testing.allocator, present);
-                defer std.testing.allocator.free(want);
-                try std.testing.expectEqualStrings(want, actual);
-            }
-        }.check);
+        try exp.assertObjectWith("present", &cell, assertPresent);
         try cj.assertInvalidates(&exp, "present", cell.presentVersion() != pre);
     }
 }

@@ -876,11 +876,15 @@ fn runFixture(bytes: []const u8) !void {
 
         try keys.assertKeyWith("active", ActiveCheck{ .allocator = ta, .sc = sc }, ActiveCheck.check);
 
-        _ = try keys.assertKeyWithOpt("matches", sc, struct {
-            fn check(chart: *StateChart, mv: std.json.Value) !void {
-                var mit = mv.object.iterator();
+        _ = try keys.assertObjectWithOpt("matches", sc, struct {
+            fn check(chart: *StateChart, matches: *cj.AssertionKeys) !void {
+                const object = switch (matches.object) {
+                    .object => |o| o,
+                    else => return error.ExpectedObject,
+                };
+                var mit = object.iterator();
                 while (mit.next()) |e| {
-                    try std.testing.expectEqual(e.value_ptr.bool, chart.matches(e.key_ptr.*));
+                    try matches.assertKey(e.key_ptr.*, chart.matches(e.key_ptr.*));
                 }
             }
         }.check);

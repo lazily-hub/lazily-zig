@@ -1737,18 +1737,17 @@ fn Engine(comptime Model: type) type {
                     "after every scenario has been replayed",
             );
 
-            _ = try expected.assertKeyWithOpt("final_state", self, Self.checkFinalState);
-            _ = try expected.assertKeyWithOpt("after_publish", self, Self.checkAfterPublish);
+            _ = try expected.assertObjectWithOpt("final_state", self, Self.checkFinalState);
+            _ = try expected.assertObjectWithOpt("after_publish", self, Self.checkAfterPublish);
 
             try expected.finish();
             for (EffectLog.cleanups.items) |c| self.rep.obs.add(a, "cleanup[{d}];", .{c});
         }
 
-        fn checkFinalState(self: *Self, fin_block: json.Value) !void {
-            var fin = cj.AssertionKeys.init("reactive-graph expected.final_state", fin_block);
-            _ = try fin.assertKeyWithOpt("dependents_of", self, struct {
-                fn check(engine: *Self, m: json.Value) !void {
-                    const map = try asObject(m);
+        fn checkFinalState(self: *Self, fin: *cj.AssertionKeys) !void {
+            _ = try fin.assertObjectWithOpt("dependents_of", self, struct {
+                fn check(engine: *Self, members: *cj.AssertionKeys) !void {
+                    const map = try asObject(members.object);
                     for (try sortedKeys(map)) |id| {
                         const idx = try engine.node(id);
                         const got = engine.model.dependentCount(idx);
@@ -1758,13 +1757,14 @@ fn Engine(comptime Model: type) type {
                             got,
                             try asUsize(map.get(id).?),
                         );
+                        try members.assertKey(id, got);
                         engine.rep.obs.add(engine.allocator, "dep[{s}]={d};", .{ id, got });
                     }
                 }
             }.check);
-            _ = try fin.assertKeyWithOpt("readable", self, struct {
-                fn check(engine: *Self, m: json.Value) !void {
-                    const map = try asObject(m);
+            _ = try fin.assertObjectWithOpt("readable", self, struct {
+                fn check(engine: *Self, members: *cj.AssertionKeys) !void {
+                    const map = try asObject(members.object);
                     for (try sortedKeys(map)) |id| {
                         const got = engine.readable(id);
                         var k: [96]u8 = undefined;
@@ -1776,13 +1776,14 @@ fn Engine(comptime Model: type) type {
                                 else => return error.MalformedReadableAssertion,
                             },
                         );
+                        try members.assertKey(id, got);
                         engine.rep.obs.add(engine.allocator, "readable[{s}]={};", .{ id, got });
                     }
                 }
             }.check);
-            _ = try fin.assertKeyWithOpt("read", self, struct {
-                fn check(engine: *Self, m: json.Value) !void {
-                    const map = try asObject(m);
+            _ = try fin.assertObjectWithOpt("read", self, struct {
+                fn check(engine: *Self, members: *cj.AssertionKeys) !void {
+                    const map = try asObject(members.object);
                     for (try sortedKeys(map)) |id| {
                         const idx = try engine.node(id);
                         const want = try asI64(map.get(id).?);
@@ -1790,20 +1791,20 @@ fn Engine(comptime Model: type) type {
                         const key = std.fmt.bufPrint(&k, "final.read.{s}", .{id}) catch "final.read";
                         if (engine.model.read(idx)) |got| {
                             engine.check(key, got, want);
+                            try members.assertKey(id, got);
                             engine.rep.obs.add(engine.allocator, "read[{s}]={d};", .{ id, got });
                         } else |_| {
                             engine.check(key, @as(V, -1), want);
+                            try members.assertKey(id, @as(V, -1));
                             engine.rep.obs.add(engine.allocator, "read[{s}]=err;", .{id});
                         }
                     }
                 }
             }.check);
-            try fin.finish();
         }
 
-        fn checkAfterPublish(self: *Self, pub_block: json.Value) !void {
+        fn checkAfterPublish(self: *Self, pub_keys: *cj.AssertionKeys) !void {
             const a = self.allocator;
-            var pub_keys = cj.AssertionKeys.init("reactive-graph expected.after_publish", pub_block);
             // `op` is the publish to PERFORM, not a fact to compare — it drives
             // the cascade every other key here observes.
             try pub_keys.excuseKey(
@@ -1820,9 +1821,9 @@ fn Engine(comptime Model: type) type {
             _ = try pub_keys.assertKeyWithOpt("observed_by", RanCtx{ .engine = self, .ran = ran }, RanCtx.check);
             for (ran) |r| self.rep.obs.add(a, "ran[{d}];", .{r});
 
-            _ = try pub_keys.assertKeyWithOpt("read", self, struct {
-                fn check(engine: *Self, m: json.Value) !void {
-                    const map = try asObject(m);
+            _ = try pub_keys.assertObjectWithOpt("read", self, struct {
+                fn check(engine: *Self, members: *cj.AssertionKeys) !void {
+                    const map = try asObject(members.object);
                     for (try sortedKeys(map)) |id| {
                         const nidx = try engine.node(id);
                         const want = try asI64(map.get(id).?);
@@ -1830,17 +1831,19 @@ fn Engine(comptime Model: type) type {
                         const key = std.fmt.bufPrint(&k, "after_publish.read.{s}", .{id}) catch "after_publish.read";
                         if (engine.model.read(nidx)) |got| {
                             engine.check(key, got, want);
+                            try members.assertKey(id, got);
                             engine.rep.obs.add(engine.allocator, "pubread[{s}]={d};", .{ id, got });
                         } else |_| {
                             engine.check(key, @as(V, -1), want);
+                            try members.assertKey(id, @as(V, -1));
                             engine.rep.obs.add(engine.allocator, "pubread[{s}]=err;", .{id});
                         }
                     }
                 }
             }.check);
-            _ = try pub_keys.assertKeyWithOpt("dependents_of", self, struct {
-                fn check(engine: *Self, m: json.Value) !void {
-                    const map = try asObject(m);
+            _ = try pub_keys.assertObjectWithOpt("dependents_of", self, struct {
+                fn check(engine: *Self, members: *cj.AssertionKeys) !void {
+                    const map = try asObject(members.object);
                     for (try sortedKeys(map)) |id| {
                         const nidx = try engine.node(id);
                         const got = engine.model.dependentCount(nidx);
@@ -1850,11 +1853,11 @@ fn Engine(comptime Model: type) type {
                             got,
                             try asUsize(map.get(id).?),
                         );
+                        try members.assertKey(id, got);
                         engine.rep.obs.add(engine.allocator, "pubdep[{s}]={d};", .{ id, got });
                     }
                 }
             }.check);
-            try pub_keys.finish();
         }
 
         /// `assertKeyWith` context for `after_publish.observed_by` — the check

@@ -540,14 +540,17 @@ test "membership conformance: membership_lifecycle" {
         defer exp.finish() catch @panic("conformance assertion-key check failed");
 
         // Per-peer state assertions.
-        try exp.assertKeyWith("states", &cell, struct {
-            fn check(c: *MembershipCell, states: json.Value) !void {
-                var sit = states.object.iterator();
-                while (sit.next()) |kv| {
-                    const peer_id = try std.fmt.parseInt(u64, kv.key_ptr.*, 10);
-                    const want = try jsonAsString(kv.value_ptr.*);
-                    const got = c.state(peer_id) orelse return error.MissingPeer;
-                    try std.testing.expectEqualStrings(want, peerStateName(got));
+        try exp.assertObjectWith("states", &cell, struct {
+            fn check(c: *MembershipCell, states: *cj.AssertionKeys) !void {
+                const object = switch (states.object) {
+                    .object => |o| o,
+                    else => return error.ExpectedObject,
+                };
+                var sit = object.iterator();
+                while (sit.next()) |peer| {
+                    const peer_id = try std.fmt.parseInt(u64, peer.key_ptr.*, 10);
+                    const actual = c.state(peer_id) orelse return error.MissingPeer;
+                    try states.assertKey(peer.key_ptr.*, peerStateName(actual));
                 }
             }
         }.check);

@@ -488,7 +488,7 @@ const QueueInvalidationCtx = struct {
     where: Str,
     asserted: *usize,
 
-    fn check(self: QueueInvalidationCtx, node: Value) !void {
+    fn check(self: QueueInvalidationCtx, node: *cj.AssertionKeys) !void {
         self.asserted.* = try assertQueueInvalidation(self.before, self.after, node, self.where);
     }
 };
@@ -496,25 +496,14 @@ const QueueInvalidationCtx = struct {
 fn assertQueueInvalidation(
     before: QueueVersions,
     after: QueueVersions,
-    node: Value,
+    node: *cj.AssertionKeys,
     where: Str,
 ) !usize {
+    _ = where;
     var asserted: usize = 0;
     inline for (.{ "head", "len", "is_empty", "is_full", "closed" }) |name| {
-        if (cj.field(node, name)) |flag_node| {
-            const want = try cj.asBool(flag_node);
-            const changed = @field(before, name) != @field(after, name);
-            if (want != changed) {
-                std.debug.print("{s}: reader {s} invalidates want={} got={}\n", .{
-                    where,
-                    name,
-                    want,
-                    changed,
-                });
-                return error.TestExpectedEqual;
-            }
-            asserted += 1;
-        }
+        const changed = @field(before, name) != @field(after, name);
+        if (try node.assertKeyOpt(name, changed)) asserted += 1;
     }
     return asserted;
 }
@@ -605,7 +594,7 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
 
         const after = model.versions();
         var flags: usize = 0;
-        _ = try expected.assertKeyWithOpt("invalidates", QueueInvalidationCtx{
+        _ = try expected.assertObjectWithOpt("invalidates", QueueInvalidationCtx{
             .before = before,
             .after = after,
             .where = where,
@@ -887,20 +876,6 @@ fn collectSubscriberIds(
         if (cj.field(try cj.required(step, "op"), "subscriber")) |id| {
             try add.call(ids, allocator, try cj.asStr(id));
         }
-        const expected = try cj.required(step, "expected");
-        for ([_]Str{ "subscriptions", "reads", "invalidates" }) |key| {
-            if (cj.field(expected, key)) |node| {
-                switch (node) {
-                    .object => |object| {
-                        var it = object.iterator();
-                        while (it.next()) |entry| {
-                            try add.call(ids, allocator, entry.key_ptr.*);
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
     }
 }
 
@@ -922,8 +897,8 @@ fn TopicStateCtx(comptime M: type) type {
         /// Subscriptions are asserted as a SET, not just per named id: a step
         /// that must REMOVE an ephemeral subscription is only observable if a
         /// surviving extra entry fails, so the count is part of the claim.
-        fn subscriptions(self: Self, node: Value) !void {
-            const object = switch (node) {
+        fn subscriptions(self: Self, node: *cj.AssertionKeys) !void {
+            const object = switch (node.object) {
                 .object => |o| o,
                 else => return error.ExpectedObject,
             };
@@ -938,20 +913,11 @@ fn TopicStateCtx(comptime M: type) type {
                     );
                     return error.MissingSubscription;
                 };
-                try testing.expectEqual(
-                    try cj.asUsize(try cj.required(entry.value_ptr.*, "cursor")),
-                    got.cursor,
-                );
-                try testing.expectEqual(
-                    try parseDurability(
-                        try cj.asStr(try cj.required(entry.value_ptr.*, "durability")),
-                    ),
-                    got.durability,
-                );
-                try testing.expectEqual(
-                    try cj.asBool(try cj.required(entry.value_ptr.*, "connected")),
-                    got.connected,
-                );
+                var subscription = try node.sub(entry.key_ptr.*);
+                try subscription.assertKey("cursor", got.cursor);
+                try subscription.assertKey("durability", got.durability);
+                try subscription.assertKey("connected", got.connected);
+                try subscription.finish();
             }
             try testing.expectEqual(want_count, self.model.subscriptionCount());
         }
@@ -960,8 +926,8 @@ fn TopicStateCtx(comptime M: type) type {
         /// the whole suffix non-reactively, and its head THROUGH THE REACTIVE
         /// READER — a shell that under-invalidated fails on the second even when
         /// the first agrees.
-        fn reads(self: Self, node: Value) !void {
-            const object = switch (node) {
+        fn reads(self: Self, node: *cj.AssertionKeys) !void {
+            const object = switch (node.object) {
                 .object => |o| o,
                 else => return error.ExpectedObject,
             };
@@ -969,10 +935,15 @@ fn TopicStateCtx(comptime M: type) type {
             while (it.next()) |entry| {
                 const want_stream = try cj.asArray(entry.value_ptr.*);
                 const got_stream = try self.model.readStream(entry.key_ptr.*);
-                try testing.expectEqual(want_stream.len, got_stream.len);
-                for (want_stream, got_stream) |want, got| {
-                    try testing.expectEqualStrings(try cj.asStr(want), got);
-                }
+                try node.assertKeyWith(entry.key_ptr.*, got_stream, struct {
+                    fn check(actual: []const Str, expected: Value) !void {
+                        const want = try cj.asArray(expected);
+                        try testing.expectEqual(want.len, actual.len);
+                        for (want, actual) |w, got| {
+                            try testing.expectEqualStrings(try cj.asStr(w), got);
+                        }
+                    }
+                }.check);
                 const want_head: ?Str = if (want_stream.len == 0)
                     null
                 else
@@ -993,10 +964,10 @@ fn assertTopicState(model: anytype, expected: *cj.AssertionKeys, where: Str) !vo
     if (!try expected.assertKeyWithOpt("elements", ctx, C.elements)) {
         try testing.expectEqual(@as(usize, 0), model.items().len);
     }
-    if (!try expected.assertKeyWithOpt("subscriptions", ctx, C.subscriptions)) {
+    if (!try expected.assertObjectWithOpt("subscriptions", ctx, C.subscriptions)) {
         try testing.expectEqual(@as(usize, 0), model.subscriptionCount());
     }
-    _ = try expected.assertKeyWithOpt("reads", ctx, C.reads);
+    _ = try expected.assertObjectWithOpt("reads", ctx, C.reads);
 }
 
 fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
@@ -1132,14 +1103,13 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
             where: Str,
             flags: *usize,
 
-            fn check(self: @This(), node: Value) !void {
-                const object = switch (node) {
+            fn check(self: @This(), node: *cj.AssertionKeys) !void {
+                const object = switch (node.object) {
                     .object => |o| o,
                     else => return error.ExpectedObject,
                 };
                 var it = object.iterator();
                 while (it.next()) |entry| {
-                    const want_invalidated = try cj.asBool(entry.value_ptr.*);
                     const id = entry.key_ptr.*;
                     var slot: usize = 0;
                     while (slot < self.ids.len and
@@ -1155,18 +1125,12 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
                         // than a version bump, and the only one available for a
                         // removed ephemeral.
                         self.before[slot] != null;
-                    if (want_invalidated != changed) {
-                        std.debug.print(
-                            "{s}: subscriber {s} invalidates want={} got={}\n",
-                            .{ self.where, id, want_invalidated, changed },
-                        );
-                        return error.TestExpectedEqual;
-                    }
+                    try node.assertKey(id, changed);
                     self.flags.* += 1;
                 }
             }
         };
-        _ = try expected.assertKeyWithOpt("invalidates", TopicInvCtx{
+        _ = try expected.assertObjectWithOpt("invalidates", TopicInvCtx{
             .model = model,
             .ids = ids.items,
             .before = before,
@@ -1489,23 +1453,11 @@ fn WorkQueueStateCtx(comptime M: type) type {
         /// `reads` are the four reader kinds. Reading them here (not only their
         /// version counters) is what makes the invalidation matrix a claim about
         /// an observable value rather than about a counter that happens to move.
-        fn reads(self: Self, node: Value) !void {
-            try testing.expectEqual(
-                try cj.asUsize(try cj.required(node, "pending_len")),
-                try self.model.pendingLen(),
-            );
-            try testing.expectEqual(
-                try cj.asBool(try cj.required(node, "is_empty")),
-                try self.model.isEmpty(),
-            );
-            try testing.expectEqual(
-                try cj.asUsize(try cj.required(node, "in_flight_len")),
-                try self.model.inFlightLen(),
-            );
-            try testing.expectEqual(
-                try cj.asUsize(try cj.required(node, "dead_letter_len")),
-                try self.model.deadLetterLen(),
-            );
+        fn reads(self: Self, node: *cj.AssertionKeys) !void {
+            try node.assertKey("pending_len", try self.model.pendingLen());
+            try node.assertKey("is_empty", try self.model.isEmpty());
+            try node.assertKey("in_flight_len", try self.model.inFlightLen());
+            try node.assertKey("dead_letter_len", try self.model.deadLetterLen());
         }
     };
 }
@@ -1527,7 +1479,7 @@ fn assertWorkQueueState(model: anytype, expected: *cj.AssertionKeys, where: Str)
     if (!try expected.assertKeyWithOpt("dead_letters", ctx, C.deadLetters)) {
         try testing.expectEqual(@as(usize, 0), model.deadLetterItems().len);
     }
-    _ = try expected.assertKeyWithOpt("reads", ctx, C.reads);
+    _ = try expected.assertObjectWithOpt("reads", ctx, C.reads);
 }
 
 /// `assertKeyWith` context for the WorkQueueCell invalidation matrix. The flag
@@ -1538,7 +1490,7 @@ const WorkQueueInvalidationCtx = struct {
     where: Str,
     asserted: *usize,
 
-    fn check(self: WorkQueueInvalidationCtx, node: Value) !void {
+    fn check(self: WorkQueueInvalidationCtx, node: *cj.AssertionKeys) !void {
         self.asserted.* = try assertWorkQueueInvalidation(
             self.before,
             self.after,
@@ -1551,22 +1503,14 @@ const WorkQueueInvalidationCtx = struct {
 fn assertWorkQueueInvalidation(
     before: WorkQueueVersions,
     after: WorkQueueVersions,
-    invalidates: Value,
+    invalidates: *cj.AssertionKeys,
     where: Str,
 ) !usize {
+    _ = where;
     var asserted: usize = 0;
     inline for (.{ "pending_len", "is_empty", "in_flight_len", "dead_letter_len" }) |name| {
-        const want = try cj.asBool(try cj.required(invalidates, name));
         const changed = @field(before, name) != @field(after, name);
-        if (want != changed) {
-            std.debug.print("{s}: reader {s} invalidates want={} got={}\n", .{
-                where,
-                name,
-                want,
-                changed,
-            });
-            return error.TestExpectedEqual;
-        }
+        try invalidates.assertKey(name, changed);
         asserted += 1;
     }
     return asserted;
@@ -1699,7 +1643,7 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
 
         const after = model.versions();
         var flags: usize = 0;
-        try expected.assertKeyWith("invalidates", WorkQueueInvalidationCtx{
+        try expected.assertObjectWith("invalidates", WorkQueueInvalidationCtx{
             .before = before,
             .after = after,
             .where = where,

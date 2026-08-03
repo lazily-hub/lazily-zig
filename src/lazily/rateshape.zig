@@ -522,12 +522,9 @@ fn expectStep(step: json.Value, emitted: ?Value, out: ?Value, out_changed: bool)
     );
     defer exp.finish() catch @panic("conformance assertion-key check failed");
     try exp.assertKey("output", out);
-    try exp.assertKeyWith("invalidates", out_changed, struct {
-        fn check(changed: bool, inv: json.Value) !void {
-            try std.testing.expectEqual(
-                try cj.asBool(try cj.required(inv, "output")),
-                changed,
-            );
+    try exp.assertObjectWith("invalidates", out_changed, struct {
+        fn check(changed: bool, inv: *cj.AssertionKeys) !void {
+            try inv.assertKey("output", changed);
         }
     }.check);
 }

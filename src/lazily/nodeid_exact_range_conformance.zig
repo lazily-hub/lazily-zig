@@ -309,7 +309,7 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     try meta.assertKey("scenario_count", replayed);
     try meta.assertKeyWith("codecs", &observed_codecs, checkDeclaredWereObserved);
     // The gloss map's key set, against the outcomes this run replayed.
-    try meta.assertKeyWith("outcomes", &observed_outcomes, checkOutcomeVocabulary);
+    try meta.assertKeySet("outcomes", observed_outcomes.items[0..observed_outcomes.len]);
 
     // The three paragraphs, DISCHARGED (`#lzprosekeyconvention`).
     try meta.proseKey("clause", &.{

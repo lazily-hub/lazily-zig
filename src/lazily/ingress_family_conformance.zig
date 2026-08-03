@@ -877,93 +877,77 @@ fn StateCtx(comptime M: type) type {
         model: M,
         where: []const u8,
 
-        fn check(self: @This(), scopes: json.Value) !void {
+        fn check(self: @This(), scopes: *cj.AssertionKeys) !void {
             try assertState(self.model, scopes, self.where);
         }
 
-        fn checkReceipts(self: @This(), receipts: json.Value) !void {
+        fn checkReceipts(self: @This(), receipts: *cj.AssertionKeys) !void {
             try assertReceipts(self.model, receipts, self.where);
         }
     };
 }
 
-fn assertState(model: anytype, scopes: json.Value, where: []const u8) !void {
-    switch (scopes) {
+fn assertState(model: anytype, scopes: *cj.AssertionKeys, where: []const u8) !void {
+    switch (scopes.object) {
         .object => |map| {
             var it = map.iterator();
             while (it.next()) |entry| {
                 const key = entry.key_ptr.*;
-                const want = entry.value_ptr.*;
                 const got = model.view(key) orelse {
                     std.debug.print("{s}: scope {s} absent\n", .{ where, key });
                     return error.TestExpectedEqual;
                 };
-                try testing.expectEqual(
-                    try requiredEnum(IngressLifecycle, want, "lifecycle"),
-                    got.lifecycle,
-                );
-                try expectEqU64(where, try requiredU64(want, "generation"), got.generation);
-                try expectEqOptU64(
-                    where,
-                    try jsonAsOptU64(try jsonFieldRequired(want, "delivered_through")),
-                    got.delivered_through,
-                );
-                try expectEqU64(where, try requiredU64(want, "buffered"), got.buffered);
-                try expectEqU64(
-                    where,
-                    try requiredU64(want, "consecutive_errors"),
-                    got.consecutive_errors,
-                );
-                try expectEqOptU64(
-                    where,
-                    try jsonAsOptU64(try jsonFieldRequired(want, "window")),
-                    try model.value(key),
-                );
-                try testing.expectEqual(
-                    try requiredEnum(IngressReadiness, want, "readiness"),
-                    try model.readiness(key),
-                );
+                var scope = try scopes.sub(key);
+                errdefer scope.finish() catch {};
+                try scope.assertKey("lifecycle", got.lifecycle);
+                try scope.assertKey("generation", got.generation);
+                try scope.assertKey("delivered_through", got.delivered_through);
+                try scope.assertKey("buffered", got.buffered);
+                try scope.assertKey("consecutive_errors", got.consecutive_errors);
+                try scope.assertKey("window", try model.value(key));
+                try scope.assertKey("readiness", try model.readiness(key));
 
                 const got_authority = try model.authority(key);
-                switch (try jsonFieldRequired(want, "authority")) {
-                    .null => try testing.expectEqual(
-                        @as(?IngressAuthority, null),
-                        got_authority,
-                    ),
-                    else => |want_authority| try testing.expectEqual(
-                        IngressAuthority{
-                            .generation = try requiredU64(want_authority, "generation"),
-                            .delivered_through = try jsonAsOptU64(
-                                try jsonFieldRequired(want_authority, "delivered_through"),
-                            ),
-                            .stamped_at = try requiredU64(want_authority, "stamped_at"),
-                        },
-                        got_authority.?,
-                    ),
+                switch (scope.object.object.get("authority") orelse return error.MissingField) {
+                    .null => try scope.assertKey("authority", @as(?u64, null)),
+                    .object => {
+                        const actual = got_authority orelse return error.TestExpectedEqual;
+                        var authority = try scope.sub("authority");
+                        errdefer authority.finish() catch {};
+                        try authority.assertKey("generation", actual.generation);
+                        try authority.assertKey("delivered_through", actual.delivered_through);
+                        try authority.assertKey("stamped_at", actual.stamped_at);
+                        try authority.finish();
+                    },
+                    else => return error.ExpectedObject,
                 }
 
                 const got_retry = try model.retry(key);
-                switch (try jsonFieldRequired(want, "retry")) {
-                    .null => try testing.expectEqual(@as(?IngressRetry, null), got_retry),
-                    else => |want_retry| try testing.expectEqual(
-                        IngressRetry{
-                            .attempt = @intCast(try requiredU64(want_retry, "attempt")),
-                            .backoff = try requiredU64(want_retry, "backoff"),
-                            .resume_from = try requiredU64(want_retry, "resume_from"),
-                        },
-                        got_retry.?,
-                    ),
+                switch (scope.object.object.get("retry") orelse return error.MissingField) {
+                    .null => try scope.assertKey("retry", @as(?u64, null)),
+                    .object => {
+                        const actual = got_retry orelse return error.TestExpectedEqual;
+                        var retry = try scope.sub("retry");
+                        errdefer retry.finish() catch {};
+                        try retry.assertKey("attempt", actual.attempt);
+                        try retry.assertKey("backoff", actual.backoff);
+                        try retry.assertKey("resume_from", actual.resume_from);
+                        try retry.finish();
+                    },
+                    else => return error.ExpectedObject,
                 }
+                try scope.finish();
             }
         },
         else => return error.ExpectedObject,
     }
 }
 
-fn assertReceipts(model: anytype, receipts: json.Value, where: []const u8) !void {
-    try expectEqU64(where, try requiredU64(receipts, "accepted"), try model.acceptedLen());
-    try expectEqU64(where, try requiredU64(receipts, "dropped"), try model.droppedLen());
-    try expectEqU64(where, try requiredU64(receipts, "error"), try model.errorsLen());
+fn assertReceipts(model: anytype, receipts: *cj.AssertionKeys, where: []const u8) !void {
+    _ = where;
+    try receipts.assertKey("accepted", try model.acceptedLen());
+    try receipts.assertKey("dropped", try model.droppedLen());
+    try receipts.assertKey("error", try model.errorsLen());
 }
 
 /// Assert `invalidates` in BOTH directions. `true` means the reader's cache went
@@ -980,7 +964,7 @@ const InvalidationCtx = struct {
     where: []const u8,
     asserted: *usize,
 
-    fn check(self: InvalidationCtx, want: json.Value) !void {
+    fn check(self: InvalidationCtx, want: *cj.AssertionKeys) !void {
         self.asserted.* = try assertInvalidation(
             self.keys,
             want,
@@ -996,64 +980,45 @@ const InvalidationCtx = struct {
 /// once. Pin the nesting so that cannot recur here.
 fn assertInvalidation(
     keys: [][]const u8,
-    want: json.Value,
+    want: *cj.AssertionKeys,
     before: Snapshot,
     after: Snapshot,
     where: []const u8,
 ) !usize {
+    _ = where;
     var asserted: usize = 0;
 
-    const want_scopes = try jsonFieldRequired(want, "scopes");
-    switch (want_scopes) {
+    var want_scopes = try want.sub("scopes");
+    errdefer want_scopes.finish() catch {};
+    switch (want_scopes.object) {
         .object => |map| {
             var it = map.iterator();
             while (it.next()) |entry| {
                 const i = try keyIndex(keys, entry.key_ptr.*);
+                var scope = try want_scopes.sub(entry.key_ptr.*);
+                errdefer scope.finish() catch {};
                 inline for (kind_names, 0..) |kind_name, slot| {
-                    const flag = try jsonAsBool(
-                        try jsonFieldRequired(entry.value_ptr.*, kind_name),
-                    );
                     const was_valid = before.scopes[i][slot];
                     const now_valid = after.scopes[i][slot];
                     const invalidated = was_valid and !now_valid;
-                    if (invalidated != flag) {
-                        std.debug.print(
-                            "{s}: {s}.{s} invalidation want {} got {} " ++
-                                "(was valid={}, now valid={})\n",
-                            .{
-                                where,
-                                entry.key_ptr.*,
-                                kind_name,
-                                flag,
-                                invalidated,
-                                was_valid,
-                                now_valid,
-                            },
-                        );
-                        return error.TestExpectedEqual;
-                    }
+                    try scope.assertKey(kind_name, invalidated);
                     asserted += 1;
                 }
+                try scope.finish();
             }
         },
         else => return error.ExpectedObject,
     }
+    try want_scopes.finish();
 
-    const want_receipts = try jsonFieldRequired(want, "receipts");
+    var want_receipts = try want.sub("receipts");
+    errdefer want_receipts.finish() catch {};
     inline for (.{ "accepted", "dropped", "error" }, 0..) |name, c| {
-        const flag = try jsonAsBool(try jsonFieldRequired(want_receipts, name));
         const invalidated = before.receipts[c] and !after.receipts[c];
-        if (invalidated != flag) {
-            std.debug.print("{s}: receipts.{s} invalidation want {} got {}\n", .{
-                where,
-                name,
-                flag,
-                invalidated,
-            });
-            return error.TestExpectedEqual;
-        }
+        try want_receipts.assertKey(name, invalidated);
         asserted += 1;
     }
+    try want_receipts.finish();
     return asserted;
 }
 
@@ -1175,18 +1140,18 @@ fn replay(
         if (jsonField(step, "invalidates") != null) return error.InvalidatesMustNestUnderExpected;
         var expected = cj.AssertionKeys.init("ingress-family expected", try jsonFieldRequired(step, "expected"));
         const StateCheck = StateCtx(@TypeOf(model));
-        try expected.assertKeyWith(
+        try expected.assertObjectWith(
             "scopes",
             StateCheck{ .model = model, .where = where },
             StateCheck.check,
         );
-        try expected.assertKeyWith(
+        try expected.assertObjectWith(
             "receipts",
             StateCheck{ .model = model, .where = where },
             StateCheck.checkReceipts,
         );
         var flags: usize = 0;
-        try expected.assertKeyWith("invalidates", InvalidationCtx{
+        try expected.assertObjectWith("invalidates", InvalidationCtx{
             .keys = keys,
             .before = before,
             .after = after,

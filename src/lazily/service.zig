@@ -525,18 +525,12 @@ fn steps(fx: json.Value) ![]const json.Value {
     };
 }
 
-/// Assert a live `service → endpoint` map equals the fixture object as a set of
-/// pairs (count + every key/value).
-fn expectMapEquals(actual: *const std.StringHashMap([]const u8), expected: json.Value) !void {
-    const obj = switch (expected) {
-        .object => |o| o,
-        else => return error.ExpectedObject,
-    };
-    try std.testing.expectEqual(obj.count(), actual.count());
-    var it = obj.iterator();
+/// Assert a live `service → endpoint` map through the fixture object's child
+/// tracker, so the pair set is checked in both directions.
+fn expectMapEquals(actual: *const std.StringHashMap([]const u8), expected: *cj.AssertionKeys) !void {
+    var it = actual.iterator();
     while (it.next()) |e| {
-        const got = actual.get(e.key_ptr.*) orelse return error.MissingKey;
-        try std.testing.expectEqualStrings(try jsonAsString(e.value_ptr.*), got);
+        try expected.assertKey(e.key_ptr.*, e.value_ptr.*);
     }
 }
 
@@ -625,7 +619,7 @@ test "service conformance: discovery" {
         defer exp.finish() catch @panic("conformance assertion-key check failed");
         var proj = try cell.discovery(std.testing.allocator);
         defer proj.deinit();
-        try exp.assertKeyWith("discovery", &proj, expectMapEquals);
+        try exp.assertObjectWith("discovery", &proj, expectMapEquals);
         try cj.assertInvalidates(&exp, "discovery", cell.discoveryVersion() != pre);
     }
 }
@@ -657,7 +651,7 @@ test "service conformance: service_registry" {
 
         var exp = cj.AssertionKeys.init("service expected", try jsonFieldRequired(step, "expected"));
         defer exp.finish() catch @panic("conformance assertion-key check failed");
-        try exp.assertKeyWith("projection", reg.projectionMap(), expectMapEquals);
+        try exp.assertObjectWith("projection", reg.projectionMap(), expectMapEquals);
         try cj.assertInvalidates(&exp, "projection", reg.projectionVersion() != pre);
     }
 }

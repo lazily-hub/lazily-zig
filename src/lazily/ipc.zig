@@ -1853,38 +1853,13 @@ test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
     var magic_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &magic_buf, readU32(arena.bytes[0..SHM_BLOB_HEADER_LEN], 0), .big);
     try keys.assertKey("magic", &magic_buf);
-    try keys.assertKeyWith("descriptor", desc, struct {
-        fn check(want: ShmBlobRef, expected_descriptor: cj.Value) anyerror!void {
-            try std.testing.expectEqual(
-                try cj.asU64(try cj.required(expected_descriptor, "offset")),
-                want.offset,
-            );
-            try std.testing.expectEqual(
-                try cj.asU64(try cj.required(expected_descriptor, "len")),
-                want.len,
-            );
-            try std.testing.expectEqual(
-                try cj.asU64(try cj.required(expected_descriptor, "generation")),
-                want.generation,
-            );
-            try std.testing.expectEqual(
-                try cj.asU64(try cj.required(expected_descriptor, "epoch")),
-                want.epoch,
-            );
-            try std.testing.expectEqual(
-                try cj.asU64(try cj.required(expected_descriptor, "checksum")),
-                want.checksum,
-            );
-            // The KEY SET, not just the five fields. Without it the block is the
-            // null form one level down: a sixth field added to `descriptor`
-            // upstream would be compared by nothing here, and the corpus
-            // perturbation pass found exactly that — a key planted inside this
-            // object left the suite green while every scalar sibling reddened.
-            const fields = switch (expected_descriptor) {
-                .object => |o| o,
-                else => return error.ExpectedObject,
-            };
-            try std.testing.expectEqual(@as(usize, 5), fields.count());
+    try keys.assertObjectWith("descriptor", desc, struct {
+        fn check(want: ShmBlobRef, descriptor_keys: *cj.AssertionKeys) anyerror!void {
+            try descriptor_keys.assertKey("offset", want.offset);
+            try descriptor_keys.assertKey("len", want.len);
+            try descriptor_keys.assertKey("generation", want.generation);
+            try descriptor_keys.assertKey("epoch", want.epoch);
+            try descriptor_keys.assertKey("checksum", want.checksum);
         }
     }.check);
     try keys.finish();

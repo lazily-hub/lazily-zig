@@ -310,7 +310,7 @@ fn Engine(comptime Model: type) type {
             vv_before: *std.StringHashMap(u64),
             values_before: *std.StringHashMap(V),
 
-            fn checkInvalidates(self: StepCtx, inv: json.Value) !void {
+            fn checkInvalidates(self: StepCtx, inv: *cj.AssertionKeys) !void {
                 try assertInvalidation(
                     Model,
                     self.model,
@@ -323,31 +323,18 @@ fn Engine(comptime Model: type) type {
                 );
             }
 
-            fn checkHandleStable(self: StepCtx, hs: json.Value) !void {
-                const obj = switch (hs) {
+            fn checkHandleStable(self: StepCtx, hs: *cj.AssertionKeys) !void {
+                const obj = switch (hs.object) {
                     .object => |o| o,
                     else => return error.ExpectedObject,
                 };
                 var it = obj.iterator();
                 while (it.next()) |e| {
-                    if (!(try asBool(e.value_ptr.*))) continue;
                     const key = e.key_ptr.*;
-                    const after = self.model.handleStamp(key) orelse {
-                        std.debug.print(
-                            "{s} step {d}: handle_stable[{s}] - handle missing after op\n",
-                            .{ Model.FLAVOR, self.step, key },
-                        );
-                        return error.HandleMissing;
-                    };
-                    const before = self.stamps_before.get(key) orelse return error.NoHandleBefore;
-                    if (after != before) {
-                        std.debug.print(
-                            "{s} step {d}: handle_stable[{s}] violated - entry identity " ++
-                                "changed across an atomic move ({d} -> {d})\n",
-                            .{ Model.FLAVOR, self.step, key, before, after },
-                        );
-                        return error.HandleNotStable;
-                    }
+                    const after = self.model.handleStamp(key);
+                    const before = self.stamps_before.get(key);
+                    const stable = after != null and before != null and after.? == before.?;
+                    try hs.assertKey(key, stable);
                 }
             }
 
@@ -380,16 +367,15 @@ fn Engine(comptime Model: type) type {
                 }
             }
 
-            fn checkValues(self: StepCtx, vals: json.Value) !void {
-                const obj = switch (vals) {
+            fn checkValues(self: StepCtx, vals: *cj.AssertionKeys) !void {
+                const object = switch (vals.object) {
                     .object => |o| o,
                     else => return error.ExpectedObject,
                 };
-                var it = obj.iterator();
-                while (it.next()) |e| {
-                    const want = try asI64(e.value_ptr.*);
-                    const got = self.model.value(e.key_ptr.*) orelse return error.MissingKey;
-                    try testing.expectEqual(want, got);
+                var it = object.iterator();
+                while (it.next()) |entry| {
+                    const got = self.model.value(entry.key_ptr.*) orelse return error.MissingKey;
+                    try vals.assertKey(entry.key_ptr.*, got);
                 }
             }
         };
@@ -478,15 +464,15 @@ fn Engine(comptime Model: type) type {
                 };
 
                 // -- invalidation (reader-class independence) ------------
-                try expected.assertKeyWith("invalidates", step_ctx, StepCtx.checkInvalidates);
+                try expected.assertObjectWith("invalidates", step_ctx, StepCtx.checkInvalidates);
 
                 // -- handle stability ------------------------------------
-                _ = try expected.assertKeyWithOpt("handle_stable", step_ctx, StepCtx.checkHandleStable);
+                _ = try expected.assertObjectWithOpt("handle_stable", step_ctx, StepCtx.checkHandleStable);
 
                 // -- resulting state -------------------------------------
                 _ = try expected.assertKeyWithOpt("order", step_ctx, StepCtx.checkOrder);
                 _ = try expected.assertKeyWithOpt("membership", step_ctx, StepCtx.checkMembership);
-                _ = try expected.assertKeyWithOpt("values", step_ctx, StepCtx.checkValues);
+                _ = try expected.assertObjectWithOpt("values", step_ctx, StepCtx.checkValues);
             }
         }
     };
@@ -545,31 +531,30 @@ fn applyOp(comptime Model: type, model: *Model, op: json.Value) !void {
 fn assertInvalidation(
     comptime Model: type,
     model: *Model,
-    inv: json.Value,
+    inv: *cj.AssertionKeys,
     step: usize,
     mv_before: u64,
     ov_before: u64,
     vv_before: *std.StringHashMap(u64),
     values_before: *std.StringHashMap(V),
 ) !void {
-    const want_membership = if (field(inv, "membership")) |m| try asBool(m) else false;
-    const want_order = if (field(inv, "order")) |o| try asBool(o) else false;
-
     const membership_changed = model.membershipVersion() != mv_before;
-    if (membership_changed != want_membership) {
+    const checked_membership = try inv.assertKeyOpt("membership", membership_changed);
+    if (!checked_membership and membership_changed) {
         std.debug.print(
-            "{s} step {d}: membership invalidation {} but fixture says {} " ++
+            "{s} step {d}: membership invalidated but the fixture omits it " ++
                 "(a pure reorder must NOT touch set identity)\n",
-            .{ Model.FLAVOR, step, membership_changed, want_membership },
+            .{ Model.FLAVOR, step },
         );
         return error.MembershipInvalidationMismatch;
     }
 
     const order_changed = model.orderVersion() != ov_before;
-    if (order_changed != want_order) {
+    const checked_order = try inv.assertKeyOpt("order", order_changed);
+    if (!checked_order and order_changed) {
         std.debug.print(
-            "{s} step {d}: order invalidation {} but fixture says {}\n",
-            .{ Model.FLAVOR, step, order_changed, want_order },
+            "{s} step {d}: order invalidated but the fixture omits it\n",
+            .{ Model.FLAVOR, step },
         );
         return error.OrderInvalidationMismatch;
     }
@@ -577,10 +562,15 @@ fn assertInvalidation(
     // Per-entry value axis. Keys the fixture lists must have changed; surviving
     // keys it does not list must be untouched.
     // An absent `value` list means "no entry value may change".
-    const listed_items: []const json.Value = if (field(inv, "value")) |lv| switch (lv) {
-        .array => |a| a.items,
-        else => return error.ExpectedArray,
-    } else &.{};
+    var listed_items: []const json.Value = &.{};
+    _ = try inv.assertKeyWithOpt("value", &listed_items, struct {
+        fn check(out: *[]const json.Value, node: json.Value) !void {
+            out.* = switch (node) {
+                .array => |a| a.items,
+                else => return error.ExpectedArray,
+            };
+        }
+    }.check);
     for (model.keys()) |k| {
         var is_listed = false;
         for (listed_items) |l| {

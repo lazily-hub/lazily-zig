@@ -390,6 +390,35 @@ fn replayingScenarioImpl(fixture: []const u8, fx: Value, id: []const u8, quiet: 
 /// in both directions — excusing a key the same run also asserts is a failure,
 /// because that excuse has gone stale and is hiding nothing.
 ///
+/// OBJECT-VALUED KEYS — `#lzsubblockkeyset`. A key whose fixture value is a JSON
+/// OBJECT carries two obligations, not one: the value of each sub-field, and the
+/// sub-field KEY SET. Reading five named sub-fields out of `arena_blob.json`'s
+/// `descriptor` and stopping satisfied every rung above — consumed, asserted,
+/// bound — while a sixth field planted in the object was compared by nothing.
+/// That is the null form one level down, INSIDE an assertion key rather than
+/// beside one.
+///
+/// So the tracker owns it, not the call site. A per-call-site field count is not
+/// conformance: it relies on the next author remembering, which is the property
+/// this rung removes. Three discharges, and `finish()` fails an object-valued key
+/// that reached none of them:
+///
+///   1. `sub(name)` — DESCEND. Hands back a CHILD tracker bound to the object,
+///      which owns the same unconsumed-key teardown, so an unread sub-field fails
+///      exactly as an unread top-level key does. Prefer this: the obligation
+///      moves down rather than being restated.
+///   2. `assertKeySet(name, produced)` — compare the object's KEY SET against the
+///      set the run really produced, in BOTH directions. For a key whose
+///      sub-fields are a VOCABULARY rather than data —
+///      `codec/nodeid_exact_range.json`'s `outcomes` maps outcome tokens to
+///      English glosses, and the assertion is which tokens exist.
+///   3. `assertKeyStructural(name, actual)` — whole-value structural equality,
+///      which already covers the key set at every depth. `assertKey` with a
+///      `Value` actual takes this path too, since `eql` compares object sizes.
+///
+/// `excuseKey` stays available for an object-valued key that genuinely carries no
+/// obligation here, and it still requires a reason.
+///
 /// No allocation: the sets are bounded inline arrays, so a replay can build one
 /// per step without touching an allocator.
 pub const AssertionKeys = struct {
@@ -407,6 +436,12 @@ pub const AssertionKeys = struct {
     pub const NARRATIVE = [_][]const u8{ "note", "notes", "comment", "description", "why" };
 
     const Excuse = struct { name: []const u8, reason: []const u8 };
+
+    /// A child tracker handed out by `sub`, and whether it was finished
+    /// (`#lzsubblockkeyset`). Tracked here rather than left to the caller: a
+    /// descend the call site forgets to `finish()` would move the obligation down
+    /// and then drop it, which is the hole this rung closes, not a new one.
+    const Sub = struct { name: []const u8, done: bool };
 
     where: []const u8,
     object: Value,
@@ -427,6 +462,19 @@ pub const AssertionKeys = struct {
     asserted_len: usize = 0,
     excused: [MAX_KEYS]Excuse = undefined,
     excused_len: usize = 0,
+    /// Object-valued keys whose KEY SET reached a check (`#lzsubblockkeyset`).
+    object_checked: [MAX_KEYS][]const u8 = undefined,
+    object_checked_len: usize = 0,
+    /// Child trackers handed out by `sub`.
+    subs: [MAX_KEYS]Sub = undefined,
+    subs_len: usize = 0,
+    /// Set on a CHILD tracker only: the parent block and the slot to close on
+    /// `finish()`, so a descend that is never finished fails the parent.
+    parent: ?*AssertionKeys = null,
+    parent_slot: usize = 0,
+    /// Set on a CHILD tracker only: the parent key whose value this block is, so
+    /// a diagnostic names `descriptor` rather than pointing at the whole fixture.
+    key_prefix: []const u8 = "",
     /// Suppress the diagnostic print. Only for this module's own self-test,
     /// which asserts the failure and must not pollute the suite's stderr.
     quiet: bool = false,
@@ -442,6 +490,18 @@ pub const AssertionKeys = struct {
         var self = AssertionKeys{ .where = where, .object = object };
         for (NARRATIVE) |name| self.mark(name);
         return self;
+    }
+
+    /// Every diagnostic goes through here so a CHILD tracker's failures name the
+    /// object-valued key they came from — `self.where` alone would point a
+    /// sub-field's failure at the whole block.
+    fn report(self: *const AssertionKeys, comptime fmt: []const u8, args: anytype) void {
+        if (self.quiet) return;
+        std.debug.print("{s}: ", .{self.where});
+        if (self.key_prefix.len > 0) {
+            std.debug.print("inside object-valued key '{s}': ", .{self.key_prefix});
+        }
+        std.debug.print(fmt, args);
     }
 
     fn mark(self: *AssertionKeys, name: []const u8) void {
@@ -563,6 +623,179 @@ pub const AssertionKeys = struct {
         return null;
     }
 
+    // -----------------------------------------------------------------------
+    // Object-valued assertion keys (#lzsubblockkeyset)
+    // -----------------------------------------------------------------------
+
+    fn markObjectChecked(self: *AssertionKeys, name: []const u8) void {
+        for (self.object_checked[0..self.object_checked_len]) |seen| {
+            if (std.mem.eql(u8, seen, name)) return;
+        }
+        if (self.object_checked_len == MAX_KEYS) @panic("AssertionKeys.MAX_KEYS exceeded");
+        self.object_checked[self.object_checked_len] = name;
+        self.object_checked_len += 1;
+    }
+
+    fn wasObjectChecked(self: *const AssertionKeys, name: []const u8) bool {
+        for (self.object_checked[0..self.object_checked_len]) |c| {
+            if (std.mem.eql(u8, c, name)) return true;
+        }
+        return false;
+    }
+
+    /// DISCHARGE 1 — DESCEND. Consume the object-valued key `name` and hand back a
+    /// CHILD tracker bound to its value.
+    ///
+    /// The child owns the same three teardown checks the parent does, so a
+    /// sub-field nothing reads fails exactly as an unconsumed top-level key does,
+    /// and a sub-field read without a comparison fails as one read and not
+    /// asserted. The obligation MOVES DOWN rather than being restated as a field
+    /// count — which is the whole difference between this and the stopgap it
+    /// replaces.
+    ///
+    /// The child deliberately does NOT book itself in the rung-0 bind ledger
+    /// (`#lznullformblind`). That ledger is two-directional against the blocks
+    /// `specReadFile` inventoried at read time, and a sub-object is not one of
+    /// them; zig's block digest is content-keyed, so a spurious child bind would
+    /// surface as a bind with no matching inventory entry.
+    ///
+    /// Usage:
+    ///
+    ///     var descriptor = try keys.sub("descriptor");
+    ///     try descriptor.assertKey("offset", observed.offset);
+    ///     …
+    ///     try descriptor.finish();
+    ///
+    /// Forgetting the child's `finish()` is not silent: the parent records the
+    /// descend and fails when a child was handed out and never closed.
+    pub fn sub(self: *AssertionKeys, name: []const u8) !AssertionKeys {
+        const value = try self.required(name);
+        if (value != .object) {
+            self.report(
+                "assertion key '{s}' is not an object, so there is nothing to descend into. " ++
+                    "sub() is for object-valued keys; assert a scalar with assertKey " ++
+                    "(#lzsubblockkeyset)\n",
+                .{name},
+            );
+            return error.SubBlockNotAnObject;
+        }
+        self.markAsserted(name);
+        self.markObjectChecked(name);
+        if (self.subs_len == MAX_KEYS) @panic("AssertionKeys.MAX_KEYS exceeded");
+        const slot = self.subs_len;
+        self.subs[slot] = .{ .name = name, .done = false };
+        self.subs_len += 1;
+        var child = AssertionKeys{
+            .where = self.where,
+            .object = value,
+            .parent = self,
+            .parent_slot = slot,
+            .key_prefix = name,
+            .quiet = self.quiet,
+        };
+        for (NARRATIVE) |n| child.mark(n);
+        return child;
+    }
+
+    /// Descend into an object-valued assertion key, run `check` against the
+    /// child tracker, and close the child. Unlike `assertKeyWith`, the callback
+    /// can only consume sub-fields through the tracker, so a corpus field the
+    /// callback does not recognise is reported by `finish()`.
+    pub fn assertObjectWith(
+        self: *AssertionKeys,
+        name: []const u8,
+        actual: anytype,
+        comptime check: fn (@TypeOf(actual), *AssertionKeys) anyerror!void,
+    ) !void {
+        var child = try self.sub(name);
+        check(actual, &child) catch |err| {
+            child.finish() catch {};
+            return err;
+        };
+        try child.finish();
+    }
+
+    /// Optional form of `assertObjectWith`; returns whether the key existed.
+    pub fn assertObjectWithOpt(
+        self: *AssertionKeys,
+        name: []const u8,
+        actual: anytype,
+        comptime check: fn (@TypeOf(actual), *AssertionKeys) anyerror!void,
+    ) !bool {
+        if (!self.has(name)) return false;
+        try self.assertObjectWith(name, actual, check);
+        return true;
+    }
+
+    /// DISCHARGE 2 — KEY SET. Consume the object-valued key `name` and compare its
+    /// KEY SET against `produced`, the set the run actually produced.
+    ///
+    /// Both directions: a fixture key nothing produced and a produced key the
+    /// fixture omits are each failures. For a key whose sub-fields are a
+    /// VOCABULARY rather than data — `codec/nodeid_exact_range.json`'s `outcomes`
+    /// maps outcome tokens to English glosses, and the assertion is which tokens
+    /// exist, not what the glosses say. Descending would demand a comparison for
+    /// each gloss, which pins wording; this pins the vocabulary.
+    pub fn assertKeySet(
+        self: *AssertionKeys,
+        name: []const u8,
+        produced: []const []const u8,
+    ) !void {
+        const expected = try self.required(name);
+        const obj = switch (expected) {
+            .object => |o| o,
+            else => {
+                self.report(
+                    "assertion key '{s}' is not an object, so it has no key set to compare " ++
+                        "(#lzsubblockkeyset)\n",
+                    .{name},
+                );
+                return error.KeySetOnNonObject;
+            },
+        };
+        self.markAsserted(name);
+        self.markObjectChecked(name);
+
+        for (obj.keys()) |declared| {
+            var found = false;
+            for (produced) |p| {
+                if (std.mem.eql(u8, p, declared)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+            self.report(
+                "object-valued assertion key '{s}' declares '{s}' and this run produced no " ++
+                    "such member. The corpus grew a field nothing here answers for " ++
+                    "(#lzsubblockkeyset)\n",
+                .{ name, declared },
+            );
+            return error.ObjectKeySetMismatch;
+        }
+        for (produced) |p| {
+            if (obj.get(p) != null) continue;
+            self.report(
+                "object-valued assertion key '{s}': this run produced '{s}' and the fixture " ++
+                    "does not declare it. A key set is checked in BOTH directions or it is " ++
+                    "not checked (#lzsubblockkeyset)\n",
+                .{ name, p },
+            );
+            return error.ObjectKeySetMismatch;
+        }
+    }
+
+    /// DISCHARGE 3 — WHOLE-VALUE structural equality. `eql` compares object member
+    /// counts at every depth, so this already covers the key set; it is a distinct
+    /// entry point so the guard can SEE that it happened, rather than the fact
+    /// living in a comment beside a generic `assertKeyWith`.
+    pub fn assertKeyStructural(self: *AssertionKeys, name: []const u8, actual: Value) !void {
+        const expected = try self.required(name);
+        self.markAsserted(name);
+        self.markObjectChecked(name);
+        try expectJsonEql(expected, actual);
+    }
+
     /// Consume `name`; null when the fixture does not carry it.
     pub fn field(self: *AssertionKeys, name: []const u8) ?Value {
         self.mark(name);
@@ -594,6 +827,10 @@ pub const AssertionKeys = struct {
     pub fn assertKey(self: *AssertionKeys, name: []const u8, actual: anytype) !void {
         const expected = try self.required(name);
         self.markAsserted(name);
+        // A `Value` actual is compared structurally, and `eql` compares object
+        // member COUNTS at every depth — so this path really does check the key
+        // set and discharges `#lzsubblockkeyset` (see `assertKeyStructural`).
+        if (@TypeOf(actual) == Value) self.markObjectChecked(name);
         try self.compare(name, expected, actual);
     }
 
@@ -604,6 +841,7 @@ pub const AssertionKeys = struct {
     pub fn assertKeyOpt(self: *AssertionKeys, name: []const u8, actual: anytype) !bool {
         const expected = self.field(name) orelse return false;
         self.markAsserted(name);
+        if (@TypeOf(actual) == Value) self.markObjectChecked(name);
         try self.compare(name, expected, actual);
         return true;
     }
@@ -667,7 +905,7 @@ pub const AssertionKeys = struct {
         args: anytype,
     ) error{AssertionValueMismatch} {
         if (!self.quiet) {
-            std.debug.print("{s}: assertion key '{s}' ", .{ self.where, name });
+            self.report("assertion key '{s}' ", .{name});
             std.debug.print(fmt ++ " (#lzconsumednotasserted)\n", args);
         }
         return error.AssertionValueMismatch;
@@ -762,28 +1000,48 @@ pub const AssertionKeys = struct {
         };
     }
 
-    /// Three failure modes, all naming the fixture and the key because "some
+    /// Five failure modes, all naming the fixture and the key because "some
     /// assertion went unread" is not actionable:
     ///
     /// 1. a key the runner never asked for (`#lzassertunknownkeys`);
     /// 2. a key the runner READ but never asserted or excused
     ///    (`#lzconsumednotasserted`);
     /// 3. an excuse for a key the same run also asserted — stale, hiding
-    ///    nothing (`#lzconsumednotasserted`).
+    ///    nothing (`#lzconsumednotasserted`);
+    /// 4. an object-valued key consumed WITHOUT a key-set check
+    ///    (`#lzsubblockkeyset`);
+    /// 5. a `sub()` descend handed out and never finished (`#lzsubblockkeyset`) —
+    ///    otherwise the obligation moves down and is then dropped.
     ///
     /// Keys the corpus declares PROSE are none of this block's business and are
     /// skipped here; `verifyProse` owns them (`#lzprosekeyconvention`).
     pub fn finish(self: *const AssertionKeys) !void {
+        // Close this block's slot in its parent FIRST, so a child that goes on to
+        // fail below still counts as finished and the parent reports the real
+        // failure rather than "a descend was never closed".
+        if (self.parent) |p| p.subs[self.parent_slot].done = true;
+
         for (self.excused[0..self.excused_len]) |e| {
             if (!self.wasAsserted(e.name)) continue;
-            if (self.quiet) return error.StaleAssertionExcuse;
-            std.debug.print(
-                "{s}: assertion key '{s}' is excused (\"{s}\") but this same run asserts " ++
+            self.report(
+                "assertion key '{s}' is excused (\"{s}\") but this same run asserts " ++
                     "it. The excuse is stale and now hides nothing — drop the excuseKey " ++
                     "call (#lzconsumednotasserted)\n",
-                .{ self.where, e.name, e.reason },
+                .{ e.name, e.reason },
             );
             return error.StaleAssertionExcuse;
+        }
+
+        for (self.subs[0..self.subs_len]) |s| {
+            if (s.done) continue;
+            self.report(
+                "object-valued assertion key '{s}' was descended into with sub() and the " ++
+                    "child tracker was never finished. The descend MOVES the unconsumed-key " ++
+                    "obligation down; dropping the child drops it entirely — call " ++
+                    "child.finish() (#lzsubblockkeyset)\n",
+                .{s.name},
+            );
+            return error.SubBlockNotFinished;
         }
 
         const obj = switch (self.object) {
@@ -816,28 +1074,48 @@ pub const AssertionKeys = struct {
                 }
             }
             if (!seen) {
-                if (self.quiet) return error.UnconsumedAssertionKey;
-                std.debug.print(
-                    "{s}: assertion key '{s}' is present in the fixture but was never " ++
+                self.report(
+                    "assertion key '{s}' is present in the fixture but was never " ++
                         "consumed by this runner. Replaying a fixture without evaluating " ++
                         "its assertion reports green while proving nothing — implement the " ++
                         "assertion rather than ignoring the key (#lzassertunknownkeys)\n",
-                    .{ self.where, name },
+                    .{name},
                 );
                 return error.UnconsumedAssertionKey;
             }
 
-            if (self.wasAsserted(name)) continue;
+            // An excuse is the declared "nothing to compare here" channel and it
+            // carries a reason, so it answers for the key set as well as for the
+            // value. Checked BEFORE the object guard for that reason.
             if (self.excuseFor(name) != null) continue;
 
-            if (self.quiet) return error.AssertionKeyReadButNotAsserted;
-            std.debug.print(
-                "{s}: assertion key '{s}' was READ but its value never reached a " ++
+            // Rung `#lzsubblockkeyset`: an OBJECT value carries a key-set
+            // obligation on top of its field values. Reaching a plain assertKeyWith
+            // that picks five sub-fields by name satisfies every other rung here
+            // while a sixth field added upstream is compared by nothing.
+            if (entry.value_ptr.* == .object and !self.wasObjectChecked(name)) {
+                self.report(
+                    "assertion key '{s}' has an OBJECT value and was consumed without a " ++
+                        "key-set check. Its sub-fields are checked one by one and its KEY " ++
+                        "SET by nothing, so a field the corpus adds later is compared by " ++
+                        "nothing and this runner stays green. Descend with sub(\"{s}\") and " ++
+                        "finish the child, compare the vocabulary with assertKeySet(\"{s}\", " ++
+                        "…), or compare the whole value with assertKeyStructural(\"{s}\", …) " ++
+                        "(#lzsubblockkeyset)\n",
+                    .{ name, name, name, name },
+                );
+                return error.ObjectKeyWithoutKeySetCheck;
+            }
+
+            if (self.wasAsserted(name)) continue;
+
+            self.report(
+                "assertion key '{s}' was READ but its value never reached a " ++
                     "comparison. Reading a key marks it consumed and proves nothing — the " ++
                     "fixture could change and this runner would stay green. Assert it with " ++
                     "assertKey/assertKeyWith, or declare excuseKey(\"{s}\", <reason>) " ++
                     "(#lzconsumednotasserted)\n",
-                .{ self.where, name, name },
+                .{ name, name },
             );
             return error.AssertionKeyReadButNotAsserted;
         }
@@ -1259,9 +1537,9 @@ pub fn assertInvalidates(
     comptime reader: []const u8,
     changed: bool,
 ) !void {
-    try keys.assertKeyWith("invalidates", changed, struct {
-        fn check(observed: bool, inv: Value) !void {
-            try std.testing.expectEqual(try asBool(try required(inv, reader)), observed);
+    try keys.assertObjectWith("invalidates", changed, struct {
+        fn check(observed: bool, inv: *AssertionKeys) !void {
+            try inv.assertKey(reader, observed);
         }
     }.check);
 }
@@ -1809,9 +2087,9 @@ test "conformance_json: assertKey compares against the fixture's own value" {
     try keys.assertKey("u", @as(usize, 7));
     try keys.assertKey("f", @as(f64, 1.5));
     try keys.assertKey("n", @as(?[]const u8, null));
-    try keys.assertKeyWith("o", @as(i64, 1), struct {
-        fn check(want_k: i64, v: Value) !void {
-            try std.testing.expectEqual(want_k, try asI64(try required(v, "k")));
+    try keys.assertObjectWith("o", @as(i64, 1), struct {
+        fn check(want_k: i64, object: *AssertionKeys) !void {
+            try object.assertKey("k", want_k);
         }
     }.check);
     try keys.finish();
@@ -1825,4 +2103,27 @@ test "conformance_json: assertKey compares against the fixture's own value" {
         error.AssertionValueMismatch,
         wrong.assertKey("n", @as(?[]const u8, "x")),
     );
+}
+
+test "conformance_json: object callbacks fail on an unrecognised sub-field" {
+    const allocator = std.testing.allocator;
+    var parsed = try json.parseFromSlice(
+        Value,
+        allocator,
+        "{\"o\":{\"k\":1,\"planted_subfield\":0}}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var keys = AssertionKeys.init("fixture", parsed.value);
+    keys.quiet = true;
+    try std.testing.expectError(
+        error.UnconsumedAssertionKey,
+        keys.assertObjectWith("o", @as(i64, 1), struct {
+            fn check(want_k: i64, object: *AssertionKeys) !void {
+                try object.assertKey("k", want_k);
+            }
+        }.check),
+    );
+    try keys.finish();
 }
