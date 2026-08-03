@@ -28,6 +28,23 @@
 //! against a hardcoded copy of the declaration to declared-against-OBSERVED —
 //! a discharge naming a key that only proves the fixture agrees with its own
 //! transcription would be true and worthless.
+//!
+//! `scenario_count` and `codecs` were left behind by that sweep and are fixed
+//! here (`#lznullformblind`): the first compared the fixture's declared count to
+//! `root.scenarios.len`, the second compared `assertions.codecs` to a
+//! hand-written `&.{"json","msgpack"}`. Both stayed green over a runner that
+//! decoded nothing. They now read the scenarios this run replayed to completion
+//! and the decoder branches this run actually fed, which is why `wire_encoding`
+//! and `anti_vacuity` can cite `codecs` at all.
+//!
+//! The raw-wire `key` classifier gets a SECOND WITNESS in the same pass. Its
+//! json arm reads through `std.json`, which is the standard library and shares
+//! nothing with this binding's codec, but its msgpack arm went through
+//! `mp.toJsonValue` — this binding's own unpacker — so an unpacker defect would
+//! have corrupted the control and the thing controlled together. `msgpackKeyForm`
+//! reads the same slot out of the raw bytes (`a3 6b 65 79`, then `0xc0` for nil)
+//! and must agree; `byte_witnessed` is counted so a witness that never runs
+//! cannot agree with everything by silence.
 
 const std = @import("std");
 const cj = @import("conformance_json.zig");
@@ -49,14 +66,25 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
-fn decodeScenario(allocator: std.mem.Allocator, scenario: Value) !ipc.ParsedMessage {
+/// Decode the scenario's wire form THROUGH the codec it names, banking the
+/// codec path that actually ran.
+///
+/// `observed` is written INSIDE the matched branch, immediately before the wire
+/// reaches that decoder (`#lznullformblind`), so the `codecs` assertion after
+/// the loop records which decoders were fed rather than reading the scenario's
+/// own `codec` label back to the fixture. A runner that replays nothing banks an
+/// empty set and reddens.
+fn decodeScenario(allocator: std.mem.Allocator, scenario: Value, observed: *StrSet) !ipc.ParsedMessage {
     const codec = try cj.asStr(try cj.required(scenario, "codec"));
     if (std.mem.eql(u8, codec, "json")) {
-        return IpcMessage.decodeJson(allocator, try cj.asStr(try cj.required(scenario, "wire_json")));
+        const wire = try cj.asStr(try cj.required(scenario, "wire_json"));
+        observed.add("json");
+        return IpcMessage.decodeJson(allocator, wire);
     }
     if (std.mem.eql(u8, codec, "msgpack")) {
         const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
         defer allocator.free(frame);
+        observed.add("msgpack");
         return mp.decode(allocator, frame);
     }
     return error.UnknownCodec;
@@ -123,6 +151,34 @@ fn wireKeyForm(scenario: Value, frame: Value) ![]const u8 {
     };
 }
 
+/// A SECOND witness for the msgpack `key` slot, read at the BYTE level.
+///
+/// `rawWire` is decoder-independent for json — `std.json.parseFromSlice` is the
+/// standard library, not this binding's codec — but its msgpack arm goes through
+/// `mp.toJsonValue`, this binding's own unpacker. A defect there would corrupt
+/// the control and the thing controlled TOGETHER, which is the one way
+/// `wireKeyForm` could agree with a wrong answer.
+///
+/// This reads the frame as bytes instead. `a3 6b 65 79` is the MessagePack
+/// fixstr for `"key"`, and the byte immediately after it is the slot's value:
+/// `0xc0` is nil, `0xa0..0xbf` a fixstr. No occurrence at all is the omitted
+/// form. The marker must be UNIQUE in the frame or the read is ambiguous, so a
+/// second occurrence is an error rather than a first-match guess.
+fn msgpackKeyForm(frame: []const u8) ![]const u8 {
+    const marker = [_]u8{ 0xa3, 'k', 'e', 'y' };
+    const at = std.mem.indexOf(u8, frame, &marker) orelse return "omitted";
+    if (std.mem.indexOf(u8, frame[at + marker.len ..], &marker) != null) {
+        return error.AmbiguousKeyMarkerInFrame;
+    }
+    if (at + marker.len >= frame.len) return error.TruncatedKeySlot;
+    const value = frame[at + marker.len];
+    if (value == 0xc0) return "null";
+    if (value >= 0xa0 and value <= 0xbf) return "present";
+    // str8/str16/str32 would still be a present key, but nothing in this corpus
+    // carries one — say so loudly rather than widen the classifier on a guess.
+    return error.UnclassifiableKeySlotByte;
+}
+
 fn nodeOf(scenario: Value, frame: Value) !Value {
     const field = try cj.asStr(try cj.required(scenario, "field"));
     if (std.mem.eql(u8, field, "snapshot")) {
@@ -154,12 +210,6 @@ fn checkDecodedKey(context: OptStr, expected: Value) anyerror!void {
     }
 }
 
-fn checkStrList(context: []const []const u8, expected: Value) anyerror!void {
-    const want = try cj.asArray(expected);
-    try std.testing.expectEqual(want.len, context.len);
-    for (want, context) |w, got| try std.testing.expectEqualStrings(try cj.asStr(w), got);
-}
-
 /// A small deduplicating set of borrowed strings, for the declared-vs-OBSERVED
 /// vocabulary checks.
 const StrSet = struct {
@@ -188,7 +238,8 @@ const StrSet = struct {
 /// `key_forms` against a literal `&.{"omitted","null","present"}` proves the
 /// fixture agrees with this runner's copy of the fixture. It says nothing about
 /// which forms a scenario actually pushed through the decoder — which is exactly
-/// what `clause` and `anti_vacuity` are discharged by below.
+/// what `clause` and `anti_vacuity` are discharged by below. `codecs` joined
+/// them under `#lznullformblind` for the same reason.
 fn checkDeclaredWereObserved(observed: *const StrSet, expected: Value) anyerror!void {
     const want = try cj.asArray(expected);
     for (want) |w| {
@@ -221,8 +272,6 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
         try cj.asStr(try cj.required(root, "kind")),
     );
 
-    const scenarios_array = try cj.asArray(try cj.required(root, "scenarios"));
-
     // The fixture-scoped prose ledger (`#lzprosekeyconvention`). The paragraphs
     // are discharged after the loop, because every key they name is asserted in a
     // per-scenario `expect` block.
@@ -233,33 +282,39 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
     try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
-    try meta.assertKey("scenario_count", scenarios_array.len);
-    try meta.assertKeyWith("codecs", @as([]const []const u8, &.{ "json", "msgpack" }), checkStrList);
     try meta.excuseKey(
         "generator",
         "names the lazily-spec script that emits this fixture. It is a fact about the " ++
             "CORPUS's build, not about this binding, so there is nothing here to compare " ++
             "it against — lazily-spec's own regeneration check owns it",
     );
-    // `fields` and `key_forms` are asserted AFTER the loop, against what this run
-    // actually observed, so `meta` stays open until then.
+    // `scenario_count`, `codecs`, `fields` and `key_forms` are all asserted
+    // AFTER the loop, against what this run actually observed, so `meta` stays
+    // open until then. `scenario_count` used to read `scenarios_array.len` and
+    // `codecs` a hand-written `&.{"json","msgpack"}` — the fixture compared to a
+    // copy of itself, green over a runner that decodes nothing
+    // (`#lznullformblind`).
 
     // Anti-vacuity in both directions. A runner that never decodes reports
     // "absent" for everything and satisfies all eight omitted/null scenarios;
     // the `present` count is what only a real decode can produce.
     var replayed: usize = 0;
     var keys_decoded: usize = 0;
+    // How many frames the decoder-INDEPENDENT byte scan classified. A witness
+    // that never runs agrees with everything, so it is counted too.
+    var byte_witnessed: usize = 0;
 
     // Declared-vs-OBSERVED vocabularies, checked after the loop.
     var observed_fields: StrSet = .{};
     var observed_key_forms: StrSet = .{};
+    // Banked inside `decodeScenario`, at the branch that feeds each decoder.
+    var observed_codecs: StrSet = .{};
 
     var scenarios = try cj.scenarios(FIXTURE, root);
     while (scenarios.next()) |sc| {
         // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a
         // body that stops short of replaying stops being booked.
         const scenario = try sc.replay();
-        replayed += 1;
 
         const expect = try cj.required(scenario, "expect");
         const field = try cj.asStr(try cj.required(scenario, "field"));
@@ -284,9 +339,30 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
                 return error.WireFormContradictsLabel;
             }
         }
+        // The SECOND witness, for msgpack only: `rawWire`'s msgpack arm is this
+        // binding's own unpacker, so on its own it cannot rule out a defect that
+        // corrupts the control and the thing controlled together. The byte scan
+        // shares no code with it (`#lznullformblind`).
+        if (std.mem.eql(u8, try cj.asStr(try cj.required(scenario, "codec")), "msgpack")) {
+            const frame = try hexToBytes(
+                std.testing.allocator,
+                try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")),
+            );
+            defer std.testing.allocator.free(frame);
+            const byte_form = try msgpackKeyForm(frame);
+            if (!std.mem.eql(u8, byte_form, key_form)) {
+                std.debug.print(
+                    "{s}: scenario '{s}' is labelled key_form '{s}', the unpacker reads " ++
+                        "it as such, and the RAW BYTES carry '{s}'\n",
+                    .{ FIXTURE, try sc.id(), key_form, byte_form },
+                );
+                return error.WireFormContradictsBytes;
+            }
+            byte_witnessed += 1;
+        }
         observed_key_forms.add(key_form);
 
-        var parsed = try decodeScenario(std.testing.allocator, scenario);
+        var parsed = try decodeScenario(std.testing.allocator, scenario, &observed_codecs);
         defer parsed.deinit();
 
         const key: ?[]const u8 = if (std.mem.eql(u8, field, "snapshot"))
@@ -325,10 +401,16 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
             else => return error.UnexpectedVariant,
         });
         try keys.finish();
+        // Booked only once the scenario's every assertion has landed, so
+        // `scenario_count` below counts scenarios REPLAYED rather than
+        // scenarios present in the file.
+        replayed += 1;
     }
 
-    // The vocabulary checks. Declared against what this run OBSERVED, not
-    // against a copy of the declaration — see `checkDeclaredWereObserved`.
+    // The count and the vocabularies. Declared against what this run OBSERVED,
+    // not against a copy of the declaration — see `checkDeclaredWereObserved`.
+    try meta.assertKey("scenario_count", replayed);
+    try meta.assertKeyWith("codecs", &observed_codecs, checkDeclaredWereObserved);
     try meta.assertKeyWith("fields", &observed_fields, checkDeclaredWereObserved);
     try meta.assertKeyWith("key_forms", &observed_key_forms, checkDeclaredWereObserved);
 
@@ -348,6 +430,11 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
     // `omitted` and `null` by design and every `expect` key is identical
     // across the two families.
     try meta.proseKey("wire_encoding", &.{
+        // "json scenarios carry `wire_json` as RAW TEXT and msgpack scenarios
+        // carry `wire_msgpack_hex` as lowercase hex" — two wire carriages, one
+        // per decoder branch, and `codecs` is now the record that BOTH were fed
+        // rather than a copy of the fixture's own list (`#lznullformblind`).
+        "codecs",
         // An ABSENT map entry versus an explicit null / msgpack nil, told apart
         // in the raw frame before the decoder runs...
         "key_forms",
@@ -367,10 +454,16 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
         // The `snapshot`/`node_add` split is the second axis: a runner that only
         // ever reads `NodeSnapshot.key` satisfies half the file.
         "fields",
+        // "one that never decodes at all satisfies all of them" — the observed
+        // codec set is EMPTY for exactly that runner, which is what turns
+        // `codecs` from a restatement into a discharge (`#lznullformblind`).
+        "codecs",
     });
     try meta.finish();
     try cj.verifyProse(&prose);
 
     try std.testing.expectEqual(@as(usize, 12), replayed);
     try std.testing.expectEqual(@as(usize, 4), keys_decoded);
+    // Every msgpack frame went past the unpacker AND past the byte scan.
+    try std.testing.expectEqual(@as(usize, 6), byte_witnessed);
 }

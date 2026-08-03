@@ -25,6 +25,15 @@
 //! real assertion: it is a gloss MAP, not a paragraph, so the assertion is over
 //! its key set — checked against the outcomes this run actually replayed, which
 //! is also what discharges `anti_vacuity`.
+//!
+//! `scenario_count` and `codecs` followed them (`#lznullformblind`).
+//! `scenario_count` read `root.scenarios.len` — the fixture against its own
+//! structure — and `codecs` a hand-written `&.{"json","msgpack"}`. Both were
+//! green over a runner that decoded nothing, which is the vacuity
+//! `anti_vacuity` names, and neither could honestly be cited by any discharge.
+//! They are now the scenarios this run replayed to completion and the decoder
+//! branches this run actually fed, so `wire_encoding` and `anti_vacuity` cite
+//! `codecs` for the half of their claim that is about the codecs running at all.
 
 const std = @import("std");
 const cj = @import("conformance_json.zig");
@@ -46,20 +55,30 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
-/// Decode a scenario's wire frame with the codec it names.
+/// Decode a scenario's wire frame with the codec it names, banking the codec
+/// path that actually ran.
 ///
 /// lazily-zig never refuses anything in this corpus, so a decode error here is
 /// a real failure rather than the `exact_or_reject` branch.
-fn decodeScenario(allocator: std.mem.Allocator, scenario: Value) !ipc.ParsedMessage {
+///
+/// `observed` is written INSIDE the matched branch, immediately before the wire
+/// is handed to that decoder (`#lznullformblind`). The `codecs` assertion after
+/// the loop is therefore a record of which decoders were fed, not a re-reading
+/// of the scenario's own `codec` label — a runner that replays nothing banks an
+/// empty set and reddens.
+fn decodeScenario(allocator: std.mem.Allocator, scenario: Value, observed: *StrSet) !ipc.ParsedMessage {
     const codec = try cj.asStr(try cj.required(scenario, "codec"));
     if (std.mem.eql(u8, codec, "json")) {
         // The raw TEXT through the codec's own entry point, so the parse that
         // would round on a narrower runtime is inside the code under test.
-        return IpcMessage.decodeJson(allocator, try cj.asStr(try cj.required(scenario, "wire_json")));
+        const wire = try cj.asStr(try cj.required(scenario, "wire_json"));
+        observed.add("json");
+        return IpcMessage.decodeJson(allocator, wire);
     }
     if (std.mem.eql(u8, codec, "msgpack")) {
         const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
         defer allocator.free(frame);
+        observed.add("msgpack");
         return mp.decode(allocator, frame);
     }
     return error.UnknownCodec;
@@ -151,11 +170,33 @@ fn checkOutcomeVocabulary(observed: *const StrSet, expected: Value) anyerror!voi
     }
 }
 
-fn checkCodecs(_: void, expected: Value) anyerror!void {
+/// Every value the fixture DECLARES was actually OBSERVED by this run, and
+/// nothing else was.
+///
+/// This replaces a hand-written `&.{"json","msgpack"}` comparison, which proved
+/// that this runner's transcription of the fixture matched the fixture and was
+/// green over a runner that decoded neither codec (`#lznullformblind`). Checked
+/// in both directions: the size equality closes the reverse case, where the run
+/// pushes frames through a codec the fixture never declared.
+fn checkDeclaredWereObserved(observed: *const StrSet, expected: Value) anyerror!void {
     const want = try cj.asArray(expected);
-    try std.testing.expectEqual(@as(usize, 2), want.len);
-    try std.testing.expectEqualStrings("json", try cj.asStr(want[0]));
-    try std.testing.expectEqualStrings("msgpack", try cj.asStr(want[1]));
+    for (want) |w| {
+        const name = try cj.asStr(w);
+        if (!observed.has(name)) {
+            std.debug.print(
+                "{s}: '{s}' is declared but no scenario in this run observed it\n",
+                .{ FIXTURE, name },
+            );
+            return error.DeclaredValueNeverObserved;
+        }
+    }
+    if (want.len != observed.len) {
+        std.debug.print(
+            "{s}: this run observed {d} distinct values against {d} declared\n",
+            .{ FIXTURE, observed.len, want.len },
+        );
+        return error.ObservedValueNotDeclared;
+    }
 }
 
 test "lazily/codec: NodeId exact-representation bound is enforced by refusal, never rounding" {
@@ -176,16 +217,19 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
     try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
-    try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
-    try meta.assertKeyWith("codecs", {}, checkCodecs);
     try meta.excuseKey(
         "generator",
         "names the lazily-spec script that emits this fixture. It is a fact about the " ++
             "CORPUS's build, not about this binding, so there is nothing here to compare " ++
             "it against — lazily-spec's own regeneration check owns it",
     );
-    // `outcomes` is asserted AFTER the loop, against the outcomes this run
-    // actually replayed, so `meta` stays open until then.
+    // `scenario_count`, `codecs` and `outcomes` are all asserted AFTER the loop,
+    // against what this run actually replayed, so `meta` stays open until then.
+    // `scenario_count` used to read `root.scenarios.len` and `codecs` a
+    // hand-written `&.{"json","msgpack"}`; both compared the fixture to a copy
+    // of itself and stayed green over a runner that decoded nothing — the shape
+    // `anti_vacuity` names, sitting inside the guard meant to enforce it
+    // (`#lznullformblind`).
 
     // Anti-vacuity. `exact_or_reject` is satisfied by a runner that decodes
     // nothing, so the count of scenarios this run actually ACCEPTED is the
@@ -193,7 +237,10 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     // corpus, so the expected value is every scenario — anything less is a
     // narrowing of the binding, not of the test.
     var accepted: usize = 0;
+    var replayed: usize = 0;
     var observed_outcomes: StrSet = .{};
+    // Banked inside `decodeScenario`, at the branch that feeds each decoder.
+    var observed_codecs: StrSet = .{};
 
     var scenarios = try cj.scenarios(FIXTURE, root);
     while (scenarios.next()) |sc| {
@@ -205,7 +252,7 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         const decimal = try cj.asStr(try cj.required(expect, "node_id_decimal"));
         const expected = try std.fmt.parseInt(u64, decimal, 10);
 
-        var parsed = try decodeScenario(std.testing.allocator, scenario);
+        var parsed = try decodeScenario(std.testing.allocator, scenario, &observed_codecs);
         defer parsed.deinit();
         accepted += 1;
 
@@ -252,8 +299,15 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         const root_decimal = try std.fmt.bufPrint(&root_decimal_buf, "{d}", .{snapshot.roots[0]});
         try keys.assertKey("root_id_decimal", root_decimal);
         try keys.finish();
+        // Booked only once the scenario's every assertion has landed, so
+        // `scenario_count` below counts scenarios REPLAYED rather than
+        // scenarios present in the file.
+        replayed += 1;
     }
 
+    // The count and the two vocabularies, against what this run actually did.
+    try meta.assertKey("scenario_count", replayed);
+    try meta.assertKeyWith("codecs", &observed_codecs, checkDeclaredWereObserved);
     // The gloss map's key set, against the outcomes this run replayed.
     try meta.assertKeyWith("outcomes", &observed_outcomes, checkOutcomeVocabulary);
 
@@ -269,11 +323,21 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     });
     // PROXY (`#lzprosekeyconvention`). Half of `wire_encoding` is a claim about
     // how the CORPUS carries its bytes, which no run can observe. The half a run
-    // CAN carry is its consequence: "a runner MUST ... compare the decoded
-    // identifier by its decimal RENDERING", and these two are that comparison —
-    // made against a string, so a double-backed runtime cannot round the
-    // expectation before the test reads it.
-    try meta.proseKey("wire_encoding", &.{ "node_id_decimal", "root_id_decimal" });
+    // CAN carry is its consequence: "a runner MUST parse `wire_json` with the
+    // codec under test, not re-serialize a pre-parsed object, and MUST compare
+    // the decoded identifier by its decimal RENDERING".
+    try meta.proseKey("wire_encoding", &.{
+        // "parse ... with the codec under test" — `codecs` is now the record of
+        // which decoders were actually fed, one branch per wire carriage (raw
+        // text for json, raw hex for msgpack), so it discharges the first half
+        // instead of being a copy of the fixture's own list (`#lznullformblind`).
+        "codecs",
+        // ...and the decimal comparison, made against a string, so a
+        // double-backed runtime cannot round the expectation before the test
+        // reads it.
+        "node_id_decimal",
+        "root_id_decimal",
+    });
     try meta.proseKey("anti_vacuity", &.{
         // "the two `exact` scenarios are the control" — the declared outcome
         // vocabulary checked against what this run actually replayed is what
@@ -281,6 +345,11 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         "outcomes",
         "outcome",
         "node_id_decimal",
+        // "`exact_or_reject` alone is satisfied by a runner that never decodes
+        // anything" — the observed codec set is EMPTY for exactly that runner,
+        // which is what makes it a discharge rather than a restatement
+        // (`#lznullformblind`).
+        "codecs",
     });
     try meta.finish();
     try cj.verifyProse(&prose);

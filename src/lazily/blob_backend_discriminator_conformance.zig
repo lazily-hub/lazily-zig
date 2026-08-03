@@ -62,6 +62,27 @@
 //! been satisfied. `proseKey` makes the same statement machine-checkable, and
 //! `verifyProse` refuses the run when a named key never reached a comparison.
 //!
+//! `scenario_count`, `codecs` and `outcomes` were the keys that sweep left
+//! behind, and they are fixed here (`#lznullformblind`). The count compared the
+//! fixture's declaration to `root.scenarios.len`; the other two compared
+//! `assertions.codecs` / `assertions.outcomes` to hand-written
+//! `&.{"json","msgpack"}` / `&.{"accept","reject"}` literals. All three were
+//! green over a runner that decoded nothing, so no discharge could honestly name
+//! them. They now read the scenarios replayed to completion, the decoder
+//! branches actually fed, and the accept/reject verdicts the decodes actually
+//! reached — which is why `clause`, `wire_encoding`, `backend_form_vocabulary`
+//! and `anti_vacuity` can cite them.
+//!
+//! The raw-wire `backend` classifier gets a SECOND WITNESS in the same pass. Its
+//! json arm reads through `std.json`, which is the standard library and shares
+//! nothing with this binding's codec, but its msgpack arm went through
+//! `mp.toJsonValue` — this binding's own unpacker — so an unpacker defect would
+//! have corrupted the control and the thing controlled together.
+//! `msgpackBackendForm` reads the same slot out of the raw bytes
+//! (`a7 62 61 63 6b 65 6e 64`, then nil / fixstr / anything else) and must
+//! agree; `byte_witnessed` is counted so a witness that never runs cannot agree
+//! with everything by silence.
+//!
 //! ONE VERDICT, NOT TWO. `msgpack.decode` unpacks to the same `std.json.Value`
 //! DOM the json decoder consumes and hands it to `ipc.IpcMessage.fromJson`, so
 //! the msgpack half of every scenario pair re-proves the UNPACKER and the
@@ -93,14 +114,24 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// Decode the scenario's wire form THROUGH the codec it names. Both codecs are
 /// exercised because the msgpack decoder is derived from the json one but the
 /// derivation is exactly what a defect would break.
-fn decodeScenario(allocator: std.mem.Allocator, scenario: Value) !ipc.ParsedMessage {
+///
+/// `observed` is written INSIDE the matched branch, immediately before the wire
+/// reaches that decoder (`#lznullformblind`), and on the REJECT path too — the
+/// codec still consumed the frame. The `codecs` assertion after the loop is
+/// therefore a record of which decoders were fed rather than a reading-back of
+/// the scenario's `codec` label, and a runner that replays nothing banks an
+/// empty set and reddens.
+fn decodeScenario(allocator: std.mem.Allocator, scenario: Value, observed: *StrSet) !ipc.ParsedMessage {
     const codec = try cj.asStr(try cj.required(scenario, "codec"));
     if (std.mem.eql(u8, codec, "json")) {
-        return IpcMessage.decodeJson(allocator, try cj.asStr(try cj.required(scenario, "wire_json")));
+        const wire = try cj.asStr(try cj.required(scenario, "wire_json"));
+        observed.add("json");
+        return IpcMessage.decodeJson(allocator, wire);
     }
     if (std.mem.eql(u8, codec, "msgpack")) {
         const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
         defer allocator.free(frame);
+        observed.add("msgpack");
         return mp.decode(allocator, frame);
     }
     return error.UnknownCodec;
@@ -162,6 +193,42 @@ fn reencodedFrame(
     return std.json.parseFromSlice(Value, allocator, encoded, .{});
 }
 
+/// A SECOND witness for the msgpack `backend` slot, read at the BYTE level.
+///
+/// `rawWire` is decoder-independent for json — `std.json.parseFromSlice` is the
+/// standard library, not this binding's codec — but its msgpack arm goes through
+/// `mp.toJsonValue`, this binding's own unpacker. A defect there would corrupt
+/// the control and the thing controlled TOGETHER, which is the one way
+/// `wireBackendForm` could agree with a wrong answer.
+///
+/// This reads the frame as bytes instead. `a7 62 61 63 6b 65 6e 64` is the
+/// MessagePack fixstr for `"backend"`, and what follows is the slot's value:
+/// `0xc0` is nil, `0xa0|len` a fixstr whose bytes are the token itself, and
+/// anything else is the non-string form. No occurrence at all is the omitted
+/// form. The marker must be UNIQUE in the frame or the read is ambiguous.
+fn msgpackBackendForm(frame: []const u8) ![]const u8 {
+    const marker = [_]u8{ 0xa7, 'b', 'a', 'c', 'k', 'e', 'n', 'd' };
+    const at = std.mem.indexOf(u8, frame, &marker) orelse return "omitted";
+    if (std.mem.indexOf(u8, frame[at + marker.len ..], &marker) != null) {
+        return error.AmbiguousBackendMarkerInFrame;
+    }
+    const slot = at + marker.len;
+    if (slot >= frame.len) return error.TruncatedBackendSlot;
+    const value = frame[slot];
+    if (value == 0xc0) return "null";
+    if (value >= 0xa0 and value <= 0xbf) {
+        const len: usize = value & 0x1f;
+        if (slot + 1 + len > frame.len) return error.TruncatedBackendToken;
+        // The TOKEN itself, lifted out of the bytes — `wireBackendForm`'s
+        // vocabulary for a present string is the token, not the word "present".
+        return frame[slot + 1 ..][0..len];
+    }
+    // str8/str16/str32 would still be a token, but no backend name in this
+    // corpus is that long, so anything else here is the non-string form.
+    if (value == 0xd9 or value == 0xda or value == 0xdb) return error.UnexpectedLongBackendToken;
+    return "non_string";
+}
+
 /// The `SharedBlob` descriptor of the frame's first op, schema-lessly.
 fn blobOf(scenario: Value, frame: Value) !Value {
     const variant = try cj.asStr(try cj.required(scenario, "variant"));
@@ -172,14 +239,8 @@ fn blobOf(scenario: Value, frame: Value) !Value {
     return try cj.required(try cj.required(slot, "payload"), "SharedBlob");
 }
 
-fn checkStrList(context: []const []const u8, expected: Value) anyerror!void {
-    const want = try cj.asArray(expected);
-    try std.testing.expectEqual(want.len, context.len);
-    for (want, context) |w, got| try std.testing.expectEqualStrings(try cj.asStr(w), got);
-}
-
-/// A small deduplicating set of borrowed strings, for the three
-/// declared-vs-OBSERVED vocabulary checks below.
+/// A small deduplicating set of borrowed strings, for the declared-vs-OBSERVED
+/// vocabulary checks below.
 const StrSet = struct {
     items: [16][]const u8 = undefined,
     len: usize = 0,
@@ -245,8 +306,6 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         try cj.asStr(try cj.required(root, "kind")),
     );
 
-    const scenarios_array = try cj.asArray(try cj.required(root, "scenarios"));
-
     // The fixture-scoped prose ledger (`#lzprosekeyconvention`). Every discharge
     // below names keys asserted in the per-scenario `expect` blocks, which are
     // reached long after this block is finished — `epoch_disambiguation` is the
@@ -258,24 +317,25 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
     try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
-    try meta.assertKey("scenario_count", scenarios_array.len);
-    try meta.assertKeyWith("codecs", @as([]const []const u8, &.{ "json", "msgpack" }), checkStrList);
-    try meta.assertKeyWith(
-        "outcomes",
-        @as([]const []const u8, &.{ "accept", "reject" }),
-        checkStrList,
-    );
     try meta.excuseKey(
         "generator",
         "names the lazily-spec script that emits this fixture. It is a fact about the " ++
             "CORPUS's build, not about this binding, so there is nothing here to compare " ++
             "it against — lazily-spec's own regeneration check owns it",
     );
-    // `backends`, `backend_forms` and `rejection_kinds` are asserted AFTER the
-    // loop, against what this run actually observed, so `meta` stays open until
-    // then. Declaring a vocabulary and comparing it to a hardcoded copy of
-    // itself — which is what `checkStrList` on `backends` did — proves the
-    // fixture agrees with the runner's transcription of the fixture.
+    // `scenario_count`, `codecs`, `outcomes`, `backends`, `backend_forms` and
+    // `rejection_kinds` are all asserted AFTER the loop, against what this run
+    // actually observed, so `meta` stays open until then. Declaring a vocabulary
+    // and comparing it to a hardcoded copy of itself — which is what
+    // `checkStrList` on `backends` did — proves the fixture agrees with the
+    // runner's transcription of the fixture.
+    //
+    // `scenario_count`, `codecs` and `outcomes` were the three left behind by
+    // that first sweep (`#lznullformblind`): the count read
+    // `scenarios_array.len`, and the other two read hand-written
+    // `&.{"json","msgpack"}` / `&.{"accept","reject"}` literals. All three were
+    // green over a runner that decoded nothing — the vacuity `anti_vacuity`
+    // names, sitting inside the guard meant to enforce it.
 
     // Anti-vacuity counters, one per way to pass without implementing the
     // clause. A runner that never decodes still reports `shm` everywhere and
@@ -290,18 +350,26 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
     var null_form_replayed: usize = 0;
     var non_string_refused: usize = 0;
     var backend_field_emitted: usize = 0;
+    // How many frames the decoder-INDEPENDENT byte scan classified. A witness
+    // that never runs agrees with everything, so it is counted too.
+    var byte_witnessed: usize = 0;
 
     // Declared-vs-OBSERVED vocabularies, checked after the loop.
     var decoded_backends: StrSet = .{};
     var observed_forms: StrSet = .{};
     var observed_rejection_kinds: StrSet = .{};
+    // Banked inside `decodeScenario`, at the branch that feeds each decoder.
+    var observed_codecs: StrSet = .{};
+    // Banked from the VERDICT this run reached — a decode that errored, a decode
+    // that produced a frame — never from the scenario's `outcome` label
+    // (`#lznullformblind`).
+    var observed_outcomes: StrSet = .{};
 
     var scenarios = try cj.scenarios(FIXTURE, root);
     while (scenarios.next()) |sc| {
         // Rung 4 books on the PAYLOAD handoff (#lzscenariobodyskip), so a body
         // that stops short of replaying stops being booked.
         const scenario = try sc.replay();
-        replayed += 1;
 
         const expect = try cj.required(scenario, "expect");
         const outcome = try cj.asStr(try cj.required(scenario, "outcome"));
@@ -326,6 +394,27 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
                 return error.WireFormContradictsLabel;
             }
         }
+        // The SECOND witness, for msgpack only: `rawWire`'s msgpack arm is this
+        // binding's own unpacker, so on its own it cannot rule out a defect that
+        // corrupts the control and the thing controlled together. The byte scan
+        // shares no code with it (`#lznullformblind`).
+        if (std.mem.eql(u8, try cj.asStr(try cj.required(scenario, "codec")), "msgpack")) {
+            const frame = try hexToBytes(
+                std.testing.allocator,
+                try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")),
+            );
+            defer std.testing.allocator.free(frame);
+            const byte_form = try msgpackBackendForm(frame);
+            if (!std.mem.eql(u8, byte_form, form)) {
+                std.debug.print(
+                    "{s}: scenario '{s}' is labelled backend_form '{s}', the unpacker " ++
+                        "reads it as such, and the RAW BYTES carry '{s}'\n",
+                    .{ FIXTURE, try sc.id(), form, byte_form },
+                );
+                return error.WireFormContradictsBytes;
+            }
+            byte_witnessed += 1;
+        }
         observed_forms.add(form);
         if (std.mem.eql(u8, form, "null")) null_form_replayed += 1;
         var keys = cj.AssertionKeys.init(FIXTURE, expect);
@@ -342,7 +431,7 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
             // inferred error sets, and the switch below has to be writable
             // against both without pinning either one's membership.
             const err: anyerror = blk: {
-                if (decodeScenario(std.testing.allocator, scenario)) |ok| {
+                if (decodeScenario(std.testing.allocator, scenario, &observed_codecs)) |ok| {
                     var accepted_frame = ok;
                     accepted_frame.deinit();
                     std.debug.print(
@@ -353,6 +442,9 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
                 } else |e| break :blk e;
             };
             refused += 1;
+            // The OBSERVED verdict: this decode really returned an error. The
+            // scenario's `outcome` label had no part in producing it.
+            observed_outcomes.add("reject");
             try keys.assertKey("rejected", true);
 
             // The refusal has to arrive where callers already catch. A frame
@@ -420,12 +512,18 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
                 try std.testing.expect(!keys.has("error_names_token"));
             }
             try keys.finish();
+            // Booked only once the scenario's every assertion has landed, so
+            // `scenario_count` below counts scenarios REPLAYED rather than
+            // scenarios present in the file.
+            replayed += 1;
             continue;
         }
 
-        var parsed = try decodeScenario(std.testing.allocator, scenario);
+        var parsed = try decodeScenario(std.testing.allocator, scenario, &observed_codecs);
         defer parsed.deinit();
         accepted += 1;
+        // The OBSERVED verdict: this decode really produced a frame.
+        observed_outcomes.add("accept");
         // An accepted frame must leave no diagnostic behind, or the reject
         // assertions above could be satisfied by a decoder that parks a token
         // on every descriptor it sees.
@@ -469,10 +567,15 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         if (present) backend_field_emitted += 1;
         try keys.assertKey("reencoded_backend_field_present", present);
         try keys.finish();
+        replayed += 1;
     }
 
-    // The vocabulary checks. Declared against what this run OBSERVED, not
-    // against a copy of the declaration — see `checkDeclaredWereObserved`.
+    // The count and the vocabulary checks. Declared against what this run
+    // OBSERVED, not against a copy of the declaration — see
+    // `checkDeclaredWereObserved`.
+    try meta.assertKey("scenario_count", replayed);
+    try meta.assertKeyWith("codecs", &observed_codecs, checkDeclaredWereObserved);
+    try meta.assertKeyWith("outcomes", &observed_outcomes, checkDeclaredWereObserved);
     try meta.assertKeyWith("backends", &decoded_backends, checkDeclaredWereObserved);
     try meta.assertKeyWith("backend_forms", &observed_forms, checkDeclaredWereObserved);
     try meta.assertKeyWith("rejection_kinds", &observed_rejection_kinds, checkDeclaredWereObserved);
@@ -492,6 +595,10 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         "rejected",
         "rejection_kind",
         "error_names_token",
+        // Both HALVES of the clause really occurred. `outcomes` is banked from
+        // the verdict each decode reached, so a run that only ever accepted —
+        // or only ever refused — no longer discharges this (`#lznullformblind`).
+        "outcomes",
     });
     // PROXY (`#lzprosekeyconvention`). `wire_encoding` is a claim about how the
     // CORPUS carries its bytes — raw text and hex rather than a pre-parsed
@@ -501,6 +608,11 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
     // forms decode identically, so a label-derived set would have discharged
     // this with nothing.
     try meta.proseKey("wire_encoding", &.{
+        // "json scenarios carry `wire_json` as RAW TEXT and msgpack scenarios
+        // carry `wire_msgpack_hex` as lowercase hex" — two carriages, one per
+        // decoder branch, and `codecs` is now the record that BOTH were fed
+        // rather than a copy of the fixture's own list (`#lznullformblind`).
+        "codecs",
         // An ABSENT map entry, an explicit null and a present short string,
         // observed as distinct forms in the raw frame...
         "backend_forms",
@@ -517,6 +629,9 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         "backends",
         "decoded_backend",
         "backend_forms",
+        // "The seven wire shapes ... each carried in BOTH CODECS" — the observed
+        // codec set is what makes that half of the sentence checkable.
+        "codecs",
     });
     try meta.proseKey("reject_obligation", &.{
         // "`error_names_token` is the assertion that separates them" — refused
@@ -553,6 +668,12 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         "decoded_backend",
         // (3) the ENCODER half.
         "reencoded_backend_field_present",
+        // "TWO CODECS ARE NOT TWO IMPLEMENTATIONS ... a binding whose two codecs
+        // share a decode path should RECORD THAT IN ITS OWN LEDGER rather than
+        // infer independence from the scenario count." `codecs` is that record —
+        // banked at the branch each decoder is fed, so it says which paths ran
+        // and claims nothing about their independence (`#lznullformblind`).
+        "codecs",
     });
     // PROXY (`#lzprosekeyconvention`). `theorem` names `resolve_wrong_backend`, a
     // Lean theorem in lazily-formal; no run in this repo can prove it. What the
@@ -578,6 +699,8 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
     // frames (two omitted, two explicit, two null) round-tripped without
     // growing a `backend` key.
     try std.testing.expectEqual(@as(usize, 4), backend_field_emitted);
+    // Every msgpack frame went past the unpacker AND past the byte scan.
+    try std.testing.expectEqual(@as(usize, 7), byte_witnessed);
 
     // A pass count is not proof that a test ran the scenarios it names — a
     // filtered `zig build test --test-filter ...` can report "N/N passed"

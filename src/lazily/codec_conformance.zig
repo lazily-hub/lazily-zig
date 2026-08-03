@@ -27,6 +27,12 @@
 //! `encoded_body_field_names` / `first_node_encoded_field_names` /
 //! `first_op_encoded_field_names` are the executable form of that rule.
 //!
+//! `scenario_count` is asserted after the replay loop, against the frames this
+//! run really round-tripped (`#lznullformblind`). It used to read
+//! `root.scenarios.len` — the fixture measured against its own structure, which
+//! stays green over a runner that decodes nothing and is therefore the same
+//! vacuity the rungs above exist to catch, sitting inside the guard.
+//!
 //! Both fixtures declare `note` a PARAGRAPH (`#lzprosekeyconvention`). It is the
 //! one reserved annotation name the corpus reclaims: everywhere else `note`
 //! annotates and is exempt by name, and here it states an obligation, so it is
@@ -198,14 +204,16 @@ test "lazily/codec: json frames round-trip through the reference codec" {
     try meta.assertKey("byte_canonical", true);
     try meta.assertKey("required_of_binding", "MUST");
     try meta.assertKey("role", "reference");
-    try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
+    // `scenario_count` is asserted AFTER the loop, against the scenarios this
+    // run really round-tripped (`#lznullformblind`). It used to be compared to
+    // `root.scenarios.len` — the fixture against its own structure, green over a
+    // runner that decodes nothing, which is the exact vacuity
+    // `assertions.anti_vacuity` exists to name.
     // The paragraph's own claim is that `role` and `byte_canonical` are the two
     // senses of "canonical" protocol.md keeps distinct and that BOTH are pinned
     // here — so it is discharged by exactly those two assertions, and a fixture
     // that stopped pinning one would fail rather than keep a true-sounding note.
     try meta.proseKey("note", &.{ "role", "byte_canonical" });
-    try meta.finish();
-    try cj.verifyProse(&prose);
 
     var scenarios = try cj.scenarios(JSON_FIXTURE, root);
     var replayed: usize = 0;
@@ -248,6 +256,14 @@ test "lazily/codec: json frames round-trip through the reference codec" {
         try keys.finish();
         replayed += 1;
     }
+
+    // The count, against the scenarios this run actually ROUND-TRIPPED. Delete
+    // the loop above and this reddens, which is the whole difference from the
+    // `root.scenarios.len` comparison it replaces (`#lznullformblind`).
+    try meta.assertKey("scenario_count", replayed);
+    try meta.finish();
+    try cj.verifyProse(&prose);
+
     try std.testing.expectEqual(@as(usize, 3), replayed);
 }
 
@@ -334,12 +350,12 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
     try meta.assertKey("byte_canonical", false);
     try meta.assertKey("required_of_binding", "MUST");
     try meta.assertKey("role", "cross_language_binary_default");
-    try meta.assertKey("scenario_count", (try cj.asArray(try cj.required(root, "scenarios"))).len);
+    // `scenario_count` is asserted AFTER the loop, against the scenarios this
+    // run really round-tripped (`#lznullformblind`) — see the json half.
     // Its two claims, in its own words: "`byte_canonical: false` is the whole
     // reason this fixture pins decoded values instead of golden bytes", and the
     // named-field encoding "is what `encoded_body_field_names` below verifies".
     try meta.proseKey("note", &.{ "byte_canonical", "encoded_body_field_names" });
-    try meta.finish();
 
     var scenarios = try cj.scenarios(MSGPACK_FIXTURE, root);
     var replayed: usize = 0;
@@ -440,6 +456,12 @@ test "lazily/codec: msgpack frames round-trip through the cross-language binary 
         try keys.finish();
         replayed += 1;
     }
+
+    // The count, against the scenarios this run actually ROUND-TRIPPED through
+    // the msgpack encoder (`#lznullformblind`).
+    try meta.assertKey("scenario_count", replayed);
+    try meta.finish();
     try cj.verifyProse(&prose);
+
     try std.testing.expectEqual(@as(usize, 3), replayed);
 }
