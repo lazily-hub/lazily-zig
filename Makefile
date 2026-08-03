@@ -15,9 +15,13 @@ fmt-fix \
 test \
 test-interop-peer \
 test-lean-formal \
+assertion-ordering-check \
 ci-reach
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage ci-reach
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach
+
+assertion-ordering-check:
+	python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .
 
 # The formatting GATE (#lazilydartzig). This binding had no formatting floor at
 # all — nothing in `check`, nothing in CI — so drift was invisible until someone

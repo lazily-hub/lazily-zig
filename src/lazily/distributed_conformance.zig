@@ -88,6 +88,44 @@ fn expectConverged(rt: *const crdt_plane.CrdtPlaneRuntime, expected: []const Val
 /// model would fail here rather than be replayed against the wrong engine.
 const RESOLUTION_IMPLEMENTED = "max_stamp";
 
+fn expectMaxStampResolution(
+    rt: *const crdt_plane.CrdtPlaneRuntime,
+    ops: []const ipc.CrdtOp,
+    label: []const u8,
+) !void {
+    for (ops) |candidate| {
+        var is_winner = true;
+        for (ops) |rival| {
+            if (rival.node == candidate.node and rival.stamp.compare(candidate.stamp) == .gt) {
+                is_winner = false;
+                break;
+            }
+        }
+        if (!is_winner) continue;
+
+        const got = convergedState(rt, candidate.node) orelse {
+            std.debug.print("{s}: node {d} has no max-stamp winner\n", .{ label, candidate.node });
+            return error.MissingResolutionWinner;
+        };
+        var got_parsed = try cj.encodeToValue(got);
+        defer got_parsed.deinit();
+        var want_parsed = try cj.encodeToValue(candidate.state);
+        defer want_parsed.deinit();
+        try cj.expectJsonEql(want_parsed.value, got_parsed.value);
+    }
+}
+
+const ResolutionCheck = struct {
+    rt: *crdt_plane.CrdtPlaneRuntime,
+    ops: []const ipc.CrdtOp,
+    name: []const u8,
+
+    fn check(self: ResolutionCheck, want: Value) !void {
+        try testing.expectEqualStrings(RESOLUTION_IMPLEMENTED, try cj.asStr(want));
+        try expectMaxStampResolution(self.rt, self.ops, self.name);
+    }
+};
+
 /// `assertKeyWith` context for `converged` — the failure message names the
 /// scenario, so the check needs both the runtime and the name.
 const ConvergeCheck = struct {
@@ -122,11 +160,6 @@ test "distributed conformance: anti_entropy_converge.json" {
             try cj.required(scenario, "expect"),
         );
 
-        // This fixture pins the LWW-at-plane model: the greatest WireStamp
-        // wins. A corpus that grew a second resolution would silently be
-        // replayed against the wrong engine here.
-        try expect.assertKey("resolution", RESOLUTION_IMPLEMENTED);
-
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const ops = try decodeOps(arena.allocator(), try cj.asArray(try cj.required(scenario, "ops")));
@@ -137,6 +170,14 @@ test "distributed conformance: anti_entropy_converge.json" {
 
         const applied = try rt.ingest(ipc.CrdtSync.init(&.{}, ops), 0);
         try expect.assertKey("applied_count", applied);
+        // The rule is asserted after ingest against the winning runtime state.
+        // One corpus conflict puts the lower stamp last, distinguishing this
+        // comparison from arrival-order resolution.
+        try expect.assertKeyWith(
+            "resolution",
+            ResolutionCheck{ .rt = &rt, .ops = ops, .name = name },
+            ResolutionCheck.check,
+        );
         try expect.assertKeyWith(
             "converged",
             ConvergeCheck{ .rt = &rt, .name = name },

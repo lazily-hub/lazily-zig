@@ -133,6 +133,9 @@ jobs:
       - name: Interop peer self-check (#lzinteroppeerci)
         run: zig build interop-peer-check
 
+      - name: Assertion observation ordering (#lzassertordering)
+        run: python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .
+
       # A fixture that lands upstream and is replayed by nobody here must fail
       # the build, not wait to be noticed. Runs on every toolchain in the matrix
       # because the manifest is per-run evidence, not a cached artifact.
