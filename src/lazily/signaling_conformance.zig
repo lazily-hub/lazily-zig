@@ -118,6 +118,26 @@ fn checkServerAssertion(msg: signaling.ServerMessage, name: []const u8, want: Va
     return error.UnhandledAssertion;
 }
 
+/// Carry the decoded frame and the key name into `assertKeyWith`, whose check is
+/// a comptime function and so cannot close over either.
+const ClientAssertion = struct {
+    msg: signaling.ClientMessage,
+    name: []const u8,
+
+    fn check(self: ClientAssertion, want: Value) anyerror!void {
+        return checkClientAssertion(self.msg, self.name, want);
+    }
+};
+
+const ServerAssertion = struct {
+    msg: signaling.ServerMessage,
+    name: []const u8,
+
+    fn check(self: ServerAssertion, want: Value) anyerror!void {
+        return checkServerAssertion(self.msg, self.name, want);
+    }
+};
+
 test "signaling conformance: frames.json" {
     const allocator = testing.allocator;
     var parsed = (try cj.load("signaling/frames.json")) orelse {
@@ -145,6 +165,13 @@ test "signaling conformance: frames.json" {
         // silently dropped frame.
         try testing.expectEqualStrings(variant, try cj.asStr(try cj.required(wire, "type")));
 
+        // Bound through `AssertionKeys` rather than read straight out of the
+        // object (#lznullformblind). The dispatch functions already refuse an
+        // unknown key, but a hand-rolled loop is invisible to every ledger rung:
+        // the bind ledger reports all seventeen of these blocks as never bound,
+        // and the read-but-not-asserted rung cannot reach a key it never saw
+        // declared.
+        var keys = cj.AssertionKeys.init(label, assertions);
         var it = switch (assertions) {
             .object => |o| o.iterator(),
             else => return error.ExpectedObject,
@@ -158,8 +185,9 @@ test "signaling conformance: frames.json" {
             defer msg.deinitDecoded(allocator);
             try testing.expectEqualStrings(variant, std.meta.activeTag(msg).wireName());
             while (it.next()) |entry| {
-                checkClientAssertion(msg, entry.key_ptr.*, entry.value_ptr.*) catch |err| {
-                    std.debug.print("frame `{s}` assertion `{s}` failed\n", .{ label, entry.key_ptr.* });
+                const name = entry.key_ptr.*;
+                keys.assertKeyWith(name, ClientAssertion{ .msg = msg, .name = name }, ClientAssertion.check) catch |err| {
+                    std.debug.print("frame `{s}` assertion `{s}` failed\n", .{ label, name });
                     return err;
                 };
                 assertions_checked += 1;
@@ -176,8 +204,9 @@ test "signaling conformance: frames.json" {
             defer msg.deinitDecoded(allocator);
             try testing.expectEqualStrings(variant, std.meta.activeTag(msg).wireName());
             while (it.next()) |entry| {
-                checkServerAssertion(msg, entry.key_ptr.*, entry.value_ptr.*) catch |err| {
-                    std.debug.print("frame `{s}` assertion `{s}` failed\n", .{ label, entry.key_ptr.* });
+                const name = entry.key_ptr.*;
+                keys.assertKeyWith(name, ServerAssertion{ .msg = msg, .name = name }, ServerAssertion.check) catch |err| {
+                    std.debug.print("frame `{s}` assertion `{s}` failed\n", .{ label, name });
                     return err;
                 };
                 assertions_checked += 1;
@@ -189,6 +218,7 @@ test "signaling conformance: frames.json" {
         } else {
             return error.UnknownFrameDirection;
         }
+        try keys.finish();
     }
 
     const rejects = try cj.asArray(try cj.required(parsed.value, "rejects"));

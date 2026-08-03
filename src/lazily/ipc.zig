@@ -1831,6 +1831,63 @@ test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
 
     // round-trip
     try std.testing.expectEqualSlices(u8, payload, try arena.readBlob(desc));
+
+    // The fixture's `assertions` block (#lznullformblind). Everything above
+    // replays `input` against `expected`; the block below was carried by the
+    // same file and read by NOTHING here — not unread, but unreachable, because
+    // no tracker ever saw it. Rung 0's ledger is what turned that up: the
+    // unconsumed-key and read-but-unasserted rungs are both scoped to blocks a
+    // runner bound, so six silent claims sat here reporting exactly nothing.
+    //
+    // Binding it through `AssertionKeys` rather than reading the keys by hand is
+    // the point — a key the corpus grows later fails as unconsumed instead of
+    // falling through.
+    var keys = cj.AssertionKeys.init("arena_blob.json assertions", try field(root, "assertions"));
+    try keys.assertKey("capacity", arena.capacity());
+    try keys.assertKey("epoch", desc.epoch);
+    try keys.assertKey("payload_len", desc.len);
+    try keys.assertKey("header_len", SHM_BLOB_HEADER_LEN);
+    // `magic` is checked against the bytes the arena really wrote, not against
+    // the constant: comparing SHM_BLOB_MAGIC to itself would pass over a header
+    // writer that stopped emitting it.
+    var magic_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &magic_buf, readU32(arena.bytes[0..SHM_BLOB_HEADER_LEN], 0), .big);
+    try keys.assertKey("magic", &magic_buf);
+    try keys.assertKeyWith("descriptor", desc, struct {
+        fn check(want: ShmBlobRef, expected_descriptor: cj.Value) anyerror!void {
+            try std.testing.expectEqual(
+                try cj.asU64(try cj.required(expected_descriptor, "offset")),
+                want.offset,
+            );
+            try std.testing.expectEqual(
+                try cj.asU64(try cj.required(expected_descriptor, "len")),
+                want.len,
+            );
+            try std.testing.expectEqual(
+                try cj.asU64(try cj.required(expected_descriptor, "generation")),
+                want.generation,
+            );
+            try std.testing.expectEqual(
+                try cj.asU64(try cj.required(expected_descriptor, "epoch")),
+                want.epoch,
+            );
+            try std.testing.expectEqual(
+                try cj.asU64(try cj.required(expected_descriptor, "checksum")),
+                want.checksum,
+            );
+            // The KEY SET, not just the five fields. Without it the block is the
+            // null form one level down: a sixth field added to `descriptor`
+            // upstream would be compared by nothing here, and the corpus
+            // perturbation pass found exactly that — a key planted inside this
+            // object left the suite green while every scalar sibling reddened.
+            const fields = switch (expected_descriptor) {
+                .object => |o| o,
+                else => return error.ExpectedObject,
+            };
+            try std.testing.expectEqual(@as(usize, 5), fields.count());
+        }
+    }.check);
+    try keys.finish();
 }
 
 // ---------------------------------------------------------------------------

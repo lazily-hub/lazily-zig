@@ -216,6 +216,17 @@ fn checkFrameAssertion(sync: ipc.CrdtSync, name: []const u8, want: Value) !void 
     return error.UnhandledAssertion;
 }
 
+/// Carries the decoded frame and the key name into `assertKeyWith`, whose check
+/// is a comptime function and so cannot close over either.
+const FrameAssertion = struct {
+    sync: ipc.CrdtSync,
+    name: []const u8,
+
+    fn check(self: FrameAssertion, want: Value) anyerror!void {
+        return checkFrameAssertion(self.sync, self.name, want);
+    }
+};
+
 test "distributed conformance: crdt_sync_frames.json" {
     const allocator = testing.allocator;
     var parsed = (try cj.load("distributed/crdt_sync_frames.json")) orelse {
@@ -246,17 +257,25 @@ test "distributed conformance: crdt_sync_frames.json" {
         };
 
         const assertions = try cj.required(frame, "assertions");
+        // Bound through `AssertionKeys` rather than read straight out of the
+        // object (#lznullformblind). The dispatch below already refuses an
+        // unknown key, but a hand-rolled loop is invisible to every ledger rung:
+        // the bind ledger reports the block as never bound, and the
+        // read-but-not-asserted rung cannot reach a key it never saw declared.
+        var keys = cj.AssertionKeys.init(label, assertions);
         var it = switch (assertions) {
             .object => |o| o.iterator(),
             else => return error.ExpectedObject,
         };
         while (it.next()) |entry| {
-            checkFrameAssertion(sync, entry.key_ptr.*, entry.value_ptr.*) catch |err| {
-                std.debug.print("frame `{s}` assertion `{s}` failed\n", .{ label, entry.key_ptr.* });
+            const name = entry.key_ptr.*;
+            keys.assertKeyWith(name, FrameAssertion{ .sync = sync, .name = name }, FrameAssertion.check) catch |err| {
+                std.debug.print("frame `{s}` assertion `{s}` failed\n", .{ label, name });
                 return err;
             };
             assertions_checked += 1;
         }
+        try keys.finish();
 
         // Re-encode and compare against the canonical bytes.
         var reencoded = try cj.encodeToValue(decoded.message);

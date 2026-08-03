@@ -65,6 +65,10 @@ pub fn specReadFile(path: []const u8) ![]u8 {
     // evidence. Recording after the successful read also keeps negative loader
     // tests from poisoning the runtime manifest with nonexistent ids.
     record(path);
+    // Rung 0 (`#lznullformblind`): inventory the assertion blocks these bytes
+    // carry, at READ time. Every rung above is scoped to a block a runner bound,
+    // so reading the file is the only moment the corpus's full set is in hand.
+    recordDeclaredBlocks(path, bytes);
     return bytes;
 }
 
@@ -137,6 +141,166 @@ pub fn recordProseVerified(fixture: []const u8) void {
     var buf: [4096]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, PROSE_LINE_PREFIX ++ "{s}", .{id}) catch return;
     append(line);
+}
+
+/// Marks an assertion-BLOCK ledger line (`#lznullformblind`). Same `@`-prefixed
+/// split as the two channels above, so one manifest still carries every evidence
+/// channel with no second file, no second environment variable and no second
+/// build.zig wiring.
+///
+/// Two record shapes:
+///   `@block<TAB>declared<TAB><fixture><TAB><digest><TAB><where>`
+///   `@block<TAB>bound<TAB><digest>`
+pub const BLOCK_LINE_PREFIX = "@block\t";
+
+// ---------------------------------------------------------------------------
+// Rung 0: the assertion-block BIND ledger (`#lznullformblind`)
+// ---------------------------------------------------------------------------
+//
+// Every rung above this one is scoped to a block a runner already handed to an
+// `AssertionKeys` tracker. The unconsumed-key check fires on a key nothing read;
+// the read-but-not-asserted check on a key read and discarded; the prose ledger
+// on a discharge naming nothing. None of them can fire for a block NO runner
+// ever bound, because there is no tracker — its keys are not unread, nothing
+// reads them, and the fixture reports exactly nothing. lazily-dart found two
+// such blocks carrying eight silent keys, one of them the anti-spoof invariant
+// its fixture exists for; lazily-cpp found a third.
+//
+// So `specReadFile` inventories every `assertions` block at READ time and
+// `AssertionKeys.init` books one as BOUND. The two sides are matched by the
+// block's CONTENT digest and never by its `where` label: runners spell those
+// inconsistently (`assertions`, `frames[3].assertions`, `scenarios[warn].expect`)
+// and a label-keyed ledger would silently miss the mismatch instead of reporting
+// it. `scripts/check-conformance-coverage.sh` fails on any inventoried block
+// with no bind.
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn feed(hash: *u64, bytes: []const u8) void {
+    for (bytes) |byte| {
+        hash.* ^= byte;
+        hash.* = hash.* *% FNV_PRIME;
+    }
+}
+
+/// FNV-1a over a structural rendering of `value`.
+///
+/// Hand-rolled rather than routed through `std.json.stringify` on purpose: the
+/// stringify API moved between the three toolchains this repo pins, and a digest
+/// that renders differently under one of them would report every block unbound
+/// on that toolchain alone. Type tags are folded in so `1` and `"1"` cannot
+/// collide, and floats are folded by their exact bits rather than by a formatted
+/// form, which is the other thing that drifts across toolchains.
+fn hashValue(hash: *u64, value: std.json.Value) void {
+    switch (value) {
+        .null => feed(hash, "n"),
+        .bool => |b| feed(hash, if (b) "b1" else "b0"),
+        .integer => |i| {
+            feed(hash, "i");
+            feed(hash, std.mem.asBytes(&i));
+        },
+        .float => |f| {
+            feed(hash, "f");
+            const bits: u64 = @bitCast(f);
+            feed(hash, std.mem.asBytes(&bits));
+        },
+        .number_string => |s| {
+            feed(hash, "N");
+            feed(hash, s);
+        },
+        .string => |s| {
+            feed(hash, "s");
+            feed(hash, s);
+        },
+        .array => |a| {
+            feed(hash, "[");
+            for (a.items) |item| hashValue(hash, item);
+            feed(hash, "]");
+        },
+        .object => |o| {
+            feed(hash, "{");
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                feed(hash, entry.key_ptr.*);
+                feed(hash, "=");
+                hashValue(hash, entry.value_ptr.*);
+            }
+            feed(hash, "}");
+        },
+    }
+}
+
+/// Content key for an assertion block: what it SAYS, not what a runner calls it.
+pub fn blockDigest(value: std.json.Value) u64 {
+    var hash: u64 = FNV_OFFSET;
+    hashValue(&hash, value);
+    return hash;
+}
+
+/// Book an `assertions` block as BOUND. Called from `AssertionKeys.init`, so
+/// every block a runner hands to a tracker is booked whatever it calls it.
+pub fn recordBlockBind(value: std.json.Value) void {
+    if (value != .object) return;
+    var buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        BLOCK_LINE_PREFIX ++ "bound\t{x:0>16}",
+        .{blockDigest(value)},
+    ) catch return;
+    append(line);
+}
+
+fn declareBlock(fixture: []const u8, where: []const u8, block: std.json.Value) void {
+    if (block != .object) return;
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        BLOCK_LINE_PREFIX ++ "declared\t{s}\t{x:0>16}\t{s}",
+        .{ fixture, blockDigest(block), where },
+    ) catch return;
+    append(line);
+}
+
+/// Inventory every `assertions` block a freshly read fixture carries: the
+/// top-level one plus any carried per-frame, per-scenario or per-reject.
+///
+/// Parsing the bytes here rather than asking a runner is the whole point — a
+/// block no runner looks at is exactly the one this rung exists to find. Bad
+/// JSON is silently skipped: bookkeeping never fails a suite, and a fixture that
+/// contributes no declaration shows up downstream as an inventory below the
+/// guard's floor.
+pub fn recordDeclaredBlocks(path: []const u8, bytes: []const u8) void {
+    if (resolveManifestPath() == null) return;
+    const id = canonicalFixtureId(path);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        bytes,
+        .{ .allocate = .alloc_always },
+    ) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const root = parsed.value.object;
+
+    if (root.get("assertions")) |block| declareBlock(id, "assertions", block);
+    for ([_][]const u8{ "frames", "scenarios", "rejects" }) |container| {
+        const items = root.get(container) orelse continue;
+        if (items != .array) continue;
+        for (items.array.items, 0..) |item, index| {
+            if (item != .object) continue;
+            const block = item.object.get("assertions") orelse continue;
+            var where_buf: [128]u8 = undefined;
+            const where = std.fmt.bufPrint(
+                &where_buf,
+                "{s}[{d}].assertions",
+                .{ container, index },
+            ) catch continue;
+            declareBlock(id, where, block);
+        }
+    }
 }
 
 /// `path` reduced to its corpus-relative id, or returned unchanged when it is

@@ -432,6 +432,13 @@ pub const AssertionKeys = struct {
     quiet: bool = false,
 
     pub fn init(where: []const u8, object: Value) AssertionKeys {
+        // Rung 0 (`#lznullformblind`): book this block as BOUND, keyed by its
+        // CONTENT rather than by `where`. Every other rung is scoped to a block a
+        // runner already bound, so a block nothing binds reports nothing at all —
+        // its keys are not unread, nothing reads them. Content keying is what
+        // stops the ledger inheriting the inconsistent spellings runners give
+        // `where`.
+        @import("conformance_manifest.zig").recordBlockBind(object);
         var self = AssertionKeys{ .where = where, .object = object };
         for (NARRATIVE) |name| self.mark(name);
         return self;
