@@ -1225,15 +1225,93 @@ fn parseNodeOnlyOp(value: std.json.Value) !DeltaOp.NodeOnlyOp {
     return .{ .node = try asU64(try field(value, "node")) };
 }
 
+/// The DOCUMENTED decode-error family for a blob descriptor
+/// (`#lzblobbackendstrict`, fixture key `rejection_is_decode_error`).
+///
+/// Refusing the frame is only half of a refusal. Every caller guards a decode
+/// with one `catch` over the codec's errors, so a refusal raised OUTSIDE the
+/// family that `catch` enumerates fails PAST the handler: the frame is still
+/// rejected and the peer still never learns why. Both refusals the clause
+/// requires — a present token outside the enum, and a `backend` that is not a
+/// string at all — therefore have to land inside this set, and this is the set
+/// they land in.
+///
+/// It is deliberately the WHOLE descriptor family rather than just the two
+/// backend errors: the point of the assertion is that a caller who already
+/// handles a malformed `checksum` needs no second handler for a malformed
+/// `backend`.
+pub const BlobDescriptorDecodeError = error{
+    /// The descriptor was not an object.
+    ExpectedObject,
+    /// A required word (`offset`, `len`, `generation`, `epoch`, `checksum`) is absent.
+    MissingField,
+    /// `backend` was present and not a string — the `non_string` reject form.
+    ExpectedString,
+    /// A descriptor word was not a non-negative integer.
+    ExpectedUnsignedInteger,
+    /// A `number_string` word did not parse as `u64`.
+    Overflow,
+    /// As `Overflow` — `std.fmt.parseInt`'s other failure.
+    InvalidCharacter,
+    /// `backend` was a string outside the enum — the `unknown_token` reject
+    /// form. The token itself travels on `BlobBackendKind.takeUnknownToken`.
+    UnknownBlobBackend,
+};
+
+/// The member names of `BlobDescriptorDecodeError`, read off the set itself so
+/// the predicate below cannot drift from the declaration above. A hand-copied
+/// list would answer `false` for a member added later — the family would grow
+/// and the guard would not, which is the same silent-narrowing failure the
+/// clause is about.
+///
+/// `@typeInfo(E).error_set` is `?[]const std.builtin.Type.Error` through 0.16
+/// and a struct carrying `error_names` on 0.17-dev. All three toolchains gate
+/// CI, so this reads through a version shim rather than pinning one — the same
+/// shape as the `Step.tag`/`Step.id` shim in build.zig.
+const BLOB_DECODE_ERROR_NAMES: []const [:0]const u8 = names: {
+    const info = @typeInfo(BlobDescriptorDecodeError).error_set;
+    if (builtin.zig_version.minor >= 17) break :names info.error_names.?;
+    var out: [32][:0]const u8 = undefined;
+    var n: usize = 0;
+    for (info.?) |e| {
+        out[n] = e.name;
+        n += 1;
+    }
+    const frozen = out[0..n].*;
+    break :names &frozen;
+};
+
+/// Whether `err` is a member of `BlobDescriptorDecodeError`.
+///
+/// `anyerror` in, because the codecs return inferred error sets that a caller
+/// (or a conformance runner) has in hand only as a widened value.
+pub fn isBlobDescriptorDecodeError(err: anyerror) bool {
+    const name = @errorName(err);
+    inline for (BLOB_DECODE_ERROR_NAMES) |member| {
+        if (std.mem.eql(u8, name, member)) return true;
+    }
+    return false;
+}
+
 fn parseShmBlobRef(value: std.json.Value) !ShmBlobRef {
-    // Absence is the forward-compatible channel and the only one
-    // (`#lzblobbackendstrict`): an omitted field is `.shm`, a present token
-    // outside the enum fails the whole decode and names itself through
-    // `BlobBackendKind.takeUnknownToken`.
-    const backend: BlobBackendKind = if (objectGet(value, "backend")) |b|
-        try BlobBackendKind.fromString(try asString(b))
-    else
-        .shm;
+    // Absence is the forward-compatible channel (`#lzblobbackendstrict`), and
+    // an explicit `null` is the ABSENT form, not a present-unknown one — the
+    // § NodeKey rule (`#lzkeynullstrict`) applied to this field. A serde-style
+    // peer that did not put `skip_serializing_if` on the optional field emits
+    // `null` where a conforming encoder omits, so refusing the null would make
+    // this binding stricter than the reference implementation on a frame the
+    // reference implementation produces.
+    //
+    // Leniency here is about ABSENCE, not about TYPES: a `backend` that is
+    // present and not a string still fails the decode (`error.ExpectedString`),
+    // and a present token outside the enum fails it while naming itself through
+    // `BlobBackendKind.takeUnknownToken`. Both refusals are members of
+    // `BlobDescriptorDecodeError`.
+    const backend: BlobBackendKind = switch (objectGet(value, "backend") orelse
+        std.json.Value{ .null = {} }) {
+        .null => .shm,
+        else => |b| try BlobBackendKind.fromString(try asString(b)),
+    };
     return .{
         .offset = try asU64(try field(value, "offset")),
         .len = try asU64(try field(value, "len")),
@@ -1538,6 +1616,68 @@ test "lazily/ipc: a present backend discriminator outside the enum is refused, n
     );
     // A successful parse leaves no diagnostic behind.
     try std.testing.expect(BlobBackendKind.takeUnknownToken() == null);
+}
+
+test "lazily/ipc: an explicit backend null is the ABSENT form and decodes as shm" {
+    // `#lzblobbackendstrict` + `#lzkeynullstrict`. A serde-style peer that did
+    // not apply `skip_serializing_if` to the optional field emits `null` where
+    // a conforming encoder omits, so refusing it would be stricter than the
+    // reference implementation ON A FRAME THE REFERENCE IMPLEMENTATION
+    // PRODUCES. It is the absent form, not a present-unknown one — the token
+    // rule never applies, and no diagnostic is parked.
+    const wire =
+        \\{"Delta":{"base_epoch":2,"epoch":3,"ops":[{"CellSet":{"node":1,"payload":
+        \\{"SharedBlob":{"offset":32,"len":4,"generation":9,"epoch":3,"checksum":7,
+        \\"backend":null}}}}]}}
+    ;
+    _ = BlobBackendKind.takeUnknownToken();
+    var parsed = try IpcMessage.decodeJson(std.testing.allocator, wire);
+    defer parsed.deinit();
+    const blob = parsed.message.Delta.ops[0].CellSet.payload.SharedBlob;
+    try std.testing.expectEqual(BlobBackendKind.shm, blob.backend);
+    // An accepted frame must leave no token behind, or the refusal assertions
+    // above could be satisfied by a decoder that parks one on every descriptor.
+    try std.testing.expect(BlobBackendKind.takeUnknownToken() == null);
+
+    // The encoder half: the null does not survive the round trip, because
+    // `.shm` is omitted. So the leniency is a DECODER fact only and this
+    // binding never emits the non-conforming form it accepts.
+    const re = try parsed.message.encodeJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(re);
+    try std.testing.expect(std.mem.indexOf(u8, re, "backend") == null);
+}
+
+test "lazily/ipc: a non-string backend is refused through the documented decode-error family" {
+    // The clause is written entirely about TOKENS, so a decoder whose reader
+    // coerces rather than refuses on a number in a string position normalizes
+    // silently here while passing every token scenario.
+    //
+    // The second half is the one that is easy to lose: the refusal has to
+    // arrive through the family every caller already guards a decode with. A
+    // refusal raised outside it fails PAST the handler — the frame is still
+    // rejected and the peer still never sees the error.
+    const wire =
+        \\{"Delta":{"base_epoch":2,"epoch":3,"ops":[{"CellSet":{"node":1,"payload":
+        \\{"SharedBlob":{"offset":32,"len":4,"generation":9,"epoch":3,"checksum":7,
+        \\"backend":7}}}}]}}
+    ;
+    _ = BlobBackendKind.takeUnknownToken();
+    try std.testing.expectError(
+        error.ExpectedString,
+        IpcMessage.decodeJson(std.testing.allocator, wire),
+    );
+    try std.testing.expect(isBlobDescriptorDecodeError(error.ExpectedString));
+    // There is no token to name, so nothing may be parked: a decoder that
+    // parked the empty string here would satisfy `error_names_token` for the
+    // NEXT frame it refused.
+    try std.testing.expect(BlobBackendKind.takeUnknownToken() == null);
+
+    // Both refusals the clause requires are in ONE family, which is what makes
+    // a single `catch` on the caller's side sufficient.
+    try std.testing.expect(isBlobDescriptorDecodeError(error.UnknownBlobBackend));
+    // ...and the family is a set, not a synonym for "any error at all".
+    try std.testing.expect(!isBlobDescriptorDecodeError(error.OutOfMemory));
+    try std.testing.expect(!isBlobDescriptorDecodeError(error.UnknownIpcMessage));
 }
 
 test "lazily/ipc: an over-long backend token is truncated into the diagnostic, never dropped" {

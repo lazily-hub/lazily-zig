@@ -385,14 +385,22 @@ fi
 # from "nothing was examined", so assert the MAGNITUDE explicitly before
 # printing OK.
 #
-# Calibrated from a real `make test` run: 115/139 fixtures OPENED and 94/94
+# Calibrated from a real `make test` run: 115/139 fixtures OPENED and 100/100
 # scenarios REPLAYED. The floors sit just below those, low enough not to trip on
 # a single upstream fixture landing without a runner, high enough that a
 # detached recorder or a short-circuited dispatch cannot slip through. Do NOT
 # lower them to fix a red run — a drop here means the corpus or the recorder
 # shrank, and that is the finding.
+#
+# The scenario floor moved 80 -> 86 when `codec/blob_backend_discriminator.json`
+# hardened to v2: the fixture went from 8 scenarios to 14 (seven wire shapes x
+# two codecs), and the ledger from 94 replayed to 100. A floor that stayed at 80
+# would have absorbed the whole increase and then some — the six new scenarios
+# could ALL have stopped being dispatched with this guard still green. The floor
+# tracks the increment, not the total, so the margin the paragraph above
+# describes is preserved rather than spent.
 MIN_FIXTURES="${MIN_FIXTURES:-110}"
-MIN_SCENARIOS="${MIN_SCENARIOS:-80}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-86}"
 
 if [ "$total" -eq 0 ]; then
   echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2
