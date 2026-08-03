@@ -121,16 +121,25 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// therefore a record of which decoders were fed rather than a reading-back of
 /// the scenario's `codec` label, and a runner that replays nothing banks an
 /// empty set and reddens.
-fn decodeScenario(allocator: std.mem.Allocator, scenario: Value, observed: *StrSet) !ipc.ParsedMessage {
+fn decodeScenario(
+    allocator: std.mem.Allocator,
+    scenario: Value,
+    keys: *cj.AssertionKeys,
+    observed: *StrSet,
+) !ipc.ParsedMessage {
     const codec = try cj.asStr(try cj.required(scenario, "codec"));
     if (std.mem.eql(u8, codec, "json")) {
         const wire = try cj.asStr(try cj.required(scenario, "wire_json"));
+        var digest: [16]u8 = undefined;
+        try keys.assertKey("wire_input_fnv1a64", cj.wireInputFnv1a64Hex(wire, &digest));
         observed.add("json");
         return IpcMessage.decodeJson(allocator, wire);
     }
     if (std.mem.eql(u8, codec, "msgpack")) {
         const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
         defer allocator.free(frame);
+        var digest: [16]u8 = undefined;
+        try keys.assertKey("wire_input_fnv1a64", cj.wireInputFnv1a64Hex(frame, &digest));
         observed.add("msgpack");
         return mp.decode(allocator, frame);
     }
@@ -431,7 +440,7 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
             // inferred error sets, and the switch below has to be writable
             // against both without pinning either one's membership.
             const err: anyerror = blk: {
-                if (decodeScenario(std.testing.allocator, scenario, &observed_codecs)) |ok| {
+                if (decodeScenario(std.testing.allocator, scenario, &keys, &observed_codecs)) |ok| {
                     var accepted_frame = ok;
                     accepted_frame.deinit();
                     std.debug.print(
@@ -519,7 +528,7 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
             continue;
         }
 
-        var parsed = try decodeScenario(std.testing.allocator, scenario, &observed_codecs);
+        var parsed = try decodeScenario(std.testing.allocator, scenario, &keys, &observed_codecs);
         defer parsed.deinit();
         accepted += 1;
         // The OBSERVED verdict: this decode really produced a frame.
@@ -600,27 +609,10 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
         // or only ever refused — no longer discharges this (`#lznullformblind`).
         "outcomes",
     });
-    // PROXY (`#lzprosekeyconvention`). `wire_encoding` is a claim about how the
-    // CORPUS carries its bytes — raw text and hex rather than a pre-parsed
-    // object — which no assertion a run makes can observe directly. The honest
-    // proxy is the form vocabulary, and it is only honest because
-    // `observed_forms` is now banked from the RAW WIRE SLOT: the three `shm`
-    // forms decode identically, so a label-derived set would have discharged
-    // this with nothing.
     try meta.proseKey("wire_encoding", &.{
-        // "json scenarios carry `wire_json` as RAW TEXT and msgpack scenarios
-        // carry `wire_msgpack_hex` as lowercase hex" — two carriages, one per
-        // decoder branch, and `codecs` is now the record that BOTH were fed
-        // rather than a copy of the fixture's own list (`#lznullformblind`).
-        "codecs",
-        // An ABSENT map entry, an explicit null and a present short string,
-        // observed as distinct forms in the raw frame...
-        "backend_forms",
-        // ...and read back off the RE-ENCODED frame, which is the only place
-        // "emitted `shm`" and "omitted `shm`" differ.
-        "reencoded_backend_field_present",
-        // The two schema-INVALID reject frames reached a decoder at all.
-        "rejected",
+        // Executable proof that the exact raw text / decoded-hex byte buffer
+        // reaches the library decoder rather than a reconstructed proxy.
+        "wire_input_fnv1a64",
     });
     try meta.proseKey("backend_form_vocabulary", &.{
         // Its own words: "every backend in `assertions.backends` appears as the

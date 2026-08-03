@@ -13,6 +13,22 @@
 
 const std = @import("std");
 
+/// Lowercase, zero-padded FNV-1a 64 over the exact wire bytes a runner decodes.
+pub fn wireInputFnv1a64Hex(bytes: []const u8, out: *[16]u8) []const u8 {
+    var hash: u64 = 0xcbf29ce484222325;
+    for (bytes) |byte| {
+        hash ^= byte;
+        hash *%= 0x100000001b3;
+    }
+    const digits = "0123456789abcdef";
+    var value = hash;
+    for (0..out.len) |i| {
+        out[out.len - i - 1] = digits[@intCast(value & 0xf)];
+        value >>= 4;
+    }
+    return out;
+}
+
 pub const json = std.json;
 pub const Value = json.Value;
 

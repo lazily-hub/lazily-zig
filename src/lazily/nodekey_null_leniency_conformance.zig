@@ -74,16 +74,25 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// the loop records which decoders were fed rather than reading the scenario's
 /// own `codec` label back to the fixture. A runner that replays nothing banks an
 /// empty set and reddens.
-fn decodeScenario(allocator: std.mem.Allocator, scenario: Value, observed: *StrSet) !ipc.ParsedMessage {
+fn decodeScenario(
+    allocator: std.mem.Allocator,
+    scenario: Value,
+    keys: *cj.AssertionKeys,
+    observed: *StrSet,
+) !ipc.ParsedMessage {
     const codec = try cj.asStr(try cj.required(scenario, "codec"));
     if (std.mem.eql(u8, codec, "json")) {
         const wire = try cj.asStr(try cj.required(scenario, "wire_json"));
+        var digest: [16]u8 = undefined;
+        try keys.assertKey("wire_input_fnv1a64", cj.wireInputFnv1a64Hex(wire, &digest));
         observed.add("json");
         return IpcMessage.decodeJson(allocator, wire);
     }
     if (std.mem.eql(u8, codec, "msgpack")) {
         const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
         defer allocator.free(frame);
+        var digest: [16]u8 = undefined;
+        try keys.assertKey("wire_input_fnv1a64", cj.wireInputFnv1a64Hex(frame, &digest));
         observed.add("msgpack");
         return mp.decode(allocator, frame);
     }
@@ -362,7 +371,12 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
         }
         observed_key_forms.add(key_form);
 
-        var parsed = try decodeScenario(std.testing.allocator, scenario, &observed_codecs);
+        var keys = cj.AssertionKeys.init(FIXTURE, expect);
+        // Into the SAME ledger as the `assertions` block: a discharge names keys
+        // by name in any block of this fixture (`#lzprosekeyconvention`).
+        try keys.trackProse(&prose);
+
+        var parsed = try decodeScenario(std.testing.allocator, scenario, &keys, &observed_codecs);
         defer parsed.deinit();
 
         const key: ?[]const u8 = if (std.mem.eql(u8, field, "snapshot"))
@@ -373,10 +387,6 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
         };
         if (key != null) keys_decoded += 1;
 
-        var keys = cj.AssertionKeys.init(FIXTURE, expect);
-        // Into the SAME ledger as the `assertions` block: a discharge names keys
-        // by name in any block of this fixture (`#lzprosekeyconvention`).
-        try keys.trackProse(&prose);
         // The decode half: omitted and explicit-null must both arrive absent.
         try keys.assertKeyWith("decoded_key", OptStr{ .value = key }, checkDecodedKey);
 
@@ -422,25 +432,10 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
         "decoded_key",
         "key_forms",
     });
-    // PROXY (`#lzprosekeyconvention`). `wire_encoding` is a claim about how the
-    // CORPUS carries its bytes, which no assertion a run makes can observe
-    // directly. `key_forms` is the honest proxy ONLY because `observed_key_forms`
-    // is banked from the raw wire slot — a label-derived set would have made
-    // this paragraph dischargeable by nothing, since the decoder collapses
-    // `omitted` and `null` by design and every `expect` key is identical
-    // across the two families.
     try meta.proseKey("wire_encoding", &.{
-        // "json scenarios carry `wire_json` as RAW TEXT and msgpack scenarios
-        // carry `wire_msgpack_hex` as lowercase hex" — two wire carriages, one
-        // per decoder branch, and `codecs` is now the record that BOTH were fed
-        // rather than a copy of the fixture's own list (`#lznullformblind`).
-        "codecs",
-        // An ABSENT map entry versus an explicit null / msgpack nil, told apart
-        // in the raw frame before the decoder runs...
-        "key_forms",
-        "decoded_key",
-        // ...and whether the re-encoded frame carries the field at all.
-        "reencoded_key_field_present",
+        // Executable proof that the exact raw text / decoded-hex byte buffer
+        // reaches the library decoder rather than a reconstructed proxy.
+        "wire_input_fnv1a64",
     });
     // "A runner MUST re-encode the decoded message and inspect the resulting
     // frame for the presence of the field" — this is that inspection.

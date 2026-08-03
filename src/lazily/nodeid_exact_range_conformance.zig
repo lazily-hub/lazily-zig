@@ -66,18 +66,27 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// the loop is therefore a record of which decoders were fed, not a re-reading
 /// of the scenario's own `codec` label — a runner that replays nothing banks an
 /// empty set and reddens.
-fn decodeScenario(allocator: std.mem.Allocator, scenario: Value, observed: *StrSet) !ipc.ParsedMessage {
+fn decodeScenario(
+    allocator: std.mem.Allocator,
+    scenario: Value,
+    keys: *cj.AssertionKeys,
+    observed: *StrSet,
+) !ipc.ParsedMessage {
     const codec = try cj.asStr(try cj.required(scenario, "codec"));
     if (std.mem.eql(u8, codec, "json")) {
         // The raw TEXT through the codec's own entry point, so the parse that
         // would round on a narrower runtime is inside the code under test.
         const wire = try cj.asStr(try cj.required(scenario, "wire_json"));
+        var digest: [16]u8 = undefined;
+        try keys.assertKey("wire_input_fnv1a64", cj.wireInputFnv1a64Hex(wire, &digest));
         observed.add("json");
         return IpcMessage.decodeJson(allocator, wire);
     }
     if (std.mem.eql(u8, codec, "msgpack")) {
         const frame = try hexToBytes(allocator, try cj.asStr(try cj.required(scenario, "wire_msgpack_hex")));
         defer allocator.free(frame);
+        var digest: [16]u8 = undefined;
+        try keys.assertKey("wire_input_fnv1a64", cj.wireInputFnv1a64Hex(frame, &digest));
         observed.add("msgpack");
         return mp.decode(allocator, frame);
     }
@@ -252,7 +261,12 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         const decimal = try cj.asStr(try cj.required(expect, "node_id_decimal"));
         const expected = try std.fmt.parseInt(u64, decimal, 10);
 
-        var parsed = try decodeScenario(std.testing.allocator, scenario, &observed_codecs);
+        var keys = cj.AssertionKeys.init(FIXTURE, expect);
+        // Into the SAME ledger as the `assertions` block: a discharge names keys
+        // by name in any block of this fixture (`#lzprosekeyconvention`).
+        try keys.trackProse(&prose);
+
+        var parsed = try decodeScenario(std.testing.allocator, scenario, &keys, &observed_codecs);
         defer parsed.deinit();
         accepted += 1;
 
@@ -262,10 +276,6 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         };
         try std.testing.expectEqualStrings("Snapshot", try cj.asStr(try cj.required(scenario, "variant")));
 
-        var keys = cj.AssertionKeys.init(FIXTURE, expect);
-        // Into the SAME ledger as the `assertions` block: a discharge names keys
-        // by name in any block of this fixture (`#lzprosekeyconvention`).
-        try keys.trackProse(&prose);
         try keys.assertKey("epoch", snapshot.epoch);
         try keys.assertKey("node_count", snapshot.nodes.len);
 
@@ -321,22 +331,10 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
         "root_id_decimal",
         "outcome",
     });
-    // PROXY (`#lzprosekeyconvention`). Half of `wire_encoding` is a claim about
-    // how the CORPUS carries its bytes, which no run can observe. The half a run
-    // CAN carry is its consequence: "a runner MUST parse `wire_json` with the
-    // codec under test, not re-serialize a pre-parsed object, and MUST compare
-    // the decoded identifier by its decimal RENDERING".
     try meta.proseKey("wire_encoding", &.{
-        // "parse ... with the codec under test" — `codecs` is now the record of
-        // which decoders were actually fed, one branch per wire carriage (raw
-        // text for json, raw hex for msgpack), so it discharges the first half
-        // instead of being a copy of the fixture's own list (`#lznullformblind`).
-        "codecs",
-        // ...and the decimal comparison, made against a string, so a
-        // double-backed runtime cannot round the expectation before the test
-        // reads it.
-        "node_id_decimal",
-        "root_id_decimal",
+        // Executable proof that the exact raw text / decoded-hex byte buffer
+        // reaches the library decoder rather than a reconstructed proxy.
+        "wire_input_fnv1a64",
     });
     try meta.proseKey("anti_vacuity", &.{
         // "the two `exact` scenarios are the control" — the declared outcome
