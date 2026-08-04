@@ -129,6 +129,7 @@ pub const ChartDef = struct {
                 i += 1;
             }
         }
+        _ = try resolveName(&index_of, top_initial.string);
 
         // Second pass: parse each state, resolving name references to indices.
         const states = try a.alloc(StateDef, count);
@@ -382,7 +383,7 @@ fn parseState(a: std.mem.Allocator, index_of: *const std.StringHashMapUnmanaged(
     const initial: ?Index = if (o.get("initial")) |v| try resolveName(index_of, try stringValue(v)) else null;
     const default: ?Index = if (o.get("default")) |v| try resolveName(index_of, try stringValue(v)) else null;
 
-    const kind: Kind = blk: {
+    const inferred: Kind = blk: {
         if (o.get("history")) |hv| {
             const hs = switch (hv) {
                 .string => |s| s,
@@ -392,11 +393,6 @@ fn parseState(a: std.mem.Allocator, index_of: *const std.StringHashMapUnmanaged(
             if (std.mem.eql(u8, hs, "deep")) break :blk .history_deep;
             return error.UnknownHistoryKind;
         }
-        // `parallel` and `kind` fail closed the same way `history` above already
-        // does (#lzscenariobodyskip). Both used to be "match the one spelling I
-        // know, otherwise fall through": a `parallel` that was not a bool, or a
-        // `kind` other than `final`, silently produced a compound/atomic state
-        // and the chart replayed green against a shape the fixture never named.
         if (o.get("parallel")) |pv| {
             const parallel = switch (pv) {
                 .bool => |b| b,
@@ -404,17 +400,36 @@ fn parseState(a: std.mem.Allocator, index_of: *const std.StringHashMapUnmanaged(
             };
             if (parallel) break :blk .parallel;
         }
-        if (o.get("kind")) |kv| {
-            const ks = switch (kv) {
-                .string => |s| s,
-                else => return error.UnknownStateKind,
-            };
-            if (!std.mem.eql(u8, ks, "final")) return error.UnknownStateKind;
-            break :blk .final;
-        }
         if (initial != null) break :blk .compound;
         break :blk .atomic;
     };
+    const kind: Kind = if (o.get("kind")) |kv| declared: {
+        const ks = switch (kv) {
+            .string => |s| s,
+            else => return error.UnknownStateKind,
+        };
+        if (std.mem.eql(u8, ks, "final")) {
+            if (inferred != .atomic) return error.ContradictoryStateKind;
+            break :declared .final;
+        }
+        const agrees =
+            (std.mem.eql(u8, ks, "atomic") and inferred == .atomic) or
+            (std.mem.eql(u8, ks, "compound") and inferred == .compound) or
+            (std.mem.eql(u8, ks, "parallel") and inferred == .parallel) or
+            (std.mem.eql(u8, ks, "history") and
+                (inferred == .history_shallow or inferred == .history_deep));
+        if (!agrees) {
+            if (std.mem.eql(u8, ks, "atomic") or
+                std.mem.eql(u8, ks, "compound") or
+                std.mem.eql(u8, ks, "parallel") or
+                std.mem.eql(u8, ks, "history"))
+            {
+                return error.ContradictoryStateKind;
+            }
+            return error.UnknownStateKind;
+        }
+        break :declared inferred;
+    } else inferred;
 
     var transitions = std.StringHashMapUnmanaged(Transition){};
     if (o.get("on")) |onv| {
@@ -461,7 +476,10 @@ fn parseTransition(a: std.mem.Allocator, index_of: *const std.StringHashMapUnman
                 .object => return error.UnsupportedExprGuard,
                 else => return error.GuardMustBeString,
             } else null;
-            const internal = if (o.get("internal")) |iv| (iv == .bool and iv.bool) else false;
+            const internal = if (o.get("internal")) |iv| switch (iv) {
+                .bool => |b| b,
+                else => return error.InternalMustBeBoolean,
+            } else false;
             return Transition{
                 .target = try resolveName(index_of, target_s),
                 .guard = guard,
@@ -922,6 +940,27 @@ test "lazily/statechart conformance: history_deep" {
 
 test "lazily/statechart conformance: entry_exit_actions" {
     try runFixture(@embedFile("test/statechart/entry_exit_actions.json"));
+}
+
+test "lazily/statechart conformance: malformed charts are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        @embedFile("test/statechart/malformed_rejected.json"),
+        .{},
+    );
+    const cases = parsed.value.object.get("cases").?.array;
+    try std.testing.expect(cases.items.len > 0);
+    for (cases.items) |scenario| {
+        const chart = scenario.object.get("chart").?;
+        if (ChartDef.parse(std.testing.allocator, chart)) |accepted| {
+            var def = accepted;
+            def.deinit();
+            return error.MalformedStatechartAccepted;
+        } else |_| {}
+    }
 }
 
 test "lazily/statechart: a guard the host did not supply blocks the transition" {

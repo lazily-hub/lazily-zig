@@ -448,6 +448,7 @@ const VENDORED_MIRRORS = [_][]const u8{
     "statechart/hierarchical_player.json",
     "statechart/history_deep.json",
     "statechart/history_shallow.json",
+    "statechart/malformed_rejected.json",
     "statechart/parallel_regions.json",
 };
 
