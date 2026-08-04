@@ -578,11 +578,45 @@ fn nextFileRecord(data: []const u8, offset: *usize) OutboxJournalError!?FileReco
     };
 }
 
+fn appendFixtureFileRecord(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    record: std.json.Value,
+    byte_limit: ?usize,
+) !void {
+    const object = record.object;
+    const op_name = object.get("op").?.string;
+    const op: u8 = if (std.mem.eql(u8, op_name, "put"))
+        @intFromEnum(FileRecordOp.put)
+    else if (std.mem.eql(u8, op_name, "delete"))
+        @intFromEnum(FileRecordOp.delete)
+    else if (std.mem.eql(u8, op_name, "cursor"))
+        @intFromEnum(FileRecordOp.cursor)
+    else
+        0xff;
+    const frame_items = if (object.get("frame")) |frame| frame.array.items else &.{};
+    var header: [file_record_header_len]u8 = undefined;
+    header[0] = op;
+    std.mem.writeInt(u64, header[1..9], @intCast(object.get("epoch").?.integer), .little);
+    std.mem.writeInt(u64, header[9..17], frame_items.len, .little);
+
+    const full_len = header.len + frame_items.len;
+    const keep = @min(byte_limit orelse full_len, full_len);
+    const header_keep = @min(keep, header.len);
+    try out.appendSlice(allocator, header[0..header_keep]);
+    if (keep > header.len) {
+        for (frame_items[0 .. keep - header.len]) |byte| {
+            try out.append(allocator, @intCast(byte.integer));
+        }
+    }
+}
+
 fn storedFrameLessThan(_: void, a: StoredOutboxFrame, b: StoredOutboxFrame) bool {
     return a.epoch < b.epoch;
 }
 
 const fixture_outbox_store = @embedFile("test/reliable-sync/outbox_store_protocol.json");
+const fixture_outbox_journal = @embedFile("test/reliable-sync/outbox_journal_decode.json");
 
 // Corpus-relative ids for the runtime scenario ledger (#lzscenariocoverage).
 // The fixtures themselves are replayed from the vendored copies above, which a
@@ -591,6 +625,7 @@ const RS_RESYNC = "reliable-sync/resync_gap_converge.json";
 const RS_IDEMPOTENT = "reliable-sync/idempotent_redelivery.json";
 const RS_MULTI_EPOCH = "reliable-sync/multi_epoch_delta.json";
 const RS_OUTBOX_REPLAY = "reliable-sync/outbox_replay_after_crash.json";
+const RS_OUTBOX_JOURNAL = "reliable-sync/outbox_journal_decode.json";
 const RS_OUTBOX_STORE = "reliable-sync/outbox_store_protocol.json";
 const RS_LIVENESS = "reliable-sync/liveness_orset_lww.json";
 
@@ -2034,6 +2069,120 @@ test "sync_driver: full-duplex gap then snapshot converges" {
     // A ResyncRequest{from:2} and an OutboxAck{through:4} crossed the wire.
     try testing.expect(h.wire.sawResyncRequest(2));
     try testing.expect(h.wire.sawOutboxAck(4));
+}
+
+test "outbox journal decode replays canonical unknown/torn opposites" {
+    const allocator = testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        fixture_outbox_journal,
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "ReliableSync",
+        parsed.value.object.get("kind").?.string,
+    );
+    try testing.expectEqualStrings(
+        "OutboxJournalDecode",
+        parsed.value.object.get("model").?.string,
+    );
+
+    var scenarios = try cj.scenarios(RS_OUTBOX_JOURNAL, parsed.value);
+    try testing.expectEqual(@as(usize, 2), scenarios.len());
+    while (scenarios.next()) |view| {
+        const scenario = try view.replay();
+        const sc = scenario.object;
+        var journal = std.ArrayList(u8).empty;
+        defer journal.deinit(allocator);
+        for (sc.get("records").?.array.items) |record| {
+            try appendFixtureFileRecord(&journal, allocator, record, null);
+        }
+        if (sc.get("tail_fault")) |tail| {
+            try testing.expectEqualStrings(
+                "torn_record",
+                tail.object.get("kind").?.string,
+            );
+            try appendFixtureFileRecord(
+                &journal,
+                allocator,
+                tail,
+                @intCast(tail.object.get("keep_bytes").?.integer),
+            );
+        }
+
+        var entries = std.AutoHashMap(u64, []const u8).init(allocator);
+        defer entries.deinit();
+        var deleted_through: u64 = 0;
+        var offset: usize = 0;
+        var rejected = false;
+        while (true) {
+            const next = nextFileRecord(journal.items, &offset) catch |err| {
+                try testing.expectEqual(error.UnknownOutboxRecordOp, err);
+                rejected = true;
+                break;
+            };
+            const record = next orelse break;
+            switch (record.op) {
+                .put => try entries.put(record.epoch, record.frame),
+                .delete => deleted_through = @max(deleted_through, record.epoch),
+                .cursor => {},
+            }
+        }
+
+        const scan_after: u64 = @intCast(sc.get("scan_after").?.integer);
+        const cursor = @max(scan_after, deleted_through);
+        var retained = std.ArrayList(StoredOutboxFrame).empty;
+        defer {
+            for (retained.items) |entry| allocator.free(entry.frame);
+            retained.deinit(allocator);
+        }
+        var iterator = entries.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.key_ptr.* > cursor) {
+                try retained.append(allocator, .{
+                    .epoch = entry.key_ptr.*,
+                    .frame = try allocator.dupe(u8, entry.value_ptr.*),
+                });
+            }
+        }
+        std.mem.sort(StoredOutboxFrame, retained.items, {}, storedFrameLessThan);
+
+        var expected = cj.AssertionKeys.init(
+            "reliable-sync/outbox_journal_decode.json expect",
+            sc.get("expect").?,
+        );
+        defer expected.finish() catch @panic("outbox journal assertion-key check failed");
+        try expected.assertKey("outcome", if (rejected) "reject" else "accept");
+        _ = try expected.assertKeyWithOpt(
+            "retained_epochs",
+            @as([]const StoredOutboxFrame, retained.items),
+            struct {
+                fn check(frames: []const StoredOutboxFrame, want: std.json.Value) !void {
+                    try testing.expectEqual(want.array.items.len, frames.len);
+                    for (want.array.items, frames) |epoch, frame| {
+                        try testing.expectEqual(@as(u64, @intCast(epoch.integer)), frame.epoch);
+                    }
+                }
+            }.check,
+        );
+        _ = try expected.assertKeyWithOpt(
+            "retained_frames",
+            @as([]const StoredOutboxFrame, retained.items),
+            struct {
+                fn check(frames: []const StoredOutboxFrame, want: std.json.Value) !void {
+                    try testing.expectEqual(want.array.items.len, frames.len);
+                    for (want.array.items, frames) |want_frame, actual| {
+                        try testing.expectEqual(want_frame.array.items.len, actual.frame.len);
+                        for (want_frame.array.items, actual.frame) |byte, got| {
+                            try testing.expectEqual(@as(u8, @intCast(byte.integer)), got);
+                        }
+                    }
+                }
+            }.check,
+        );
+    }
 }
 
 test "outbox journal: an unknown record opcode is refused, not skipped" {

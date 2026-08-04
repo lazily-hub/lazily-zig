@@ -439,6 +439,7 @@ const VENDORED_MIRRORS = [_][]const u8{
     "reliable-sync/idempotent_redelivery.json",
     "reliable-sync/liveness_orset_lww.json",
     "reliable-sync/multi_epoch_delta.json",
+    "reliable-sync/outbox_journal_decode.json",
     "reliable-sync/outbox_replay_after_crash.json",
     "reliable-sync/outbox_store_protocol.json",
     "reliable-sync/resync_gap_converge.json",
