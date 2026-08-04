@@ -326,12 +326,6 @@ test "lazily/codec: an omitted blob backend is shm, a present unknown one is ref
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
     try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
-    try meta.excuseKey(
-        "generator",
-        "names the lazily-spec script that emits this fixture. It is a fact about the " ++
-            "CORPUS's build, not about this binding, so there is nothing here to compare " ++
-            "it against — lazily-spec's own regeneration check owns it",
-    );
     // `scenario_count`, `codecs`, `outcomes`, `backends`, `backend_forms` and
     // `rejection_kinds` are all asserted AFTER the loop, against what this run
     // actually observed, so `meta` stays open until then. Declaring a vocabulary

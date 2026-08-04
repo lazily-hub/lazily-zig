@@ -226,12 +226,6 @@ test "lazily/codec: NodeId exact-representation bound is enforced by refusal, ne
     var meta = cj.AssertionKeys.init(FIXTURE ++ " assertions", try cj.required(root, "assertions"));
     try meta.trackProse(&prose);
     try meta.assertKey("required_of_binding", "MUST");
-    try meta.excuseKey(
-        "generator",
-        "names the lazily-spec script that emits this fixture. It is a fact about the " ++
-            "CORPUS's build, not about this binding, so there is nothing here to compare " ++
-            "it against — lazily-spec's own regeneration check owns it",
-    );
     // `scenario_count`, `codecs` and `outcomes` are all asserted AFTER the loop,
     // against what this run actually replayed, so `meta` stays open until then.
     // `scenario_count` used to read `root.scenarios.len` and `codecs` a
