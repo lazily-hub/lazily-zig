@@ -24,16 +24,137 @@ pub const CapabilityHandshake = struct {
     session_id: []const u8,
     features: []const []const u8 = &.{},
 
+    pub fn hasFeature(self: CapabilityHandshake, feature: []const u8) bool {
+        for (self.features) |advertised| {
+            if (std.mem.eql(u8, advertised, feature)) return true;
+        }
+        return false;
+    }
+
+    /// Returns structured negotiated state or the first fail-closed field.
+    pub fn checkCompatible(
+        self: CapabilityHandshake,
+        other: CapabilityHandshake,
+        required_features: []const []const u8,
+    ) CapabilityNegotiation {
+        if (!std.mem.eql(u8, self.protocol_id, protocol_id)) {
+            return incompatible("protocol_id", "local protocol_id is not lazily-ipc");
+        }
+        if (!std.mem.eql(u8, other.protocol_id, protocol_id)) {
+            return incompatible("protocol_id", "remote protocol_id is not lazily-ipc");
+        }
+        if (self.protocol_major_version != protocol_major_version or
+            other.protocol_major_version != protocol_major_version or
+            self.protocol_major_version != other.protocol_major_version)
+        {
+            return incompatible(
+                "protocol_major_version",
+                "protocol major versions are incompatible",
+            );
+        }
+        if (self.codec != other.codec) {
+            return incompatible("codec", "codecs are incompatible");
+        }
+        if (!self.ordered_reliable or !other.ordered_reliable) {
+            return incompatible(
+                "ordered_reliable",
+                "both peers must require ordered-reliable delivery",
+            );
+        }
+        if (self.max_frame_size == 0 or other.max_frame_size == 0) {
+            return incompatible(
+                "max_frame_size",
+                "both peers must advertise a positive receive ceiling",
+            );
+        }
+        if (self.session_id.len == 0 or
+            other.session_id.len == 0 or
+            !std.mem.eql(u8, self.session_id, other.session_id))
+        {
+            return incompatible(
+                "session_id",
+                "both peers must name the same non-empty session",
+            );
+        }
+        for (required_features) |feature| {
+            if (!self.hasFeature(feature) or !other.hasFeature(feature)) {
+                return incompatible(
+                    "features",
+                    "a required feature was not advertised by both peers",
+                );
+            }
+        }
+        return .{ .compatible = .{
+            .local = self,
+            .remote = other,
+            .max_frame_size = @min(self.max_frame_size, other.max_frame_size),
+            .fragmentation_supported = self.fragmentation_supported and
+                other.fragmentation_supported,
+            .session_id = self.session_id,
+        } };
+    }
+
+    pub fn negotiate(
+        self: CapabilityHandshake,
+        other: CapabilityHandshake,
+        required_features: []const []const u8,
+    ) CapabilityNegotiation {
+        return self.checkCompatible(other, required_features);
+    }
+
     pub fn isCompatibleWith(self: CapabilityHandshake, other: CapabilityHandshake) bool {
-        return std.mem.eql(u8, self.protocol_id, protocol_id) and
-            std.mem.eql(u8, other.protocol_id, protocol_id) and
-            self.protocol_major_version == other.protocol_major_version and
-            self.protocol_major_version == protocol_major_version and
-            self.codec == other.codec and
-            self.ordered_reliable and
-            other.ordered_reliable;
+        return switch (self.checkCompatible(other, &.{})) {
+            .compatible => true,
+            .incompatible => false,
+        };
+    }
+
+    /// Serializes the standalone handshake frame in struct field order.
+    pub fn encodeJsonAlloc(
+        self: CapabilityHandshake,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        return std.json.Stringify.valueAlloc(allocator, self, .{});
+    }
+
+    /// Decodes an owned standalone handshake frame.
+    pub fn decodeJson(
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+    ) !std.json.Parsed(CapabilityHandshake) {
+        return std.json.parseFromSlice(CapabilityHandshake, allocator, bytes, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = false,
+        });
     }
 };
+
+pub const CapabilityFailure = struct {
+    field: []const u8,
+    reason: []const u8,
+};
+
+/// Compatibility-checked state retained for framing and feature gates.
+pub const NegotiatedCapabilities = struct {
+    local: CapabilityHandshake,
+    remote: CapabilityHandshake,
+    max_frame_size: u64,
+    fragmentation_supported: bool,
+    session_id: []const u8,
+
+    pub fn supports(self: NegotiatedCapabilities, feature: []const u8) bool {
+        return self.local.hasFeature(feature) and self.remote.hasFeature(feature);
+    }
+};
+
+pub const CapabilityNegotiation = union(enum) {
+    compatible: NegotiatedCapabilities,
+    incompatible: CapabilityFailure,
+};
+
+fn incompatible(field_name: []const u8, reason: []const u8) CapabilityNegotiation {
+    return .{ .incompatible = .{ .field = field_name, .reason = reason } };
+}
 
 /// Longest backend token `BlobBackendKind`'s diagnostic slot keeps verbatim.
 /// Comfortably longer than any spelled backend name; see `takeUnknownToken` for
@@ -1461,6 +1582,85 @@ fn assertDecodedClaims(keys: *cj.AssertionKeys, message: IpcMessage) !void {
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
 const cj = @import("conformance_json.zig");
+
+const CAPABILITY_FIXTURE = "codec/capability_handshake.json";
+
+fn roundTripCapabilityFixtureValue(
+    value: std.json.Value,
+) !std.json.Parsed(CapabilityHandshake) {
+    const source = try std.json.Stringify.valueAlloc(std.testing.allocator, value, .{});
+    defer std.testing.allocator.free(source);
+
+    var decoded = try CapabilityHandshake.decodeJson(std.testing.allocator, source);
+    defer decoded.deinit();
+    const encoded = try decoded.value.encodeJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    return CapabilityHandshake.decodeJson(std.testing.allocator, encoded);
+}
+
+test "lazily/ipc: capability handshake conformance" {
+    const fixture_path = "../lazily-spec/conformance/" ++ CAPABILITY_FIXTURE;
+    const bytes = try readFixtureFile(fixture_path);
+    defer std.testing.allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+
+    var scenarios = try cj.scenarios(CAPABILITY_FIXTURE, parsed.value);
+    var replayed: usize = 0;
+    while (scenarios.next()) |scenario_view| {
+        const scenario = try scenario_view.replay();
+        var local = try roundTripCapabilityFixtureValue(
+            try cj.required(scenario, "local"),
+        );
+        defer local.deinit();
+        var remote = try roundTripCapabilityFixtureValue(
+            try cj.required(scenario, "remote"),
+        );
+        defer remote.deinit();
+
+        const outcome = local.value.negotiate(remote.value, &.{});
+        var compatible = false;
+        var field_name: []const u8 = "";
+        var negotiated_max_frame_size: u64 = 0;
+        var negotiated_fragmentation_supported = false;
+        switch (outcome) {
+            .compatible => |negotiated| {
+                compatible = true;
+                negotiated_max_frame_size = negotiated.max_frame_size;
+                negotiated_fragmentation_supported =
+                    negotiated.fragmentation_supported;
+            },
+            .incompatible => |failure| {
+                field_name = failure.field;
+            },
+        }
+
+        var expected = cj.AssertionKeys.init(
+            CAPABILITY_FIXTURE,
+            try cj.required(scenario, "expected"),
+        );
+        try expected.assertKey("compatible", compatible);
+        _ = try expected.assertKeyOpt("field", field_name);
+        _ = try expected.assertKeyOpt(
+            "negotiated_max_frame_size",
+            negotiated_max_frame_size,
+        );
+        _ = try expected.assertKeyOpt(
+            "negotiated_fragmentation_supported",
+            negotiated_fragmentation_supported,
+        );
+        try expected.finish();
+        replayed += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), replayed);
+}
 
 test "lazily/ipc: snapshot_minimal fixture" {
     var parsed = try assertFixtureRoundTripFromFile("snapshot_minimal.json");

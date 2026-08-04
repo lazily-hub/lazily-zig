@@ -461,8 +461,8 @@ fi
 # could ALL have stopped being dispatched with this guard still green. The floor
 # tracks the increment, not the total, so the margin the paragraph above
 # describes is preserved rather than spent.
-MIN_FIXTURES="${MIN_FIXTURES:-110}"
-MIN_SCENARIOS="${MIN_SCENARIOS:-86}"
+MIN_FIXTURES="${MIN_FIXTURES:-111}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-91}"
 
 if [ "$total" -eq 0 ]; then
   echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2
