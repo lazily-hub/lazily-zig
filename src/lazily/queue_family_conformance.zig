@@ -52,7 +52,7 @@
 //! # One place the corpus used to be thinner than the code
 //!
 //! `WorkQueueCell`'s `visibility_timeout` / `max_deliveries` now come from the
-//! fixture's top-level `config` block. They used to be supplied out of band —
+//! fixture's `initial` block. They used to be supplied out of band —
 //! `replayWorkQueue` took `max_deliveries` as a parameter and the timeout was the
 //! literal `10` — which is drift by construction: the corpus could retune a lease
 //! and this binding would keep replaying the old one and stay green.
@@ -1526,22 +1526,21 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         try cj.asStr(try cj.required(fixture, "model")),
     );
 
-    // The lease configuration comes from the fixture, not from this file. It used
+    // The lease configuration comes from fixture.initial, not from this file. It used
     // to be a runner parameter, which is drift by construction: the corpus could
     // retune a lease and this binding would keep replaying the old one and stay
     // green.
-    const config = try cj.required(fixture, "config");
+    const initial = try cj.required(fixture, "initial");
     const model = try Model.create(
         allocator,
-        try cj.asU64(try cj.required(config, "visibility_timeout")),
-        try cj.asU64(try cj.required(config, "max_deliveries")),
+        try cj.asU64(try cj.required(initial, "visibility_timeout")),
+        try cj.asU64(try cj.required(initial, "max_deliveries")),
     );
     defer model.destroy();
 
     // Both canonical fixtures start empty; there is no snapshot constructor to seat
     // pending/in-flight state, and no fixture needs one. Fail loudly rather than
     // silently replaying from the wrong start if that ever changes.
-    const initial = try cj.required(fixture, "initial");
     for ([_]Str{ "pending", "in_flight", "dead_letters" }) |key| {
         try testing.expectEqual(@as(usize, 0), (try cj.arrayOr(initial, key)).len);
     }
