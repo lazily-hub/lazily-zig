@@ -108,6 +108,7 @@ pub const compute_fortification_test = @import("./lazily/compute_fortification.z
 pub const effectNoCleanup = @import("./lazily/effect.zig").effectNoCleanup;
 pub const keyed_order = @import("./lazily/keyed_order.zig");
 pub const collections_family_conformance = @import("./lazily/collections_family_conformance.zig");
+pub const dependency_availability_conformance = @import("./lazily/dependency_availability_conformance.zig");
 pub const queue_family_conformance = @import("./lazily/queue_family_conformance.zig");
 // Canonical replays for the fixtures this binding used to assert with inline
 // mirrors (`#lazilyzigconformance`). Referenced here so `refAllDecls` pulls
@@ -132,6 +133,7 @@ pub const blob_backend_discriminator_conformance =
     @import("./lazily/blob_backend_discriminator_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
+pub const dependency_map = @import("./lazily/dependency_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
 pub const SourceMap = reactive_map.SourceMap;
 pub const ComputedMap = reactive_map.ComputedMap;
