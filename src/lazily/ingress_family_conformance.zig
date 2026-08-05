@@ -1222,6 +1222,393 @@ fn expectedStepTotal() !usize {
 const flags_per_step_floor = 7;
 
 // ---------------------------------------------------------------------------
+// Boundary ingress adapter — canonical reactive projection replay.
+// ---------------------------------------------------------------------------
+
+const BOUNDARY_FIXTURE = "ingress/boundary_ingress_adapter.json";
+const boundary_capacity = 8;
+
+const BoundaryStrings = struct {
+    items: [boundary_capacity][]const u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const BoundaryStrings) []const []const u8 {
+        return self.items[0..self.len];
+    }
+
+    fn clear(self: *BoundaryStrings) void {
+        self.len = 0;
+    }
+
+    fn contains(self: *const BoundaryStrings, value: []const u8) bool {
+        for (self.slice()) |item| {
+            if (std.mem.eql(u8, item, value)) return true;
+        }
+        return false;
+    }
+
+    fn add(self: *BoundaryStrings, value: []const u8) bool {
+        if (self.contains(value)) return false;
+        std.debug.assert(self.len < self.items.len);
+        self.items[self.len] = value;
+        self.len += 1;
+        return true;
+    }
+
+    fn remove(self: *BoundaryStrings, value: []const u8) bool {
+        for (self.slice(), 0..) |item, index| {
+            if (!std.mem.eql(u8, item, value)) continue;
+            var cursor = index;
+            while (cursor + 1 < self.len) : (cursor += 1) {
+                self.items[cursor] = self.items[cursor + 1];
+            }
+            self.len -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn replaceFromJson(self: *BoundaryStrings, value: json.Value) !void {
+        self.clear();
+        for (try cj.asArray(value)) |item| {
+            _ = self.add(try cj.asStr(item));
+        }
+    }
+};
+
+const BoundaryEvent = struct {
+    cursor: u64,
+    stamped_at: u64,
+    action: []const u8,
+    key: ?[]const u8,
+    validation: ?[]const u8,
+};
+
+const BoundaryModel = struct {
+    max_buffered: usize,
+    freshness_horizon: u64,
+    phase: []const u8 = "idle",
+    generation: u64 = 0,
+    cursor: ?u64 = null,
+    buffered: [boundary_capacity]BoundaryEvent = undefined,
+    buffered_len: usize = 0,
+    source_keys: BoundaryStrings = .{},
+    members: BoundaryStrings = .{},
+    validation: []const u8 = "unknown",
+    replay_from: ?u64 = null,
+    stale_events: u64 = 0,
+    receipt_id: ?[]const u8 = null,
+    targets: BoundaryStrings = .{},
+    acked: BoundaryStrings = .{},
+    last_stamped_at: ?u64 = null,
+    now: u64 = 0,
+    revision: u64 = 0,
+    observation_revision: u64 = 0,
+
+    fn init(max_buffered: usize, freshness_horizon: u64) BoundaryModel {
+        return .{
+            .max_buffered = max_buffered,
+            .freshness_horizon = freshness_horizon,
+        };
+    }
+
+    fn fresh(self: *const BoundaryModel) bool {
+        const stamp = self.last_stamped_at orelse return false;
+        const age = if (self.now > stamp) self.now - stamp else 0;
+        return age <= self.freshness_horizon;
+    }
+
+    fn ready(self: *const BoundaryModel) bool {
+        return std.mem.eql(u8, self.phase, "live") and
+            std.mem.eql(u8, self.validation, "valid");
+    }
+
+    fn deliveryConverged(self: *const BoundaryModel) bool {
+        if (self.receipt_id == null or self.targets.len == 0) return false;
+        for (self.targets.slice()) |target| {
+            if (!self.acked.contains(target)) return false;
+        }
+        return true;
+    }
+
+    fn subscribe(self: *BoundaryModel, generation: u64) void {
+        self.phase = "bootstrapping";
+        self.generation = generation;
+        self.cursor = null;
+        self.buffered_len = 0;
+        self.source_keys.clear();
+        self.members.clear();
+        self.validation = "unknown";
+        self.replay_from = null;
+        self.last_stamped_at = null;
+        self.revision += 1;
+    }
+
+    fn findBuffered(self: *const BoundaryModel, cursor: u64) ?usize {
+        for (self.buffered[0..self.buffered_len], 0..) |event, index| {
+            if (event.cursor == cursor) return index;
+        }
+        return null;
+    }
+
+    fn removeBuffered(self: *BoundaryModel, index: usize) BoundaryEvent {
+        const event = self.buffered[index];
+        var cursor = index;
+        while (cursor + 1 < self.buffered_len) : (cursor += 1) {
+            self.buffered[cursor] = self.buffered[cursor + 1];
+        }
+        self.buffered_len -= 1;
+        return event;
+    }
+
+    fn insertBuffered(self: *BoundaryModel, event: BoundaryEvent) bool {
+        if (self.findBuffered(event.cursor) != null) return true;
+        if (self.buffered_len >= self.max_buffered) return false;
+        std.debug.assert(self.buffered_len < self.buffered.len);
+        var index = self.buffered_len;
+        while (index > 0 and self.buffered[index - 1].cursor > event.cursor) : (index -= 1) {
+            self.buffered[index] = self.buffered[index - 1];
+        }
+        self.buffered[index] = event;
+        self.buffered_len += 1;
+        return true;
+    }
+
+    fn applyEvent(self: *BoundaryModel, event: BoundaryEvent) void {
+        if (std.mem.eql(u8, event.action, "upsert")) {
+            _ = self.source_keys.add(event.key.?);
+        } else if (std.mem.eql(u8, event.action, "remove")) {
+            _ = self.source_keys.remove(event.key.?);
+        } else if (std.mem.eql(u8, event.action, "validate")) {
+            self.validation = event.validation.?;
+        } else {
+            @panic("unknown boundary event action");
+        }
+        self.cursor = event.cursor;
+        self.last_stamped_at = event.stamped_at;
+    }
+
+    fn recomputePhase(self: *BoundaryModel) void {
+        if (self.buffered_len > 0) {
+            self.phase = "replay_required";
+            self.replay_from = (self.cursor orelse 0) + 1;
+        } else {
+            self.replay_from = null;
+            self.phase = if (std.mem.eql(u8, self.validation, "valid")) "live" else "invalid";
+        }
+    }
+
+    fn drain(self: *BoundaryModel) void {
+        while (self.cursor) |cursor| {
+            const index = self.findBuffered(cursor + 1) orelse break;
+            self.applyEvent(self.removeBuffered(index));
+        }
+        self.recomputePhase();
+    }
+
+    fn snapshot(self: *BoundaryModel, op: json.Value) !void {
+        const generation = try cj.asU64(try cj.required(op, "generation"));
+        if (generation != self.generation) {
+            self.stale_events += 1;
+            self.revision += 1;
+            return;
+        }
+        self.cursor = try cj.asU64(try cj.required(op, "cursor"));
+        self.last_stamped_at = try cj.asU64(try cj.required(op, "stamped_at"));
+        try self.source_keys.replaceFromJson(try cj.required(op, "source_keys"));
+        try self.members.replaceFromJson(try cj.required(op, "members"));
+        self.validation = try cj.asStr(try cj.required(op, "validation"));
+        self.replay_from = null;
+
+        var index: usize = 0;
+        while (index < self.buffered_len) {
+            if (self.buffered[index].cursor <= self.cursor.?) {
+                _ = self.removeBuffered(index);
+            } else {
+                index += 1;
+            }
+        }
+
+        self.revision += 1;
+        self.observation_revision = self.revision;
+        self.drain();
+    }
+
+    fn ingestEvent(self: *BoundaryModel, op: json.Value) !void {
+        const generation = try cj.asU64(try cj.required(op, "generation"));
+        if (generation != self.generation) {
+            self.stale_events += 1;
+            self.revision += 1;
+            return;
+        }
+        const incoming = BoundaryEvent{
+            .cursor = try cj.asU64(try cj.required(op, "cursor")),
+            .stamped_at = try cj.asU64(try cj.required(op, "stamped_at")),
+            .action = try cj.asStr(try cj.required(op, "action")),
+            .key = if (cj.field(op, "key")) |value| try cj.asStr(value) else null,
+            .validation = if (cj.field(op, "validation")) |value| try cj.asStr(value) else null,
+        };
+
+        if (self.cursor == null) {
+            if (!self.insertBuffered(incoming)) {
+                self.phase = "backpressured";
+                self.replay_from = 0;
+            }
+            self.revision += 1;
+            return;
+        }
+
+        if (incoming.cursor <= self.cursor.?) return;
+        if (incoming.cursor == self.cursor.? + 1) {
+            self.applyEvent(incoming);
+            self.drain();
+        } else if (!self.insertBuffered(incoming)) {
+            self.phase = "backpressured";
+            self.replay_from = self.cursor.? + 1;
+        } else {
+            self.phase = "replay_required";
+            self.replay_from = self.cursor.? + 1;
+        }
+        self.revision += 1;
+    }
+
+    fn memberJoin(self: *BoundaryModel, member: []const u8) void {
+        const changed = self.members.add(member);
+        const target_changed = self.receipt_id != null and self.targets.add(member);
+        if (changed or target_changed) self.revision += 1;
+    }
+
+    fn memberLeave(self: *BoundaryModel, member: []const u8) void {
+        if (self.members.remove(member)) self.revision += 1;
+    }
+
+    fn openReceipt(self: *BoundaryModel, receipt_id: []const u8) void {
+        self.receipt_id = receipt_id;
+        self.targets.clear();
+        for (self.members.slice()) |member| _ = self.targets.add(member);
+        self.acked.clear();
+        self.revision += 1;
+    }
+
+    fn ack(self: *BoundaryModel, receipt_id: []const u8, member: []const u8) void {
+        const active = self.receipt_id orelse return;
+        if (!std.mem.eql(u8, active, receipt_id) or !self.targets.contains(member)) return;
+        if (self.acked.add(member)) self.revision += 1;
+    }
+
+    fn tick(self: *BoundaryModel, now: u64) void {
+        const before = self.fresh();
+        self.now = now;
+        if (before != self.fresh()) self.revision += 1;
+    }
+
+    fn apply(self: *BoundaryModel, op: json.Value) !void {
+        const op_type = try cj.asStr(try cj.required(op, "type"));
+        if (std.mem.eql(u8, op_type, "subscribe")) {
+            self.subscribe(try cj.asU64(try cj.required(op, "generation")));
+        } else if (std.mem.eql(u8, op_type, "snapshot")) {
+            try self.snapshot(op);
+        } else if (std.mem.eql(u8, op_type, "event")) {
+            try self.ingestEvent(op);
+        } else if (std.mem.eql(u8, op_type, "member_join")) {
+            self.memberJoin(try cj.asStr(try cj.required(op, "member")));
+        } else if (std.mem.eql(u8, op_type, "member_leave")) {
+            self.memberLeave(try cj.asStr(try cj.required(op, "member")));
+        } else if (std.mem.eql(u8, op_type, "open_receipt")) {
+            self.openReceipt(try cj.asStr(try cj.required(op, "receipt_id")));
+        } else if (std.mem.eql(u8, op_type, "ack")) {
+            self.ack(
+                try cj.asStr(try cj.required(op, "receipt_id")),
+                try cj.asStr(try cj.required(op, "member")),
+            );
+        } else if (std.mem.eql(u8, op_type, "tick")) {
+            self.tick(try cj.asU64(try cj.required(op, "now")));
+        } else {
+            return error.UnknownBoundaryOp;
+        }
+    }
+
+    fn bufferedCursors(self: *const BoundaryModel, out: *[boundary_capacity]u64) []const u64 {
+        for (self.buffered[0..self.buffered_len], 0..) |event, index| out[index] = event.cursor;
+        return out[0..self.buffered_len];
+    }
+
+    fn assertExpected(self: *const BoundaryModel, expected_value: json.Value) !void {
+        var expected = cj.AssertionKeys.init(BOUNDARY_FIXTURE ++ " expected", expected_value);
+        _ = try expected.assertKeyOpt("phase", self.phase);
+        _ = try expected.assertKeyOpt("generation", self.generation);
+        _ = try expected.assertKeyOpt("cursor", self.cursor);
+
+        var cursors: [boundary_capacity]u64 = undefined;
+        _ = try expected.assertKeyWithOpt(
+            "buffered_cursors",
+            self.bufferedCursors(&cursors),
+            expectBoundaryU64List,
+        );
+        _ = try expected.assertKeyWithOpt("source_keys", self.source_keys.slice(), expectBoundaryStringList);
+        _ = try expected.assertKeyWithOpt("members", self.members.slice(), expectBoundaryStringList);
+        _ = try expected.assertKeyOpt("validation", self.validation);
+        _ = try expected.assertKeyOpt("replay_from", self.replay_from);
+        _ = try expected.assertKeyOpt("stale_events", self.stale_events);
+        _ = try expected.assertKeyOpt("revision", self.revision);
+        _ = try expected.assertKeyOpt("observation_revision", self.observation_revision);
+        _ = try expected.assertKeyOpt("ready", self.ready());
+        _ = try expected.assertKeyOpt("fresh", self.fresh());
+
+        if (expected.has("delivery")) {
+            var delivery = try expected.sub("delivery");
+            try delivery.assertKey("receipt_id", self.receipt_id);
+            try delivery.assertKeyWith("targets", self.targets.slice(), expectBoundaryStringList);
+            try delivery.assertKeyWith("acked", self.acked.slice(), expectBoundaryStringList);
+            try delivery.assertKey("converged", self.deliveryConverged());
+            try delivery.finish();
+        }
+        try expected.finish();
+    }
+};
+
+fn expectBoundaryU64List(actual: []const u64, expected: json.Value) !void {
+    const wanted = try cj.asArray(expected);
+    try testing.expectEqual(wanted.len, actual.len);
+    for (wanted, actual) |want, got| try testing.expectEqual(try cj.asU64(want), got);
+}
+
+fn expectBoundaryStringList(actual: []const []const u8, expected: json.Value) !void {
+    const wanted = try cj.asArray(expected);
+    try testing.expectEqual(wanted.len, actual.len);
+    for (wanted, actual) |want, got| try testing.expectEqualStrings(try cj.asStr(want), got);
+}
+
+test "lazily/boundary ingress adapter: canonical contract is a reactive projection" {
+    var parsed = (try cj.load(BOUNDARY_FIXTURE)) orelse return error.SkipZigTest;
+    defer parsed.deinit();
+
+    const root_policy = try cj.required(parsed.value, "policy");
+    const default_max = try cj.asU64(try cj.required(root_policy, "max_buffered"));
+    const horizon = try cj.asU64(try cj.required(root_policy, "freshness_horizon"));
+    var ledger = try cj.scenarios(BOUNDARY_FIXTURE, parsed.value);
+    try testing.expect(ledger.len() > 0);
+
+    var steps_replayed: usize = 0;
+    while (ledger.next()) |entry| {
+        const scenario = try entry.replay();
+        _ = try entry.id();
+        const scenario_max = if (cj.field(scenario, "policy")) |policy|
+            try cj.asU64(try cj.required(policy, "max_buffered"))
+        else
+            default_max;
+        var model = BoundaryModel.init(@intCast(scenario_max), horizon);
+
+        for (try cj.asArray(try cj.required(scenario, "steps"))) |step| {
+            try model.apply(try cj.required(step, "op"));
+            try model.assertExpected(try cj.required(step, "expected"));
+            steps_replayed += 1;
+        }
+    }
+    try testing.expect(steps_replayed > 0);
+}
+
+// ---------------------------------------------------------------------------
 // The gates
 // ---------------------------------------------------------------------------
 
