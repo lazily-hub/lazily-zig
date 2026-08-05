@@ -58,6 +58,11 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
+  # Reactive egress is currently Rust-only; Zig has no egress replay runner.
+  "egress/egress_generation_fence.json"
+  "egress/egress_inflight_window.json"
+  "egress/egress_ordered_ack.json"
+  "egress/egress_retry_budget.json"
   # The experimental protobuf-v1 generator pilot is Rust/Kotlin/TypeScript;
   # this binding must negotiate the capability before replaying the typed trace.
   "protobuf/graph_boundary_traces.json"
