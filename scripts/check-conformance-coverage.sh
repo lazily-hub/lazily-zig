@@ -58,6 +58,9 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
+  # The experimental protobuf-v1 generator pilot is Rust/Kotlin/TypeScript;
+  # this binding must negotiate the capability before replaying the typed trace.
+  "protobuf/graph_boundary_traces.json"
   # No runner at all in this binding.
   "agent-doc/delta_agent_doc_state.json"
   "agent-doc/snapshot_agent_doc_state.json"
