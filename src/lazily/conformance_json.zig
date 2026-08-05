@@ -862,11 +862,11 @@ pub const AssertionKeys = struct {
         return true;
     }
 
-    /// Read `name`, mark it ASSERTED, and hand the fixture's value to the
-    /// caller's own check. For comparisons that are not an equality — a
-    /// tolerance, a set containment, a per-entry sweep of an object. What
-    /// matters is that the fixture's value reaches the comparison, not that the
-    /// comparison is `==`.
+    /// Read `name`, hand the fixture's value to the caller's own check, and
+    /// mark it ASSERTED only after the check succeeds. For comparisons that are
+    /// not an equality — a tolerance, a set containment, a per-entry sweep of
+    /// an object. What matters is that the fixture's value reaches the
+    /// comparison, not that the comparison is `==`.
     pub fn assertKeyWith(
         self: *AssertionKeys,
         name: []const u8,
@@ -874,8 +874,8 @@ pub const AssertionKeys = struct {
         comptime check: fn (@TypeOf(context), Value) anyerror!void,
     ) !void {
         const expected = try self.required(name);
-        self.markAsserted(name);
         try check(context, expected);
+        self.markAsserted(name);
     }
 
     /// As `assertKeyWith`, but a no-op when the fixture omits `name`. Reports
@@ -887,8 +887,8 @@ pub const AssertionKeys = struct {
         comptime check: fn (@TypeOf(context), Value) anyerror!void,
     ) !bool {
         const expected = self.field(name) orelse return false;
-        self.markAsserted(name);
         try check(context, expected);
+        self.markAsserted(name);
         return true;
     }
 
@@ -1696,7 +1696,11 @@ fn proseFixtureJson(comptime extra: []const u8) []const u8 {
     return "{\"prose\":[\"clause\"],\"clause\":\"a paragraph\",\"backends\":[\"shm\"]" ++ extra ++ "}";
 }
 
-fn checkAnything(_: void, _: Value) anyerror!void {}
+fn checkBackends(_: void, value: Value) anyerror!void {
+    const backends = value.array;
+    try std.testing.expectEqual(@as(usize, 1), backends.items.len);
+    try std.testing.expectEqualStrings("shm", backends.items[0].string);
+}
 
 test "conformance_json: a discharged prose key satisfies both the block and the ledger" {
     const allocator = std.testing.allocator;
@@ -1711,7 +1715,7 @@ test "conformance_json: a discharged prose key satisfies both the block and the 
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     // `prose` and `clause` are both consumed without being asserted or excused
     // here: the ledger owns them.
@@ -1732,7 +1736,7 @@ test "conformance_json: rule 1 — asserting a declared prose key fails" {
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     // A tally compared to the paragraph's own text pins wording, not behaviour.
     try keys.assertKey("clause", "a paragraph");
@@ -1752,7 +1756,7 @@ test "conformance_json: rule 2 — excusing a declared prose key with free text 
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     try keys.excuseKey("clause", "prose: the scenarios below assert what it describes");
     try std.testing.expectError(error.ProseKeyExcused, verifyProse(&fixture));
@@ -1771,7 +1775,7 @@ test "conformance_json: rule 3 — discharging a key the corpus did not declare 
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     // `backends` carries a comparable value; a binding does not get to reclassify
     // it as a paragraph.
@@ -1797,7 +1801,7 @@ test "conformance_json: rule 4 — a declared prose key nothing discharges fails
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     // `theorem` is declared and forgotten. The block's own `finish()` cannot see
     // it — the ledger skipped it there — so this comparison is what makes a
@@ -1822,7 +1826,7 @@ test "conformance_json: rule 5 — a discharge naming nothing fails at the call 
     const empty: []const []const u8 = &.{};
     try std.testing.expectError(error.ProseDischargeNamesNothing, keys.proseKey("clause", empty));
     // The ledger still has to be answered for, or this test's own teardown fails.
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     try verifyProse(&fixture);
 }
@@ -1864,7 +1868,7 @@ test "conformance_json: rule 6 — a discharge is satisfied from ANOTHER block o
     var meta = AssertionKeys.init("fake/prose.json assertions", block.value);
     meta.quiet = true;
     try meta.trackProse(&fixture);
-    try meta.assertKeyWith("backends", {}, checkAnything);
+    try meta.assertKeyWith("backends", {}, checkBackends);
     try meta.proseKey("clause", &.{"frame_epoch"});
     try meta.finish();
 
@@ -1895,7 +1899,7 @@ test "conformance_json: rule 7 — a discharge naming another prose key fails" {
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("theorem", &.{"backends"});
     try keys.proseKey("clause", &.{"theorem"});
     try std.testing.expectError(error.ProseDischargeNamesProse, verifyProse(&fixture));
@@ -1910,7 +1914,7 @@ test "conformance_json: an untracked block still fails on the unconsumed `prose`
     // key of the block, so the existing consumption guard sees it.
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.excuseKey("clause", "prose");
     try std.testing.expectError(error.UnconsumedAssertionKey, keys.finish());
 
@@ -1975,7 +1979,7 @@ test "conformance_json: rule 7 — a discharge naming `prose` itself fails" {
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     // `prose` never lists itself, so it is not "declared" — without seeding the
     // prose-name set with it, rule 7 misses this and rule 6 waves it through on
     // the strength of the declaration having been consumed. A paragraph
@@ -1997,7 +2001,7 @@ test "conformance_json: a discharge naming a key the fixture does not carry has 
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     // Distinct from rule 6: this key is not merely unasserted, it is gone.
     try keys.proseKey("clause", &.{"backends_renamed_upstream"});
     try std.testing.expectError(error.ProseDischargeNamesAbsentKey, verifyProse(&fixture));
@@ -2019,7 +2023,7 @@ test "conformance_json: rules 3 and 4 are BLOCK-local, rules 6 and 7 are fixture
     var meta = AssertionKeys.init("fake/prose.json assertions", declaring.value);
     meta.quiet = true;
     try meta.trackProse(&fixture);
-    try meta.assertKeyWith("backends", {}, checkAnything);
+    try meta.assertKeyWith("backends", {}, checkBackends);
 
     var expect = AssertionKeys.init("fake/prose.json expect", other.value);
     expect.quiet = true;
@@ -2050,7 +2054,7 @@ test "conformance_json: inside a declaring block the annotation exemption is off
     var keys = AssertionKeys.init("fake/prose.json assertions", parsed.value);
     keys.quiet = true;
     try keys.trackProse(&fixture);
-    try keys.assertKeyWith("backends", {}, checkAnything);
+    try keys.assertKeyWith("backends", {}, checkBackends);
     try keys.proseKey("clause", &.{"backends"});
     try std.testing.expectError(error.AssertionKeyReadButNotAsserted, keys.finish());
     try verifyProse(&fixture);
