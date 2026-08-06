@@ -14,7 +14,7 @@ The main use case is Zig libraries for cross-platform logic via FFI. Building dy
 ## Feature coverage
 
 The full `lazily` capability set across every binding. Legend: ✅ shipped ·
-`~` partial · `—` absent or not applicable. The canonical matrix with per-cell
+`~` partial · `—` absent · `⊘` not applicable. The canonical matrix with per-cell
 notes and platform carve-outs lives in
 [`lazily-spec` § Cross-Language Coverage](https://github.com/lazily-hub/lazily-spec/blob/main/docs/coverage.md).
 
