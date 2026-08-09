@@ -127,7 +127,18 @@ pub fn SeqCrdt(comptime Id: type, comptime V: type) type {
         pub fn fork(self: *const Self, peer: PeerId) !Self {
             var out = Self.init(self.allocator, peer);
             errdefer out.deinit();
+            // Carry the source's causal POSITION, but never its peer. A fork has
+            // observed everything the source holds, so its clock must not go
+            // backwards — hence the carry. The peer is a different thing: it is
+            // the stamp's final tiebreaker, and `out.hlc = self.hlc` copied it
+            // wholesale, so a fork stamped under the SOURCE's id. Two replicas
+            // stamping as one peer can mint the same `(wall, logical, peer)`,
+            // LWW adopts only on `.gt`, and they then diverge permanently
+            // (`#lzzigforkhlcpeer`; the regression test at the bottom of this
+            // file is the divergence, and it is not reachable from
+            // `seqcrdt_convergence.json`).
             out.hlc = self.hlc;
+            out.hlc.peer = peer;
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
                 const pos = try entry.value_ptr.position.clone(self.allocator);
@@ -605,4 +616,49 @@ test "lazily/seq_crdt: remove tombstone converges; merge is commutative" {
     // whether `contains` answered about live elements or about table entries,
     // which is the one thing this line exists to pin.
     try std.testing.expect(!ab.contains("b"));
+}
+
+test "lazily/seq_crdt: a fork stamps with ITS OWN peer, so equal-wall edits still converge" {
+    // `fork` carries the source's clock forward, which is the right call: a
+    // replica that has observed the source's state must not mint a stamp
+    // causally behind it. But carrying the clock must NOT carry the source's
+    // PEER — the peer is the stamp's tiebreaker, and two replicas stamping
+    // under one peer id can mint the SAME `(wall, logical, peer)` triple.
+    //
+    // That is not cosmetic. LWW adopts only on `.gt`, so a tie means NEITHER
+    // side adopts and the replicas diverge permanently — the one outcome a CRDT
+    // exists to make impossible. This is the shape:
+    //
+    //   a@peer1  insert x @ now=10        -> (10, 0, 1)
+    //   b = a.fork(2)                     -> clock at (10, 0)
+    //   b        set x=99 @ now=10        -> logical bumps -> (10, 1, ?)
+    //   a        set x=55 @ now=10        -> logical bumps -> (10, 1, 1)
+    //
+    // With the source's peer on b's clock both stamps are (10, 1, 1) and the
+    // two merges below leave a=55 and b=99 forever. With b's own peer, b's
+    // (10, 1, 2) dominates and both settle on 99.
+    //
+    // `seqcrdt_convergence.json` cannot see this: every fork in it is followed
+    // by an op whose `now` EXCEEDS the source's last_wall, so `send` takes the
+    // `now > last_wall` branch and the logical counter resets to 0 regardless
+    // of which clock the fork started from (`#lzzigforkhlcpeer`).
+    const allocator = std.testing.allocator;
+    var a = SeqCrdt([]const u8, i64).init(allocator, 1);
+    defer a.deinit();
+    try a.insertBack("x", 1, 10);
+
+    var b = try a.fork(2);
+    defer b.deinit();
+
+    _ = try b.setValue("x", 99, 10);
+    _ = try a.setValue("x", 55, 10);
+
+    _ = try a.merge(&b, 20);
+    _ = try b.merge(&a, 20);
+
+    // Convergence FIRST: the two replicas must agree at all, before which value
+    // won is even a meaningful question.
+    try std.testing.expectEqual(b.get("x"), a.get("x"));
+    // And the later stamp is b's, because peer 2 breaks the tie above peer 1.
+    try std.testing.expectEqual(@as(?i64, 99), a.get("x"));
 }
