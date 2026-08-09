@@ -117,6 +117,10 @@ pub const conformance_json = @import("./lazily/conformance_json.zig");
 pub const stdlib_conformance = @import("./lazily/stdlib_conformance.zig");
 pub const collections_conformance = @import("./lazily/collections_conformance.zig");
 pub const distributed_conformance = @import("./lazily/distributed_conformance.zig");
+// Canonical replays for the nine `lossless-tree/*.json` fixtures. This binding
+// implemented the whole op vocabulary and opened NONE of the corpus for it, so
+// all nine sat under "No runner at all in this binding".
+pub const lossless_tree_conformance = @import("./lazily/lossless_tree_conformance.zig");
 // The `msgpack` frame codec (`#lzmsgpackseven`) — the cross-language binary
 // default of protocol.md § Frame codecs, derived from the reference json codec
 // so the two can never disagree about tags, field names, or the
