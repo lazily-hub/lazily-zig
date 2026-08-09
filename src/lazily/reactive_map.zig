@@ -979,6 +979,53 @@ fn arrayItems(value: json.Value) ![]const json.Value {
 const Slots = ComputedMap([]const u8, FV);
 const Cells = SourceMap([]const u8, FV);
 
+/// The one `default_mode` assertion, shared by every materialization fixture
+/// (`#lzdefaultmodeuniform`).
+///
+/// `expected.default_mode` names a *strategy*, and this binding has no mode flag
+/// to read back — eager vs lazy is which call the caller makes. So the string
+/// DISPATCHES the build (`eager` = the pre-mint `materializeAll` loop, `lazy` =
+/// mint-on-access) and the behavioural fact asserted is that the map built the
+/// fixture's default way is fully materialized at build: every declared entry,
+/// source and computed, present before any read. Entry kind is orthogonal to
+/// mode — source entries are present at build under EVERY strategy, computed
+/// entries only under eager — so only the eager build satisfies this, and
+/// flipping the fixture to `"lazy"` reddens. An unknown string is a hard error,
+/// never `error.SkipZigTest`.
+fn assertDefaultModeMaterializesAtBuild(
+    ctx: *Context,
+    expected: json.Value,
+    source_keys: []const []const u8,
+    computed_keys: []const []const u8,
+    lookup: *Lookup,
+) !void {
+    const mode = try jsonAsString(try jsonFieldRequired(expected, "default_mode"));
+
+    var sources = try Cells.init(ctx);
+    defer sources.deinit();
+    for (source_keys) |k| _ = try sources.entry(k, lookup.map.get(k).?);
+    var computeds = try Slots.init(ctx);
+    defer computeds.deinit();
+    if (std.mem.eql(u8, mode, "eager")) {
+        try computeds.materializeAll(computed_keys, lookup.factory());
+    } else if (std.mem.eql(u8, mode, "lazy")) {
+        // Mint-on-access: no computed entry is materialized at build.
+    } else {
+        std.debug.print("unknown default_mode \"{s}\"\n", .{mode});
+        return error.UnknownDefaultMode;
+    }
+
+    const declared = source_keys.len + computed_keys.len;
+    const present_at_build = sources.presentCount() + computeds.presentCount();
+    if (present_at_build != declared) {
+        std.debug.print(
+            "a map built the fixture's default way ({s}) is materialized at build: {d} of {d} declared entries present\n",
+            .{ mode, present_at_build, declared },
+        );
+        return error.DefaultModeNotMaterializedAtBuild;
+    }
+}
+
 /// Shared checks for the two `spec.val` fixtures (all-slot maps): default mode
 /// eager, eager materializes all, observational transparency eager==lazy.
 fn checkValFixture(ctx: *Context, name: []const u8) !void {
@@ -990,9 +1037,6 @@ fn checkValFixture(ctx: *Context, name: []const u8) !void {
     defer parsed.deinit();
     const fixture = parsed.value;
     const expected = try jsonFieldRequired(fixture, "expected");
-
-    // default_mode_eager
-    try testing.expectEqualStrings("eager", try jsonAsString(try jsonFieldRequired(expected, "default_mode")));
 
     // Build the runtime lookup + declared key order from `spec.val`.
     const val_obj = switch (try jsonFieldRequired(try jsonFieldRequired(fixture, "spec"), "val")) {
@@ -1008,6 +1052,15 @@ fn checkValFixture(ctx: *Context, name: []const u8) !void {
         try lookup.map.put(entry.key_ptr.*, try jsonAsI64(entry.value_ptr.*));
         try keys.append(testing.allocator, entry.key_ptr.*);
     }
+
+    // default_mode_eager. This binding has no mode *flag* to read back — eager vs
+    // lazy is which call the caller makes — so the fixture's value SELECTS THE
+    // BUILD and the fact asserted is behavioural: a map built the way the fixture
+    // names its default is fully materialized at build time. Comparing the key to
+    // the literal `"eager"` asserted only that the fixture equals itself
+    // (`#lzconsumednotasserted`) — a binding whose eager build materialized
+    // nothing still passed. Mirrors lazily-rs / lazily-cpp / lazily-cs.
+    try assertDefaultModeMaterializesAtBuild(ctx, expected, &.{}, keys.items, &lookup);
 
     // Eager = pre-mint loop; lazy = empty, mint-on-access.
     var eager_map = try Slots.init(ctx);
@@ -1138,7 +1191,6 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     defer parsed.deinit();
     const fixture = parsed.value;
     const expected = try jsonFieldRequired(fixture, "expected");
-    try testing.expectEqualStrings("eager", try jsonAsString(try jsonFieldRequired(expected, "default_mode")));
 
     // Split the map's declared entries by kind: input cells vs derived slots.
     // A single ReactiveMap fixes one handle kind, so a mixed-kind fixture is
@@ -1167,6 +1219,12 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
             .computed => try slot_keys.append(testing.allocator, key),
         }
     }
+
+    // default_mode across kinds: the same behavioural assertion as the all-computed
+    // fixtures, with the entry-kind split — the strategy the fixture names selects
+    // the build, and only the build that materializes BOTH kinds has all four
+    // declared entries present (under `lazy` only the two source entries would be).
+    try assertDefaultModeMaterializesAtBuild(ctx, expected, cell_keys.items, slot_keys.items, &lookup);
 
     // Eager build: every entry present (cells via entry, slots via materializeAll).
     var eager_cells = try Cells.init(ctx);
