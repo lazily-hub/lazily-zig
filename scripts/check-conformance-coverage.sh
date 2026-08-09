@@ -73,9 +73,6 @@ KNOWN_UNCOVERED=(
   # No runner at all in this binding.
   "agent-doc/delta_agent_doc_state.json"
   "agent-doc/snapshot_agent_doc_state.json"
-  "collections/seqcrdt_convergence.json"
-  "collections/textcrdt_convergence.json"
-  "collections/textcrdt_delta_sync.json"
   "message-passing/accepted_then_applied_receipt.json"
   "message-passing/cancel_preempts_nonterminal.json"
   "message-passing/editor_route_submit.json"

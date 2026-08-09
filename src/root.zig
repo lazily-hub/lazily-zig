@@ -121,6 +121,12 @@ pub const distributed_conformance = @import("./lazily/distributed_conformance.zi
 // implemented the whole op vocabulary and opened NONE of the corpus for it, so
 // all nine sat under "No runner at all in this binding".
 pub const lossless_tree_conformance = @import("./lazily/lossless_tree_conformance.zig");
+// Canonical replays for the two `collections/textcrdt_*.json` fixtures and for
+// `collections/seqcrdt_convergence.json`. Both models carried inline mirrors of
+// the corpus scenarios and opened NONE of the corpus, so all three fixtures sat
+// under "No runner at all in this binding" (`#lzzigcanonrunner`).
+pub const text_crdt_conformance = @import("./lazily/text_crdt_conformance.zig");
+pub const seq_crdt_conformance = @import("./lazily/seq_crdt_conformance.zig");
 // The `msgpack` frame codec (`#lzmsgpackseven`) — the cross-language binary
 // default of protocol.md § Frame codecs, derived from the reference json codec
 // so the two can never disagree about tags, field names, or the

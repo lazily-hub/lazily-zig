@@ -143,8 +143,19 @@ pub fn SeqCrdt(comptime Id: type, comptime V: type) type {
             return out;
         }
 
+        /// Is `id` a LIVE element?
+        ///
+        /// Removal is an LWW tombstone, so the entry survives in the table for
+        /// the merge algebra to reason about — answering from `entries` alone
+        /// reports a removed element as present, which is what this used to do.
+        /// The canonical `seqcrdt_convergence.json` pins the live reading
+        /// through `not_contains_on`, and lazily-rs answers it the same way
+        /// (`entries.get(id).is_some_and(|e| !e.deleted.value())`). Found by
+        /// retiring the inline mirror that hedged around it with
+        /// `!ab.contains("b") or ab.get("b") == null` (`#lzzigcanonrunner`).
         pub fn contains(self: *const Self, id: Id) bool {
-            return self.entries.contains(id);
+            const e = self.entries.get(id) orelse return false;
+            return !e.deleted;
         }
 
         pub fn get(self: *const Self, id: Id) ?V {
@@ -588,5 +599,10 @@ test "lazily/seq_crdt: remove tombstone converges; merge is commutative" {
     const oba = try ba.order(allocator);
     defer allocator.free(oba);
     try std.testing.expectEqualSlices([]const u8, oab, oba);
-    try std.testing.expect(!ab.contains("b") or ab.get("b") == null);
+    // Unhedged since `contains` became a LIVE-element question
+    // (`#lzzigcanonrunner`). The `or ab.get("b") == null` disjunct was the
+    // mirror agreeing with a defect it was transcribed from: it stayed green
+    // whether `contains` answered about live elements or about table entries,
+    // which is the one thing this line exists to pin.
+    try std.testing.expect(!ab.contains("b"));
 }
