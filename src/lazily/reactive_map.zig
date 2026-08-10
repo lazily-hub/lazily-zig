@@ -887,16 +887,38 @@ test "lazily/reactive_map: invalidate flags match conformance contract" {
 // ---------------------------------------------------------------------------
 
 const json = std.json;
-const SPEC_DIR = "../lazily-spec/conformance/materialization";
 const FV = i64;
 
 /// Reads through the runtime conformance manifest recorder
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
-const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const conformance_manifest = @import("conformance_manifest.zig");
+const readFixtureFile = conformance_manifest.specReadFile;
 
+/// The materialization corpus, resolved at RUNTIME so a probe can point this
+/// suite at a scratch copy without editing a comptime constant
+/// (`#lzzigspecdiroption`). Caller frees.
+fn specPath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/materialization/{s}", .{
+        conformance_manifest.conformanceRoot(),
+        name,
+    });
+}
+
+/// Are the fixtures readable — and if not, is that a skip or a failure?
+///
+/// Absence means different things by provenance. Without the `lazily-spec`
+/// sibling a contributor is not making a false claim, so the default root skips.
+/// An EXPLICIT `LAZILY_SPEC_CONFORMANCE_DIR` that cannot be read is a broken
+/// probe: skipping there is how a corpus-perturbation run reports GREEN having
+/// replayed nothing, silently converting red into skip (`#lzzigspecdiroption`).
 fn specFixturesPresent() bool {
-    const raw = readFixtureFile(SPEC_DIR ++ "/observational_transparency.json") catch return false;
+    // A bare `catch return false` is safe HERE only because `specReadFile`
+    // panics when an explicitly-named corpus is missing; without that this
+    // probe would convert a broken probe into a skip (`#lzzigspecdiroption`).
+    const path = specPath(std.testing.allocator, "observational_transparency.json") catch return false;
+    defer std.testing.allocator.free(path);
+    const raw = readFixtureFile(path) catch return false;
     std.testing.allocator.free(raw);
     return true;
 }
@@ -1029,7 +1051,7 @@ fn assertDefaultModeMaterializesAtBuild(
 /// Shared checks for the two `spec.val` fixtures (all-slot maps): default mode
 /// eager, eager materializes all, observational transparency eager==lazy.
 fn checkValFixture(ctx: *Context, name: []const u8) !void {
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ SPEC_DIR, name });
+    const path = try specPath(testing.allocator, name);
     defer testing.allocator.free(path);
     const raw = try readFixtureFile(path);
     defer testing.allocator.free(raw);
@@ -1095,7 +1117,9 @@ test "lazily/reactive_map conformance: observational_transparency" {
 
     // Replay the lazy read sequence on a fresh map; the lazy present set is
     // exactly the read keys (lazy_defers_slots).
-    const raw = try readFixtureFile(SPEC_DIR ++ "/observational_transparency.json");
+    const path = try specPath(testing.allocator, "observational_transparency.json");
+    defer testing.allocator.free(path);
+    const raw = try readFixtureFile(path);
     defer testing.allocator.free(raw);
     var parsed = try json.parseFromSlice(json.Value, testing.allocator, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -1130,7 +1154,9 @@ test "lazily/reactive_map conformance: deferral_not_deallocation" {
     defer ctx.deinit();
     try checkValFixture(ctx, "deferral_not_deallocation.json");
 
-    const raw = try readFixtureFile(SPEC_DIR ++ "/deferral_not_deallocation.json");
+    const path = try specPath(testing.allocator, "deferral_not_deallocation.json");
+    defer testing.allocator.free(path);
+    const raw = try readFixtureFile(path);
     defer testing.allocator.free(raw);
     var parsed = try json.parseFromSlice(json.Value, testing.allocator, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -1185,7 +1211,9 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
 
-    const raw = try readFixtureFile(SPEC_DIR ++ "/entry_kind_orthogonal_to_mode.json");
+    const path = try specPath(testing.allocator, "entry_kind_orthogonal_to_mode.json");
+    defer testing.allocator.free(path);
+    const raw = try readFixtureFile(path);
     defer testing.allocator.free(raw);
     var parsed = try json.parseFromSlice(json.Value, testing.allocator, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();

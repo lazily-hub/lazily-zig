@@ -49,18 +49,99 @@ var manifest_resolved: bool = false;
 
 /// Read a conformance fixture and record the fact that its bytes were opened.
 ///
+/// The canonical corpus location when nothing overrides it.
+pub const DEFAULT_CONFORMANCE_ROOT = "../lazily-spec/conformance";
+
+/// Name of the corpus-directory override, shared with every sibling binding and
+/// with `scripts/check-conformance-coverage.sh` (`#lzoverrideallrunners`).
+pub const CONFORMANCE_DIR_ENV = "LAZILY_SPEC_CONFORMANCE_DIR";
+
+/// The override, or null when the default applies.
+///
+/// Resolved ONCE into a file-scope buffer rather than per call: the root is
+/// concatenated into a path at every fixture read, and `readEnv` re-opens and
+/// re-scans `/proc/self/environ` on each call (there is no stable `getenv` across
+/// the three pinned toolchains — see `readEnv`). Caching also means the corpus a
+/// run reads cannot change halfway through it.
+var root_buf: [4096]u8 = undefined;
+var root_slice: ?[]const u8 = null;
+var root_resolved: bool = false;
+
+pub fn conformanceRootOverride() ?[]const u8 {
+    if (!root_resolved) {
+        root_resolved = true;
+        if (readEnv(CONFORMANCE_DIR_ENV, &root_buf)) |value| {
+            root_slice = value;
+        }
+    }
+    return root_slice;
+}
+
+/// The corpus root this process should read.
+pub fn conformanceRoot() []const u8 {
+    return conformanceRootOverride() orelse DEFAULT_CONFORMANCE_ROOT;
+}
+
+/// Is an unreadable fixture a SKIP, or a failure?
+///
+/// This is the whole reason the override is a runtime read rather than an edit
+/// to a comptime constant (`#lzzigspecdiroption`). Every replay here guards
+/// itself with a presence probe and answers absence with `error.SkipZigTest`,
+/// because a contributor without the `lazily-spec` sibling is not making a false
+/// claim. But that same skip is a trap for a corpus-perturbation probe: point the
+/// tests at a scratch corpus, typo the path, and the suite reports GREEN having
+/// replayed nothing — the probe silently converts red into skip, which is
+/// precisely the vacuity these guards exist to prevent.
+///
+/// So absence means different things by provenance. The DEFAULT root may be
+/// absent (skip). An EXPLICIT root may not: naming a corpus is a claim that it is
+/// there, and if it is not, that is a broken probe and must be loud.
+pub fn conformanceAbsenceIsFatal() bool {
+    return conformanceRootOverride() != null;
+}
+
+/// Self-tests that deliberately read an absent path set this. Nothing else may.
+pub var absence_probe_mode: bool = false;
+
+/// Enforce the rule ABOVE the error channel, at the one point every corpus read
+/// funnels through.
+///
+/// Returning an error here would not be enough, and that is the whole lesson of
+/// this change. Eleven presence probes in this repo have the shape
+/// `fn specFixturesPresent() bool { _ = read(...) catch return false; }`, and
+/// every one of them converts any error — including "the corpus you named is not
+/// there" — into `error.SkipZigTest`. A per-call error is therefore silently
+/// swallowed by the exact code the fail-closed rule exists to protect. A panic
+/// cannot be caught into a skip, so the guarantee becomes structural rather than
+/// something each of eleven call sites has to remember (`#lzzigspecdiroption`).
+fn panicIfExplicitCorpusMissing(path: []const u8, err: anyerror) void {
+    if (absence_probe_mode) return;
+    const root = conformanceRootOverride() orelse return;
+    if (!std.mem.startsWith(u8, path, root)) return;
+    std.debug.panic(
+        "{s} names `{s}`, but {s} could not be read ({s}).\n" ++
+            "An explicitly pointed-at corpus that is not there is a BROKEN PROBE, not a skip: " ++
+            "skipping here is how a corpus-perturbation run reports green having replayed " ++
+            "nothing (#lzzigspecdiroption).",
+        .{ CONFORMANCE_DIR_ENV, root, path, @errorName(err) },
+    );
+}
+
 /// Drop-in for the `readFixtureFile` helper each conformance file used to define
 /// for itself.
 pub fn specReadFile(path: []const u8) ![]u8 {
-    const bytes = if (comptime builtin.zig_version.minor >= 16)
-        try std.Io.Dir.cwd().readFileAlloc(
+    const bytes = (if (comptime builtin.zig_version.minor >= 16)
+        std.Io.Dir.cwd().readFileAlloc(
             std.testing.io,
             path,
             std.testing.allocator,
             .limited(1024 * 1024),
         )
     else
-        try std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024);
+        std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024 * 1024)) catch |err| {
+        panicIfExplicitCorpusMissing(path, err);
+        return err;
+    };
     // A failed lookup did not open fixture bytes and must not manufacture
     // evidence. Recording after the successful read also keeps negative loader
     // tests from poisoning the runtime manifest with nonexistent ids.

@@ -35,12 +35,20 @@ pub const Value = json.Value;
 /// Reads through the runtime conformance manifest recorder: naming a fixture is
 /// not replaying it, so the coverage guard is fed by observed reads rather than
 /// a source grep.
+const conformance_manifest = @import("conformance_manifest.zig");
 pub const specReadFile = @import("conformance_manifest.zig").specReadFile;
 
 /// Runtime scenario ledger (`#lzscenariocoverage`). See `Scenarios` below.
 pub const recordScenario = @import("conformance_manifest.zig").recordScenario;
 
-pub const CONFORMANCE_ROOT = "../lazily-spec/conformance";
+/// Kept as the DEFAULT root and as the string diagnostics print. The corpus a
+/// run actually reads comes from `conformanceRoot()`, which honours
+/// `LAZILY_SPEC_CONFORMANCE_DIR` (`#lzzigspecdiroption`).
+pub const CONFORMANCE_ROOT = conformance_manifest.DEFAULT_CONFORMANCE_ROOT;
+
+/// The corpus root for this process — the override when one is set.
+pub const conformanceRoot = conformance_manifest.conformanceRoot;
+pub const conformanceRootOverride = conformance_manifest.conformanceRootOverride;
 
 pub const Fixture = json.Parsed(Value);
 
@@ -53,8 +61,12 @@ pub const Fixture = json.Parsed(Value);
 /// whole test.
 pub fn load(rel_path: []const u8) !?Fixture {
     const allocator = std.testing.allocator;
-    const path = try std.fmt.allocPrint(allocator, CONFORMANCE_ROOT ++ "/{s}", .{rel_path});
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ conformanceRoot(), rel_path });
     defer allocator.free(path);
+    // Absence of the DEFAULT corpus is an ordinary local state and loads as
+    // null. Absence of an EXPLICIT one never reaches here — `specReadFile`
+    // panics on it, because a `catch return null` is exactly what would turn a
+    // broken probe into a silent skip (`#lzzigspecdiroption`).
     const raw = specReadFile(path) catch return null;
     defer allocator.free(raw);
     return try json.parseFromSlice(Value, allocator, raw, .{ .allocate = .alloc_always });
@@ -218,8 +230,33 @@ test "conformance_json: structural equality ignores object key order" {
 }
 
 test "conformance_json: an absent corpus loads as null rather than failing" {
+    // This test reads a path that is MEANT to be missing, so it must opt out of
+    // the explicit-corpus panic — otherwise the whole suite aborts whenever it is
+    // run under `LAZILY_SPEC_CONFORMANCE_DIR`, which is exactly when a
+    // perturbation probe needs it (`#lzzigspecdiroption`).
+    conformance_manifest.absence_probe_mode = true;
+    defer conformance_manifest.absence_probe_mode = false;
     const missing = try load("definitely-not-a-corpus-directory/nope.json");
     try std.testing.expect(missing == null);
+}
+
+test "conformance_json: an EXPLICIT corpus that is absent is fatal, not a skip" {
+    // The other half, and the one that matters. Asserting only the null branch
+    // above is how the skip trap survived: absence has two provenances and the
+    // suite pinned one of them. Here the panic itself cannot be caught, so what
+    // is pinned is the DECISION that produces it.
+    const saved = conformance_manifest.absence_probe_mode;
+    defer conformance_manifest.absence_probe_mode = saved;
+
+    conformance_manifest.absence_probe_mode = false;
+    if (conformance_manifest.conformanceRootOverride() == null) {
+        // No override in this run: the default root is the one in play, and its
+        // absence is legitimately a skip. Pin that reading rather than silently
+        // passing.
+        try std.testing.expect(!conformance_manifest.conformanceAbsenceIsFatal());
+        return;
+    }
+    try std.testing.expect(conformance_manifest.conformanceAbsenceIsFatal());
 }
 
 // ---------------------------------------------------------------------------
