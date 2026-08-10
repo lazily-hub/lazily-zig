@@ -58,7 +58,36 @@ const slotKeyed = @import("slot.zig").slotKeyed;
 const AsyncContext = @import("async_context.zig").AsyncContext;
 const ThreadSafeContext = @import("thread_safe_context.zig").ThreadSafeContext;
 
-const SPEC_DIR = "../lazily-spec/conformance/reactive-graph";
+const conformance_manifest = @import("conformance_manifest.zig");
+
+/// Corpus area this file replays.
+const AREA = "reactive-graph";
+
+/// This used to be `const SPEC_DIR = "../lazily-spec/conformance/reactive-graph"`,
+/// a COMPTIME constant — and this is the one runner in the binding that
+/// ENUMERATES the corpus directory rather than only reading named files
+/// (`#lzledgeragreementaudit`). So the drift guard below, the guard whose entire
+/// job is to fire when somebody else grows the corpus, was reading a path that
+/// `LAZILY_SPEC_CONFORMANCE_DIR` could not move.
+///
+/// That made it immune to the probe it most needs to survive. Point the suite at
+/// a scratch corpus carrying an extra reactive-graph fixture and this runner
+/// enumerated the DEFAULT corpus instead, found no drift, and reported green
+/// having proved nothing about the corpus it was aimed at. Pointing it at a
+/// corpus that does not exist AT ALL was green too, because
+/// `panicIfExplicitCorpusMissing` only fires for paths under the override root
+/// and these paths never were (`#lzzigspecdiroption`, `#lzoverrideallrunners`).
+///
+/// Resolved at runtime, so both the enumeration and every fixture read follow
+/// the override, and an explicitly named corpus that is absent is fatal here for
+/// the same reason it is everywhere else.
+fn specPath(a: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ conformance_manifest.conformanceRoot(), AREA, name });
+}
+
+fn specDirPath(a: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}", .{ conformance_manifest.conformanceRoot(), AREA });
+}
 
 /// The value type every model carries. The corpus is integer-valued.
 const V = i64;
@@ -285,18 +314,21 @@ const EffectLog = struct {
 /// Reads through the runtime conformance manifest recorder
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
-const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const readFixtureFile = conformance_manifest.specReadFile;
 
 fn specFixturesPresent() bool {
-    const raw = readFixtureFile(
-        SPEC_DIR ++ "/transitive_invalidation_reaches_depth.json",
+    const path = specPath(
+        std.testing.allocator,
+        "transitive_invalidation_reaches_depth.json",
     ) catch return false;
+    defer std.testing.allocator.free(path);
+    const raw = readFixtureFile(path) catch return false;
     std.testing.allocator.free(raw);
     return true;
 }
 
 fn loadFixture(name: []const u8) !json.Parsed(json.Value) {
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ SPEC_DIR, name });
+    const path = try specPath(std.testing.allocator, name);
     defer std.testing.allocator.free(path);
     const raw = try readFixtureFile(path);
     defer std.testing.allocator.free(raw);
@@ -1903,7 +1935,19 @@ fn sortedKeys(map: json.ObjectMap) ![]const []const u8 {
 
 fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value, total: *Report) !void {
     const a = std.testing.allocator;
-    const shape = try asString(field(fx, "shape") orelse return error.MissingShape);
+    // A bare `error.MissingShape` / `error.UnknownFixtureShape` names neither
+    // the fixture nor what was read, and this is the failure a GROWN corpus
+    // produces (`#lzledgeragreementaudit`). Findings print, then return the
+    // error — see the file header.
+    const shape_value = field(fx, "shape") orelse {
+        std.debug.print(
+            "  reactive-graph {s}: fixture carries no `shape` — this runner dispatches on it " ++
+                "and cannot guess. Fix the fixture upstream or add the shape here\n",
+            .{fixture_name},
+        );
+        return error.MissingShape;
+    };
+    const shape = try asString(shape_value);
 
     if (std.mem.eql(u8, shape, "steps")) {
         resetDefs();
@@ -1919,7 +1963,15 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
         return;
     }
 
-    if (!std.mem.eql(u8, shape, "scenarios")) return error.UnknownFixtureShape;
+    if (!std.mem.eql(u8, shape, "scenarios")) {
+        std.debug.print(
+            "  reactive-graph {s}: unknown fixture shape `{s}` — this runner knows only " ++
+                "`steps` and `scenarios`. A fixture carrying a new shape needs a replay arm " ++
+                "here before it can be replayed; never widen this to a skip (#lzspecconf)\n",
+            .{ fixture_name, shape },
+        );
+        return error.UnknownFixtureShape;
+    }
 
     // `observationally_equal` is a relation between two op streams, which a
     // single `steps` array cannot express. Each scenario is replayed in its own
@@ -2023,9 +2075,9 @@ fn runCorpus(comptime Model: type) !void {
 
     if (!specFixturesPresent()) {
         std.debug.print(
-            "SKIP reactive_graph_conformance[{s}]: {s} not found — clone lazily-spec as a " ++
+            "SKIP reactive_graph_conformance[{s}]: {s}/{s} not found — clone lazily-spec as a " ++
                 "sibling to run the reactive-graph fixtures (#lzspecconf)\n",
-            .{ name, SPEC_DIR },
+            .{ name, conformance_manifest.conformanceRoot(), AREA },
         );
         return error.SkipZigTest;
     }
@@ -2170,17 +2222,20 @@ test "reactive-graph conformance: fixture set on disk matches FIXTURES" {
     // An upstream addition or rename must fail here rather than go unrun.
     if (!specFixturesPresent()) return error.SkipZigTest;
 
+    const dir_path = try specDirPath(std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+
     var seen: usize = 0;
     if (comptime builtin.zig_version.minor >= 16) {
         const io = std.testing.io;
-        var dir = try std.Io.Dir.cwd().openDir(io, SPEC_DIR, .{ .iterate = true });
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         defer dir.close(io);
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             seen += try countFixture(entry.name);
         }
     } else {
-        var dir = try std.fs.cwd().openDir(SPEC_DIR, .{ .iterate = true });
+        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
         var it = dir.iterate();
         while (try it.next()) |entry| {
