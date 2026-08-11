@@ -606,6 +606,54 @@ print(
 )
 PY_BLOCKS
 
+# ── no replay spells the corpus root itself (#lzzigingressspecdir) ─────────
+#
+# Every rung above reasons about the corpus the run READ. This one is about
+# WHICH corpus that was. Fourteen sites across twelve areas each carried their
+# own `const SPEC_DIR = "../lazily-spec/conformance/<area>"` and built paths by
+# comptime concatenation, so LAZILY_SPEC_CONFORMANCE_DIR moved some replays and
+# not others — and nothing could report it, because a run that reads the DEFAULT
+# corpus while believing it was redirected is green either way. Truncating
+# fourteen fixtures in a scratch corpus and pointing the suite at it reddened
+# ZERO tests before the fix and 26 after.
+#
+# That silence is what makes this worth a guard rather than a convention: the
+# failure mode of a perturbation probe (#lzperturbaudit) is a cell that reads
+# "this fixture cannot be made to fail" when in truth the runner never opened the
+# bytes. Build corpus paths with specPath/specAreaPath in conformance_manifest.zig
+# (or conformance_json.load), which resolve the root at runtime.
+#
+# conformance_manifest.zig is the one legitimate mention: it DEFINES the default
+# and its own tests exercise canonicalisation. The needle is split so this
+# script does not match itself.
+needle='../lazily-'"spec/conformance"
+examined=0
+offenders=()
+while IFS= read -r f; do
+  examined=$((examined + 1))
+  case "$f" in */conformance_manifest.zig) continue ;; esac
+  # Comments may legitimately quote the old form while explaining it; only code
+  # that could BUILD a path counts, so skip `///` and `//!` doc lines.
+  if grep -v '^\s*//' "$f" | grep -qF "$needle"; then
+    offenders+=("$f")
+  fi
+done < <(find src -name '*.zig' | sort)
+
+# Positive evidence: a walk that examined nothing would report OK over an empty
+# set, the vacuous green every other rung here refuses.
+if [ "$examined" -lt 20 ]; then
+  echo "ERROR: corpus-root scan examined only $examined zig sources — expected the whole tree." >&2
+  echo "       Reporting OK here would be a pass over nothing (#lzvacuousrun)." >&2
+  exit 1
+elif [ "${#offenders[@]}" -gt 0 ]; then
+  echo "ERROR: these sources spell the corpus root instead of resolving it at runtime:" >&2
+  for f in "${offenders[@]}"; do echo "         $f" >&2; done
+  echo "       LAZILY_SPEC_CONFORMANCE_DIR would not reach them, so a perturbation probe" >&2
+  echo "       reads their fixtures as unfalsifiable. Build the path with specPath /" >&2
+  echo "       specAreaPath (#lzzigingressspecdir)." >&2
+  exit 1
+fi
+
 echo "conformance coverage OK: $covered/$total canonical fixtures OPENED by the suite" \
      "(${#KNOWN_UNCOVERED[@]} listed as known-uncovered; runtime manifest — these bytes were really read)"
 echo "scenario coverage OK: $scenario_replayed/$scenario_total scenarios of those fixtures REPLAYED" \
