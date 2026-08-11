@@ -23,22 +23,39 @@ check: fmt test test-interop-peer test-lean-formal conformance-coverage assertio
 assertion-ordering-check:
 	python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .
 
-# The formatting GATE (#lazilydartzig). This binding had no formatting floor at
-# all — nothing in `check`, nothing in CI — so drift was invisible until someone
-# read a diff.
+# The formatting GATE (#lazilydartzig, #lzzigfmttoolchains). This binding had no
+# formatting floor at all — nothing in `check`, nothing in CI — so drift was
+# invisible until someone read a diff.
 #
 # `zig fmt` is canonical and ships with the toolchain, so adopting it costs no new
-# dependency. The one real question was WHICH toolchain's `zig fmt`, because this
-# repo pins three (0.15.2 / 0.16.0 / master) and a formatter that disagreed across
-# them would make the gate a coin flip. It does not: all three flag exactly the
-# same 21 files on the pre-format tree, so `$(ZIG)` needs no pin here. The CI step
-# runs inside the existing three-toolchain matrix, which keeps re-proving that
-# rather than trusting this comment.
+# dependency. The real question is WHICH toolchain's `zig fmt`, because this repo
+# pins three (0.15.2 / 0.16.0 / master) and they DO NOT all produce the same
+# bytes. The claim that used to sit here — "all three flag exactly the same 21
+# files" — was an observation on ONE tree, not a property of the formatters, and
+# it is false as a general statement: 0.15.2 and 0.16.0 disagree about a multiline
+# string literal spliced inline with `++` inside a `return`, and neither output is
+# a fixed point of the other. 5bea17c restructured the one construct that tripped
+# it; this target is what stops the next one reaching CI.
+#
+# So the gate is not `$(ZIG) fmt --check .`. It is every pinned RELEASE toolchain
+# in the CI matrix, resolved and version-verified, with any that is missing NAMED
+# and fatal — "checked 1 of 2" must never report OK. `master` is advisory only: it
+# is a moving nightly, so a local `master` and CI's `master` are different
+# compilers and a gate on it is a coin flip. CI runs this same script over both
+# pinned releases in one job.
+#
+# GUARANTEED by a green `make fmt`: this tree is accepted byte-for-byte by zig fmt
+# 0.15.2 AND 0.16.0. NOT guaranteed: anything about master, or about any zig
+# release this repo does not pin.
 #
 # --check is the gate; the rewriting form is `fmt-fix` and is not in `check`.
 fmt:
-	$(ZIG) fmt --check .
+	./scripts/check-fmt.sh
 
+# Rewrites with $(ZIG) — ONE toolchain, by construction. It cannot fix a
+# cross-toolchain disagreement, because for such a construct there is no
+# formatting all pinned releases accept: run `make fmt` afterwards and restructure
+# whatever it still names.
 fmt-fix:
 	$(ZIG) fmt .
 

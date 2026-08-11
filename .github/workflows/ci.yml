@@ -32,6 +32,64 @@ jobs:
   # dependency loop from a field naming a container decl, and a nested error
   # union 0.15.2 will not coerce. `std.Io` genuinely does not exist there, so
   # `FileOutboxStore`'s two tests skip visibly; nothing else is downgraded.
+  # ---------------------------------------------------------------------------
+  # The formatting gate (#lazilydartzig, #lzzigfmttoolchains).
+  #
+  # ONE job that installs EVERY pinned release toolchain and runs `make fmt`
+  # once, rather than a step inside the matrix that ran it against whichever
+  # single toolchain that job had.
+  #
+  # `zig fmt` is not one formatter. The pinned releases disagree per-CONSTRUCT:
+  # 0.15.2 rewrites a multiline string literal spliced inline with `++` inside a
+  # `return` differently from 0.16.0, and neither output is a fixed point of the
+  # other. Under the old shape that was invisible until CI: a contributor
+  # formatted with the toolchain on their PATH, `make fmt` passed locally, and
+  # the OTHER matrix job reddened. 5bea17c is the workaround for one instance of
+  # it. `scripts/check-fmt.sh` is the gate for the class, and it now runs the
+  # same way here and on a laptop.
+  #
+  # Still PINNED RELEASES ONLY — never `master`. `mlugg/setup-zig` resolves
+  # `master` to the current nightly, so CI's `master` and a local `master` are
+  # different compilers; a gate on it reddens on the upstream formatter's
+  # schedule rather than on anything a contributor did, which is how a gate
+  # teaches everyone to ignore it. check-fmt.sh reports it as advisory and never
+  # gates on it. master keeps running every other step in the matrix below.
+  #
+  # The version literals below are load-bearing: check-fmt.sh derives its gated
+  # set from the `zig:` matrix in this file and then asserts this workflow
+  # installs each of them with a literal `version:`. Adding a pinned release to
+  # the matrix without installing it here fails the gate instead of quietly
+  # checking fewer toolchains than the set claims.
+  fmt:
+    name: Format gate (all pinned releases)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.15.2'
+      - name: Record the 0.15.2 formatter
+        run: echo "ZIG_FMT_0_15_2=$(command -v zig)" >>"$GITHUB_ENV"
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.16.0'
+      - name: Record the 0.16.0 formatter
+        run: echo "ZIG_FMT_0_16_0=$(command -v zig)" >>"$GITHUB_ENV"
+
+      # check-fmt.sh asks each resolved binary its own version and fails if it
+      # answers with anything other than the version it was resolved FOR, so two
+      # paths that turned out to be the same compiler cannot report as two
+      # toolchains agreeing.
+      - name: Format gate (make fmt)
+        run: make fmt
+
+  # ---------------------------------------------------------------------------
   test:
     name: Zig ${{ matrix.zig }}
     runs-on: ubuntu-latest
@@ -48,26 +106,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ matrix.zig }}
-
-      # The formatting gate (#lazilydartzig). Inside the matrix, but PINNED
-      # RELEASES ONLY — never `master`.
-      #
-      # This first shipped running on all three, on the strength of a local check
-      # that all three flagged the same 21 files. That check was worthless for
-      # `master` and CI said so within the hour: `mlugg/setup-zig` resolves
-      # `master` to the current nightly, so the locally-installed `master` and
-      # CI's `master` are simply different compilers, and 0.15.2 + 0.16.0 passed
-      # while master reddened on five files. `master` cannot be pinned by
-      # construction, so a gate that runs on it reddens on the upstream
-      # formatter's schedule rather than on anything a contributor did — which is
-      # how a gate teaches everyone to ignore it.
-      #
-      # The two pinned releases still cross-check each other, which is the part
-      # of the original intent that was actually verifiable. master keeps running
-      # every other step in the matrix.
-      - name: Format gate (make fmt)
-        if: matrix.zig != 'master'
-        run: make fmt
 
       # lazily-spec is the canonical cross-language source for the conformance
       # fixtures. Clone it as a sibling BEFORE the test step so the replay
