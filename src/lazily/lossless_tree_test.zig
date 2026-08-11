@@ -237,6 +237,63 @@ test "lazily/lossless_tree: non_contiguous_anti_entropy — hole then repair" {
     try std.testing.expectEqualStrings("0123", rb);
 }
 
+// `diff` returns ops in canonical `(counter, peer)` order (#lzzigdiffmutant).
+//
+// Nothing else pins this. Replacing the sort with `std.mem.reverse` leaves the
+// whole suite green, including `non_contiguous_anti_entropy` — that fixture's
+// `deliver.only: [0, 2]` selects a SET that happens to be order-invariant here,
+// so it pins the anti-entropy FILTER (both an ignore-the-frontier mutant and a
+// per-peer-max mutant redden it) while pinning nothing about order.
+//
+// The order is still a contract, and a cross-binding one: `deliver.only` indexes
+// positionally into whatever `diff` returns, so the canonical fixture means the
+// same thing in every binding only while every binding agrees on that order.
+// lazily-rs (`ops.sort_by_key(|op| (op.id.counter, op.id.peer))`), lazily-py
+// (`sorted(...)`) and lazily-js (`.sort(cmpId)`) all produce it. A binding that
+// dropped the sort would keep replaying the corpus green while `only` selected
+// different ops than the fixture names.
+//
+// Constructed so log order and sorted order DIFFER — otherwise the assertion
+// holds for a reversed diff too and pins nothing. `a` appends its own ops as it
+// makes them and appends `b`'s op when it arrives, so a remote op with a LOWER
+// counter than a's latest lands LAST in the log.
+test "lazily/lossless_tree: diff returns ops in canonical (counter, peer) order" {
+    var a = try LosslessTreeCrdt.init(allocator, 1);
+    defer a.deinit();
+    const para = try element(&a, lt.root_id, null, "para");
+    const base = try leaf(&a, para, null, .trivia, "0");
+
+    var b = try a.fork(2);
+    defer b.deinit();
+
+    // a runs ahead to counter 4; b's single op stays at counter 3.
+    const one = try a.createNode(para, base, .{ .leaf = .{ .kind = .trivia, .text = "1" } });
+    _ = try a.createNode(para, one, .{ .leaf = .{ .kind = .trivia, .text = "2" } });
+    _ = try b.createNode(para, base, .{ .leaf = .{ .kind = .trivia, .text = "9" } });
+
+    const from_b = try b.diff(&a.getFrontier(), allocator);
+    defer b.freeUpdate(from_b);
+    try a.applyUpdate(from_b);
+
+    var empty = lt.TreeVersionFrontier.init(allocator);
+    defer empty.deinit();
+    const all = try a.diff(&empty, allocator);
+    defer a.freeUpdate(all);
+
+    // Non-vacuity: the log itself is NOT in canonical order, so an unsorted or
+    // reversed `diff` cannot satisfy the assertion below by accident.
+    try std.testing.expectEqual(all.ops.len, a.log.items.len);
+    var log_is_canonical = true;
+    for (a.log.items, all.ops) |logged, sorted_op| {
+        if (!logged.id.eql(sorted_op.id)) log_is_canonical = false;
+    }
+    try std.testing.expect(!log_is_canonical);
+
+    for (all.ops[1..], all.ops[0 .. all.ops.len - 1]) |curr, prev| {
+        try std.testing.expectEqual(std.math.Order.lt, prev.id.compare(curr.id));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // token_trivia_preservation fixture
 // ---------------------------------------------------------------------------
