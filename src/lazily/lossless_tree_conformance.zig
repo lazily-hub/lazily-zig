@@ -557,22 +557,64 @@ const three_op_steps =
     \\    { "on": "a", "op": "edit_leaf", "node": "inner", "at_byte": 4, "delete_bytes": 0, "insert": "X" },
 ;
 
-fn threeOpScenario(comptime delivery: []const u8, comptime expect: []const u8) []const u8 {
-    return
+const both_render_deepX =
+    \\ { "render_on": { "a": "deepX", "b": "deepX" } }
+;
+
+const b_still_empty =
+    \\ { "render_on": { "a": "deepX", "b": "" } }
+;
+
+const reversed_batch =
+    \\    { "deliver": { "from": "a", "to": "b", "order": [2, 1, 0] } }
+;
+
+const last_valid_index =
+    \\    { "deliver": { "from": "a", "to": "b", "order": [2] } }
+;
+
+const order_past_the_end =
+    \\    { "deliver": { "from": "a", "to": "b", "order": [3] } }
+;
+
+const only_past_the_end =
+    \\    { "deliver": { "from": "a", "to": "b", "only": [0, 9] } }
+;
+
+const both_selectors =
+    \\    { "deliver": { "from": "a", "to": "b", "only": [0], "order": [0] } }
+;
+
+const no_selector =
+    \\    { "deliver": { "from": "a", "to": "b" } }
+;
+
+const scenario_head =
     \\{
     \\  "id": "runner_contract",
     \\  "seed": { "peer": 1, "tree": { "children": [
     \\    { "label": "para", "element": "para", "children": [] }
     \\  ] } },
     \\  "steps": [
-    ++ three_op_steps ++ delivery ++
-        \\
-        \\  ],
-        \\  "expect":
-    ++ expect ++
-        \\
-        \\}
-    ;
+;
+
+const scenario_expect_mark =
+    \\
+    \\  ],
+    \\  "expect":
+;
+
+const scenario_close =
+    \\
+    \\}
+;
+
+/// The three-op scenario above, with one delivery step and one `expect` block
+/// spliced in. Every piece is its own named literal because `zig fmt` 0.15.2 and
+/// 0.16.0 disagree about a multiline string literal spliced inline with `++`,
+/// and the format gate runs on all three pinned toolchains.
+fn threeOpScenario(comptime delivery: []const u8, comptime expect: []const u8) []const u8 {
+    return scenario_head ++ three_op_steps ++ delivery ++ scenario_expect_mark ++ expect ++ scenario_close;
 }
 
 test "lossless-tree runner: deliver.order reaches applyUpdate unsorted, in ONE call" {
@@ -581,11 +623,7 @@ test "lossless-tree runner: deliver.order reaches applyUpdate unsorted, in ONE c
     delivery_probe = &probe;
     defer delivery_probe = null;
 
-    try replayInline(threeOpScenario(
-        \\    { "deliver": { "from": "a", "to": "b", "order": [2, 1, 0] } }
-    ,
-        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
-    ));
+    try replayInline(threeOpScenario(reversed_batch, both_render_deepX));
 
     // ONE call. Splitting the batch would let each op find its dependency
     // already applied, so the buffer would never be exercised.
@@ -608,32 +646,24 @@ test "lossless-tree runner: an out-of-range delivery index fails rather than cla
     // is about the bound and not about the shape. `b` renders empty because the
     // one op it received is a `LeafEdit` whose target has not arrived — it sits
     // in the buffer, which is the behaviour the corpus fixture goes on to pin.
-    try replayInline(threeOpScenario(
-        \\    { "deliver": { "from": "a", "to": "b", "order": [2] } }
-    ,
-        \\ { "render_on": { "a": "deepX", "b": "" } }
-    ));
-    try testing.expectError(error.DeliverIndexOutOfRange, replayInline(threeOpScenario(
-        \\    { "deliver": { "from": "a", "to": "b", "order": [3] } }
-    ,
-        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
-    )));
-    try testing.expectError(error.DeliverIndexOutOfRange, replayInline(threeOpScenario(
-        \\    { "deliver": { "from": "a", "to": "b", "only": [0, 9] } }
-    ,
-        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
-    )));
+    try replayInline(threeOpScenario(last_valid_index, b_still_empty));
+    try testing.expectError(
+        error.DeliverIndexOutOfRange,
+        replayInline(threeOpScenario(order_past_the_end, both_render_deepX)),
+    );
+    try testing.expectError(
+        error.DeliverIndexOutOfRange,
+        replayInline(threeOpScenario(only_past_the_end, both_render_deepX)),
+    );
 }
 
 test "lossless-tree runner: a deliver step carries exactly one of only/order" {
-    try testing.expectError(error.DeliverSelectorConflict, replayInline(threeOpScenario(
-        \\    { "deliver": { "from": "a", "to": "b", "only": [0], "order": [0] } }
-    ,
-        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
-    )));
-    try testing.expectError(error.DeliverSelectorMissing, replayInline(threeOpScenario(
-        \\    { "deliver": { "from": "a", "to": "b" } }
-    ,
-        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
-    )));
+    try testing.expectError(
+        error.DeliverSelectorConflict,
+        replayInline(threeOpScenario(both_selectors, both_render_deepX)),
+    );
+    try testing.expectError(
+        error.DeliverSelectorMissing,
+        replayInline(threeOpScenario(no_selector, both_render_deepX)),
+    );
 }
