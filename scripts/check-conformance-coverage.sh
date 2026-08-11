@@ -451,8 +451,9 @@ fi
 # Re-pinned 2026-08-11 against lazily-spec `39df4b3`, which landed
 # `lossless-tree/apply_update_advances_counter.json` and
 # `lossless-tree/out_of_order_delivery_buffers.json` (#lzspecoutoforderfixtures):
-# 134/152 fixtures OPENED, 149/149 scenarios REPLAYED. Both numbers read off a
-# local `make test` run; each is EXACT — 135 and 150 both fail.
+# 134/152 fixtures OPENED, 149/149 scenarios REPLAYED. Read off CI run
+# 31501252193, where all three pinned toolchains report the same two numbers; a
+# local `make test` reproduced them. Each is EXACT — 135 and 150 both fail.
 #
 # Previously 132/147, pinned 2026-08-09 from CI run 31343252373 against a
 # 150-fixture corpus.
