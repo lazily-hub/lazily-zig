@@ -495,10 +495,9 @@ test "lazily/receipt: causal_receipts conformance fixture round-trips" {
     // re-encode byte-identically.
     const allocator = std.testing.allocator;
 
-    const fixture_path = try std.fmt.allocPrint(
+    const fixture_path = try specPath(
         allocator,
-        "../lazily-spec/conformance/receipts/causal_receipts.json",
-        .{},
+        "receipts/causal_receipts.json",
     );
     defer allocator.free(fixture_path);
 
@@ -780,10 +779,9 @@ test "lazily/receipt: replaying the conformance fixture into a projection yields
     // fixture's `assertions` block.
     const allocator = std.testing.allocator;
 
-    const fixture_path = try std.fmt.allocPrint(
+    const fixture_path = try specPath(
         allocator,
-        "../lazily-spec/conformance/receipts/causal_receipts.json",
-        .{},
+        "receipts/causal_receipts.json",
     );
     defer allocator.free(fixture_path);
     const fixture_raw = try readFixtureFile(fixture_path);
@@ -933,3 +931,4 @@ fn asArray(value: std.json.Value) ![]const std.json.Value {
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const specPath = @import("conformance_manifest.zig").specPath;

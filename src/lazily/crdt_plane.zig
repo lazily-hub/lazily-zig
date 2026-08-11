@@ -501,7 +501,8 @@ test "lazily/crdt_plane: stability frontier expands with membership" {
 
 const builtin = @import("builtin");
 const json = std.json;
-const FAMILY_FIXTURE = "../lazily-spec/conformance/familysync/materialize_on_ingest.json";
+/// Corpus-relative; the root resolves at RUNTIME (`#lzzigingressspecdir`).
+const FAMILY_FIXTURE_REL = "familysync/materialize_on_ingest.json";
 
 const TRUE_STATE = [_]u8{1};
 const FALSE_STATE = [_]u8{0};
@@ -561,6 +562,7 @@ test "lazily/crdt_plane: family sync materializes remote keys on ingest" {
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFamilyFixture = @import("conformance_manifest.zig").specReadFile;
+const specPath = @import("conformance_manifest.zig").specPath;
 
 /// Per-scenario replay accounting (#lzscenariocoverage). Opening the fixture is
 /// rung 1; this records that each of its three scenarios was actually replayed.
@@ -568,7 +570,10 @@ const cj = @import("conformance_json.zig");
 
 test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
     const allocator = std.testing.allocator;
-    const raw = readFamilyFixture(FAMILY_FIXTURE) catch return error.SkipZigTest;
+    const family_fixture = specPath(std.testing.allocator, FAMILY_FIXTURE_REL) catch
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(family_fixture);
+    const raw = readFamilyFixture(family_fixture) catch return error.SkipZigTest;
     defer allocator.free(raw);
 
     var parsed = try json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always });

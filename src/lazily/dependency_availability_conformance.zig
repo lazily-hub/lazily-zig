@@ -8,7 +8,9 @@ const ThreadSafeContext = @import("thread_safe_context.zig").ThreadSafeContext;
 const dependency = @import("dependency_map.zig");
 const cj = @import("conformance_json.zig");
 
-const fixture_path = "../lazily-spec/conformance/collections/dependency_reactive_availability.json";
+/// Corpus-relative. The root resolves at RUNTIME (`#lzzigingressspecdir`); the
+/// full path is built per read so `LAZILY_SPEC_CONFORMANCE_DIR` moves this replay.
+const fixture_rel = "collections/dependency_reactive_availability.json";
 
 fn required(value: json.Value, name: []const u8) !json.Value {
     return cj.required(value, name);
@@ -23,6 +25,8 @@ fn integer(value: json.Value) !i64 {
 }
 
 test "dependency availability replays the exact-key fixture" {
+    const fixture_path = try @import("conformance_manifest.zig").specPath(testing.allocator, fixture_rel);
+    defer testing.allocator.free(fixture_path);
     const raw = try @import("conformance_manifest.zig").specReadFile(fixture_path);
     defer testing.allocator.free(raw);
     var parsed = try json.parseFromSlice(json.Value, testing.allocator, raw, .{ .allocate = .alloc_always });
@@ -74,7 +78,7 @@ test "dependency availability replays the exact-key fixture" {
 
         const state = reader.get().*;
         identity = identity orelse map.handle(Probe.key).?.id;
-        var expected = cj.AssertionKeys.init(fixture_path, try required(step, "expected"));
+        var expected = cj.AssertionKeys.init(fixture_rel, try required(step, "expected"));
         switch (state) {
             .unavailable => try expected.assertKey("state", "Unavailable"),
             .available => |value| {

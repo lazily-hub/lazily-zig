@@ -1450,11 +1450,7 @@ fn writeByteArray(bytes: []const u8, jw: anytype) !void {
 }
 
 fn assertFixtureRoundTripFromFile(comptime fixture_name: []const u8) !ParsedMessage {
-    const fixture_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "../lazily-spec/conformance/{s}",
-        .{fixture_name},
-    );
+    const fixture_path = try specPath(std.testing.allocator, fixture_name);
     defer std.testing.allocator.free(fixture_path);
 
     const fixture = try readFixtureFile(fixture_path);
@@ -1581,6 +1577,7 @@ fn assertDecodedClaims(keys: *cj.AssertionKeys, message: IpcMessage) !void {
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const specPath = @import("conformance_manifest.zig").specPath;
 const cj = @import("conformance_json.zig");
 
 const CAPABILITY_FIXTURE = "codec/capability_handshake.json";
@@ -1599,7 +1596,8 @@ fn roundTripCapabilityFixtureValue(
 }
 
 test "lazily/ipc: capability handshake conformance" {
-    const fixture_path = "../lazily-spec/conformance/" ++ CAPABILITY_FIXTURE;
+    const fixture_path = try specPath(std.testing.allocator, CAPABILITY_FIXTURE);
+    defer std.testing.allocator.free(fixture_path);
     const bytes = try readFixtureFile(fixture_path);
     defer std.testing.allocator.free(bytes);
 
@@ -1982,11 +1980,7 @@ test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
     // write must match the canonical lazily-spec fixture, so rs/py/zig arenas
     // produce interoperable bytes.
     const allocator = std.testing.allocator;
-    const fixture_path = try std.fmt.allocPrint(
-        allocator,
-        "../lazily-spec/conformance/{s}",
-        .{"arena_blob.json"},
-    );
+    const fixture_path = try specPath(allocator, "arena_blob.json");
     defer allocator.free(fixture_path);
 
     const fixture_raw = try readFixtureFile(fixture_path);

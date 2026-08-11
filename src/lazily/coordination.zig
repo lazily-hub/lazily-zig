@@ -475,15 +475,21 @@ test "coordination: quorum opens at majority" {
 // ===========================================================================
 
 const json = std.json;
-const SPEC_DIR = "../lazily-spec/conformance/coordination";
+/// This area's subdirectory of the corpus. NOT a path: the root resolves at
+/// RUNTIME through `specAreaPath`, so this replay moves under
+/// `LAZILY_SPEC_CONFORMANCE_DIR` with every other one (`#lzzigingressspecdir`).
+const SPEC_AREA = "coordination";
 
 /// Reads through the runtime conformance manifest recorder
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const specAreaPath = @import("conformance_manifest.zig").specAreaPath;
 
 fn specFixturesPresent() bool {
-    const raw = readFixtureFile(SPEC_DIR ++ "/lease.json") catch return false;
+    const path = specAreaPath(std.testing.allocator, SPEC_AREA, "lease.json") catch return false;
+    defer std.testing.allocator.free(path);
+    const raw = readFixtureFile(path) catch return false;
     std.testing.allocator.free(raw);
     return true;
 }
@@ -525,7 +531,7 @@ fn optU64(value: json.Value) !?u64 {
 }
 
 fn loadFixture(name: []const u8) !json.Parsed(json.Value) {
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ SPEC_DIR, name });
+    const path = try specAreaPath(std.testing.allocator, SPEC_AREA, name);
     defer std.testing.allocator.free(path);
     const raw = try readFixtureFile(path);
     defer std.testing.allocator.free(raw);

@@ -82,6 +82,35 @@ pub fn conformanceRoot() []const u8 {
     return conformanceRootOverride() orelse DEFAULT_CONFORMANCE_ROOT;
 }
 
+/// `<corpus>/<rel>` under the RUNTIME root. Caller frees.
+///
+/// Exists so no replay builds a corpus path by comptime-concatenating
+/// `DEFAULT_CONFORMANCE_ROOT` (`#lzzigingressspecdir`). Eleven runners did, each
+/// with its own `const SPEC_DIR = "../lazily-spec/conformance/<area>"`, so
+/// `LAZILY_SPEC_CONFORMANCE_DIR` moved some replays and not others — and the
+/// difference is invisible, because a run that reads the DEFAULT corpus while
+/// believing it was redirected is green either way. That is worse than an
+/// unsupported override: a perturbation probe pointed at a scratch corpus gets a
+/// partly-redirected suite and reads the unperturbed cell as "this fixture
+/// cannot be made to fail", which is the exact false negative the probe exists
+/// to rule out.
+///
+/// A comptime `++` against the default is therefore not a shortcut for this — it
+/// is the defect. Route new replays through here or through `conformance_json.load`.
+pub fn specPath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ conformanceRoot(), rel });
+}
+
+/// `<corpus>/<area>/<name>` under the RUNTIME root. Caller frees.
+pub fn specAreaPath(allocator: std.mem.Allocator, area: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ conformanceRoot(), area, name });
+}
+
+/// `<corpus>/<area>` under the RUNTIME root, for diagnostics. Caller frees.
+pub fn specAreaDir(allocator: std.mem.Allocator, area: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ conformanceRoot(), area });
+}
+
 /// Is an unreadable fixture a SKIP, or a failure?
 ///
 /// This is the whole reason the override is a runtime read rather than an edit

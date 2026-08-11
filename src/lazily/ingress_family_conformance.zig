@@ -62,6 +62,7 @@ const ThreadSafeContext = @import("thread_safe_context.zig").ThreadSafeContext;
 /// (`#lazilyupgradeconformance`): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const specAreaPath = @import("conformance_manifest.zig").specAreaPath;
 
 const IngressAdmission = core_mod.IngressAdmission;
 const IngressAuthority = core_mod.IngressAuthority;
@@ -79,7 +80,10 @@ const ScopeView = core_mod.ScopeView;
 
 const testing = std.testing;
 
-const SPEC_DIR = "../lazily-spec/conformance/ingress/";
+/// This area's subdirectory of the corpus. NOT a path: the root resolves at
+/// RUNTIME through `specAreaPath`, so this replay moves under
+/// `LAZILY_SPEC_CONFORMANCE_DIR` with every other one (`#lzzigingressspecdir`).
+const SPEC_AREA = "ingress";
 
 /// Every fixture the ingress corpus ships. Named explicitly rather than globbed:
 /// a fixture added to the corpus and not to this list is a *missing replay*, and
@@ -1167,7 +1171,7 @@ fn replay(
 }
 
 fn loadFixture(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    const path = try std.fmt.allocPrint(allocator, SPEC_DIR ++ "{s}", .{name});
+    const path = try specAreaPath(allocator, SPEC_AREA, name);
     defer allocator.free(path);
     return readFixtureFile(path) catch null;
 }

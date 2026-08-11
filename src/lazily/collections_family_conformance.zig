@@ -41,7 +41,10 @@ const reactive_map = @import("reactive_map.zig");
 const thread_safe_reactive_map = @import("thread_safe_reactive_map.zig");
 const async_reactive_map = @import("async_reactive_map.zig");
 
-const SPEC_DIR = "../lazily-spec/conformance/collections";
+/// This area's subdirectory of the corpus. NOT a path: the root resolves at
+/// RUNTIME through `specAreaPath`, so this replay moves under
+/// `LAZILY_SPEC_CONFORMANCE_DIR` with every other one (`#lzzigingressspecdir`).
+const SPEC_AREA = "collections";
 
 /// Entry value type used across all collection fixtures (JSON integers).
 const V = i64;
@@ -50,9 +53,12 @@ const V = i64;
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const readFixtureFile = @import("conformance_manifest.zig").specReadFile;
+const specAreaPath = @import("conformance_manifest.zig").specAreaPath;
 
 fn fixturesPresent() bool {
-    const raw = readFixtureFile(SPEC_DIR ++ "/cellmap_atomic_move.json") catch return false;
+    const path = specAreaPath(testing.allocator, SPEC_AREA, "cellmap_atomic_move.json") catch return false;
+    defer testing.allocator.free(path);
+    const raw = readFixtureFile(path) catch return false;
     testing.allocator.free(raw);
     return true;
 }
@@ -384,12 +390,12 @@ fn Engine(comptime Model: type) type {
             if (!fixturesPresent()) {
                 std.debug.print(
                     "skipping {s}: {s} absent - run with the lazily-spec sibling\n",
-                    .{ Model.FLAVOR, SPEC_DIR },
+                    .{ Model.FLAVOR, SPEC_AREA },
                 );
                 return;
             }
             const alloc = testing.allocator;
-            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ SPEC_DIR, fixture_name });
+            const path = try specAreaPath(alloc, SPEC_AREA, fixture_name);
             defer alloc.free(path);
             const raw = try readFixtureFile(path);
             defer alloc.free(raw);
