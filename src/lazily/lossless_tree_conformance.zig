@@ -29,6 +29,14 @@
 //!   frontier exists for. `deliver.only` hands over exactly those indices.
 //! - **invalid_source_roundtrip** — an Error leaf round-trips unchanged; the
 //!   tree is lossless about text it cannot parse.
+//! - **apply_update_advances_counter** — the Lamport counter advances past every
+//!   observed op, unconditionally and BEFORE the idempotence skip, so a write
+//!   minted AFTER a sync outranks the stamps that sync delivered. The first
+//!   scenario in this corpus that mutates a replica AFTER a sync INTO it.
+//! - **out_of_order_delivery_buffers** — an op whose parent/target or `prev` has
+//!   not arrived is BUFFERED and retried as the rest of the same batch lands,
+//!   rather than dropped while its dot is recorded. `deliver.order` ships the
+//!   batch REVERSED, in one `applyUpdate` call (`#lzspecoutoforderfixtures`).
 //!
 //! Node identity: the fixtures name nodes by `label`, this binding by `OpId`.
 //! Each replica therefore carries its own label table, populated as the seed
@@ -184,27 +192,119 @@ fn applyOp(allocator: std.mem.Allocator, r: *Replica, step: Value) !void {
     return error.UnhandledOp;
 }
 
-/// Ship `from`'s unseen ops to `to`.
+/// Which ops of the computed diff one delivery step ships, and in what sequence.
 ///
-/// `only` restricts delivery to those indices of the diff — the non-contiguous
-/// case, where the partner receives ops 0 and 2 and must still converge when 1
-/// arrives later. Applying the full diff there would test nothing.
-fn deliver(allocator: std.mem.Allocator, from: *Replica, to: *Replica, only: ?[]const Value) !void {
+/// The diff itself is the same list `sync` computes — `diff(&their, allocator)`,
+/// sorted by dotted `(counter, peer)`. That sort is pinned by
+/// `lossless_tree_test.zig`'s "diff returns ops in canonical (counter, peer)
+/// order", which is what makes an INDEX in the corpus mean the same op here as
+/// in every other binding.
+const Selection = union(enum) {
+    /// A full `sync`: the whole diff, in canonical order.
+    all,
+    /// `deliver.only` — restrict delivery to those indices of the diff. The
+    /// non-contiguous case, where the partner receives ops 0 and 2 and must
+    /// still converge when 1 arrives later; applying the full diff there would
+    /// test nothing.
+    only: []const Value,
+    /// `deliver.order` — deliver exactly those entries, IN THE LISTED SEQUENCE,
+    /// as ONE `applyUpdate` call (`#lzspecoutoforderfixtures`).
+    ///
+    /// Not re-sorted, not split across calls, not clamped. A binding that
+    /// re-sorts this list was measured GREEN against a library with no
+    /// dependency buffer at all: canonical order delivers every parent before
+    /// its child, so the buffer is never exercised and
+    /// `out_of_order_delivery_buffers` stops discriminating anything. `order`
+    /// need not be a permutation of the diff.
+    order: []const Value,
+};
+
+/// Read the delivery selector off a `deliver` step. EXACTLY ONE of
+/// `only` / `order` — both is ambiguous, neither is a corpus shape this runner
+/// does not know. Fail closed on either, rather than picking a default and
+/// replaying a step the fixture did not write (`#lzspecoutoforderfixtures`).
+fn deliverSelection(d: Value) !Selection {
+    const only = cj.field(d, "only");
+    const order = cj.field(d, "order");
+    if (only != null and order != null) {
+        std.debug.print(
+            "lossless-tree: `deliver` carries BOTH `only` and `order`; they select the " ++
+                "same diff two ways and this runner will not guess which one the fixture meant\n",
+            .{},
+        );
+        return error.DeliverSelectorConflict;
+    }
+    if (only) |o| return .{ .only = try cj.asArray(o) };
+    if (order) |o| return .{ .order = try cj.asArray(o) };
+    std.debug.print(
+        "lossless-tree: `deliver` carries neither `only` nor `order`; a delivery with no " ++
+            "selector is a `sync` the corpus spelled as a `deliver`\n",
+        .{},
+    );
+    return error.DeliverSelectorMissing;
+}
+
+/// Test-only observation point (`#lzspecoutoforderfixtures`).
+///
+/// A fixture cannot assert on how its own step was INTERPRETED: a runner that
+/// re-sorts `order` replays a different scenario and still renders whatever a
+/// buffer-less library renders under canonical order. So the sequence handed to
+/// `applyUpdate`, and the number of calls it took, are pinned by a direct test
+/// through this probe rather than by the corpus.
+const DeliveryProbe = struct {
+    allocator: std.mem.Allocator,
+    /// One increment per `applyUpdate` call `deliver` makes.
+    calls: usize = 0,
+    /// Every op id handed over, concatenated in the order it was passed.
+    ids: std.ArrayListUnmanaged(OpId) = .empty,
+
+    fn deinit(self: *DeliveryProbe) void {
+        self.ids.deinit(self.allocator);
+    }
+};
+
+var delivery_probe: ?*DeliveryProbe = null;
+
+fn recordDelivery(ops: []const lt.TreeOp) void {
+    const probe = delivery_probe orelse return;
+    probe.calls += 1;
+    for (ops) |op| probe.ids.append(probe.allocator, op.id) catch @panic("delivery probe out of memory");
+}
+
+/// Ship `from`'s unseen ops to `to`, as selected.
+fn deliver(allocator: std.mem.Allocator, from: *Replica, to: *Replica, sel: Selection) !void {
     var their = to.crdt.getFrontier();
     const update = try from.crdt.diff(&their, allocator);
     defer from.crdt.freeUpdate(update);
 
-    if (only) |idxs| {
-        var picked = std.ArrayList(lt.TreeOp).empty;
-        defer picked.deinit(allocator);
-        for (idxs) |iv| {
-            const i = try cj.asUsize(iv);
-            if (i >= update.ops.len) return error.DeliverIndexOutOfRange;
-            try picked.append(allocator, update.ops[i]);
+    const idxs = switch (sel) {
+        .all => {
+            recordDelivery(update.ops);
+            return to.crdt.applyUpdate(update);
+        },
+        .only => |o| o,
+        .order => |o| o,
+    };
+
+    var picked = std.ArrayList(lt.TreeOp).empty;
+    defer picked.deinit(allocator);
+    for (idxs) |iv| {
+        const i = try cj.asUsize(iv);
+        // Refuse rather than clamp. A clamped index silently delivers a
+        // DIFFERENT op than the fixture names, which is the one failure the
+        // corpus cannot see from the outside.
+        if (i >= update.ops.len) {
+            std.debug.print(
+                "lossless-tree: delivery index {d} is past the {d}-op diff from {s} to {s}\n",
+                .{ i, update.ops.len, from.name, to.name },
+            );
+            return error.DeliverIndexOutOfRange;
         }
-        return to.crdt.applyUpdate(.{ .ops = picked.items });
+        try picked.append(allocator, update.ops[i]);
     }
-    try to.crdt.applyUpdate(update);
+    // ONE call, in the sequence the fixture listed.
+    recordDelivery(picked.items);
+    return to.crdt.applyUpdate(.{ .ops = picked.items });
 }
 
 /// A label table is per-replica, but a node created on one replica and shipped
@@ -245,6 +345,13 @@ fn replayScenario(allocator: std.mem.Allocator, scenario: Value) !void {
     try world.items.append(allocator, a);
 
     if (cj.field(scenario, "steps")) |steps_raw| {
+        // Steps are replayed in corpus order with NO phase model: nothing here
+        // assumes fork -> concurrent edits -> sync, and no replica's diff,
+        // frontier or clock is cached across steps (`deliver` recomputes both
+        // sides every time). `apply_update_advances_counter` is the first
+        // scenario to mutate a replica AFTER a sync INTO it, and that works
+        // because a mutation step is just "resolve the named replica, apply the
+        // op" wherever it lands (`#lzspecoutoforderfixtures`).
         for (try cj.asArray(steps_raw)) |step| {
             if (cj.field(step, "fork")) |fork_name| {
                 const name = try cj.asStr(fork_name);
@@ -262,15 +369,14 @@ fn replayScenario(allocator: std.mem.Allocator, scenario: Value) !void {
                 const from = try world.get(try cj.asStr(try cj.required(sync, "from")));
                 const to_name = try cj.asStr(try cj.required(sync, "to"));
                 const to = try world.get(to_name);
-                try deliver(allocator, from, to, null);
+                try deliver(allocator, from, to, .all);
                 try adoptLabels(allocator, from, to);
                 continue;
             }
             if (cj.field(step, "deliver")) |d| {
                 const from = try world.get(try cj.asStr(try cj.required(d, "from")));
                 const to = try world.get(try cj.asStr(try cj.required(d, "to")));
-                const only: ?[]const Value = if (cj.field(d, "only")) |o| try cj.asArray(o) else null;
-                try deliver(allocator, from, to, only);
+                try deliver(allocator, from, to, try deliverSelection(d));
                 try adoptLabels(allocator, from, to);
                 continue;
             }
@@ -413,4 +519,121 @@ test "lossless-tree: concurrent_reorder_and_leaf_edit" {
 
 test "lossless-tree: non_contiguous_anti_entropy" {
     try replayFixture("non_contiguous_anti_entropy.json");
+}
+
+test "lossless-tree: apply_update_advances_counter" {
+    try replayFixture("apply_update_advances_counter.json");
+}
+
+test "lossless-tree: out_of_order_delivery_buffers" {
+    try replayFixture("out_of_order_delivery_buffers.json");
+}
+
+// ---------------------------------------------------------------------------
+// The runner's own contract (`#lzspecoutoforderfixtures`)
+// ---------------------------------------------------------------------------
+//
+// These replay INLINE scenarios, not corpus fixtures, and that is the point: a
+// fixture can assert on what the library did, never on how the runner read the
+// step that drove it. `deliver.order`'s whole value is the SEQUENCE, and a
+// runner that re-sorted it — or clamped an index, or split the batch — would
+// keep every corpus replay green while `out_of_order_delivery_buffers` stopped
+// discriminating a dependency buffer from no buffer at all.
+//
+// Every scenario below is the same three-op shape the corpus uses: `b` forks
+// off holding only the empty `para`, then `a` creates `outer`, creates `inner`
+// under it, and edits `inner` — so the diff from `a` to `b` is exactly the
+// three ops (2,1), (3,1), (4,1) in canonical order.
+fn replayInline(src: []const u8) !void {
+    var parsed = try cj.json.parseFromSlice(Value, testing.allocator, src, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try replayScenario(testing.allocator, parsed.value);
+}
+
+const three_op_steps =
+    \\    { "fork": "b", "peer": 2 },
+    \\    { "on": "a", "op": "create", "parent": "para", "after": null, "label": "outer", "element": "wrap" },
+    \\    { "on": "a", "op": "create", "parent": "outer", "after": null, "label": "inner", "leaf": { "kind": "raw", "text": "deep" } },
+    \\    { "on": "a", "op": "edit_leaf", "node": "inner", "at_byte": 4, "delete_bytes": 0, "insert": "X" },
+;
+
+fn threeOpScenario(comptime delivery: []const u8, comptime expect: []const u8) []const u8 {
+    return
+    \\{
+    \\  "id": "runner_contract",
+    \\  "seed": { "peer": 1, "tree": { "children": [
+    \\    { "label": "para", "element": "para", "children": [] }
+    \\  ] } },
+    \\  "steps": [
+    ++ three_op_steps ++ delivery ++
+        \\
+        \\  ],
+        \\  "expect":
+    ++ expect ++
+        \\
+        \\}
+    ;
+}
+
+test "lossless-tree runner: deliver.order reaches applyUpdate unsorted, in ONE call" {
+    var probe = DeliveryProbe{ .allocator = testing.allocator };
+    defer probe.deinit();
+    delivery_probe = &probe;
+    defer delivery_probe = null;
+
+    try replayInline(threeOpScenario(
+        \\    { "deliver": { "from": "a", "to": "b", "order": [2, 1, 0] } }
+    ,
+        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
+    ));
+
+    // ONE call. Splitting the batch would let each op find its dependency
+    // already applied, so the buffer would never be exercised.
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    // The LISTED sequence, reversed relative to the canonical diff.
+    try testing.expectEqualSlices(OpId, &.{
+        .{ .counter = 4, .peer = 1 },
+        .{ .counter = 3, .peer = 1 },
+        .{ .counter = 2, .peer = 1 },
+    }, probe.ids.items);
+    // Non-vacuity: the canonical order really is the OTHER one, so a re-sorting
+    // runner could not satisfy the assertion above by accident.
+    for (probe.ids.items[1..], probe.ids.items[0 .. probe.ids.items.len - 1]) |curr, prev| {
+        try testing.expectEqual(std.math.Order.gt, prev.compare(curr));
+    }
+}
+
+test "lossless-tree runner: an out-of-range delivery index fails rather than clamping" {
+    // Non-vacuity first: the last valid index really is 2, so the refusal below
+    // is about the bound and not about the shape. `b` renders empty because the
+    // one op it received is a `LeafEdit` whose target has not arrived — it sits
+    // in the buffer, which is the behaviour the corpus fixture goes on to pin.
+    try replayInline(threeOpScenario(
+        \\    { "deliver": { "from": "a", "to": "b", "order": [2] } }
+    ,
+        \\ { "render_on": { "a": "deepX", "b": "" } }
+    ));
+    try testing.expectError(error.DeliverIndexOutOfRange, replayInline(threeOpScenario(
+        \\    { "deliver": { "from": "a", "to": "b", "order": [3] } }
+    ,
+        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
+    )));
+    try testing.expectError(error.DeliverIndexOutOfRange, replayInline(threeOpScenario(
+        \\    { "deliver": { "from": "a", "to": "b", "only": [0, 9] } }
+    ,
+        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
+    )));
+}
+
+test "lossless-tree runner: a deliver step carries exactly one of only/order" {
+    try testing.expectError(error.DeliverSelectorConflict, replayInline(threeOpScenario(
+        \\    { "deliver": { "from": "a", "to": "b", "only": [0], "order": [0] } }
+    ,
+        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
+    )));
+    try testing.expectError(error.DeliverSelectorMissing, replayInline(threeOpScenario(
+        \\    { "deliver": { "from": "a", "to": "b" } }
+    ,
+        \\ { "render_on": { "a": "deepX", "b": "deepX" } }
+    )));
 }

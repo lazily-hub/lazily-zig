@@ -448,9 +448,14 @@ fi
 # printing OK.
 #
 # These floors track WHAT CI ACTUALLY REPLAYS, exactly — no margin, no slack.
-# Pinned 2026-08-09 from CI run 31343252373 against the published corpus:
-# 132/150 fixtures OPENED, 147/147 scenarios REPLAYED. A local `make test` on the
-# same commit reproduced both numbers.
+# Re-pinned 2026-08-11 against lazily-spec `39df4b3`, which landed
+# `lossless-tree/apply_update_advances_counter.json` and
+# `lossless-tree/out_of_order_delivery_buffers.json` (#lzspecoutoforderfixtures):
+# 134/152 fixtures OPENED, 149/149 scenarios REPLAYED. Both numbers read off a
+# local `make test` run; each is EXACT — 135 and 150 both fail.
+#
+# Previously 132/147, pinned 2026-08-09 from CI run 31343252373 against a
+# 150-fixture corpus.
 #
 # Do NOT raise a floor "by however many this change adds" and leave the old
 # margin in place. That was the convention here, and it is the bug: the floor
@@ -468,8 +473,8 @@ fi
 # An upstream fixture that lands without a zig runner raises `total` and leaves
 # `covered` alone, so it does not trip MIN_FIXTURES; only a replay that STOPS
 # running does.
-MIN_FIXTURES="${MIN_FIXTURES:-132}"
-MIN_SCENARIOS="${MIN_SCENARIOS:-147}"
+MIN_FIXTURES="${MIN_FIXTURES:-134}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-149}"
 
 if [ "$total" -eq 0 ]; then
   echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2
