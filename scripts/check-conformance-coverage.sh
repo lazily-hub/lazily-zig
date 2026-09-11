@@ -58,6 +58,13 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
+  # Replay-equivalence proof (`lazily-spec/docs/replay-equivalence.md`) is an
+  # optional (MAY) coverage row and lazily-py is the reference implementation;
+  # this binding has no harness yet, so it opens none of the three. Building one
+  # is what removes these entries — they are not permanent carve-outs.
+  "replay/canonical_encoding_equality.json"
+  "replay/divergence_localization.json"
+  "replay/fingerprint_log_binding.json"
   # Register CRDTs (LWW / MV / PnCounter + the CellCrdt projection bit) are
   # implemented here, but this binding has no canonical replay for the new
   # registers corpus yet; the Registers coverage row is `~` until it does.
