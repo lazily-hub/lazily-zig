@@ -117,7 +117,25 @@ fn outcomeOf(err: anyerror) ![]const u8 {
     };
 }
 
-fn driveHarnessFixture(rel: []const u8, minimum_steps: usize) !void {
+/// Drive one `ReplayHarness` fixture, executing every step it carries.
+///
+/// There is deliberately no step-count parameter. This used to take a
+/// `minimum_steps` floor, and that floor is what `#lzcorpusfloorguard` was
+/// about: `#lzreplayframing` grew a sibling fixture from 11 steps to 14 and
+/// every binding's floor stayed at 11, so three new rows sat inside the slack
+/// and would have reported green WITHOUT RUNNING. A number a runner carries
+/// about a corpus it does not own only ever drifts.
+///
+/// What replaces it is two assertions that carry no number at all:
+///   1. `steps.len == executed` at the bottom — every step LOADED was EXECUTED.
+///      Exact, and it tightens by itself as the corpus grows.
+///   2. An unrecognised op type is a hard failure, never a skip, so "executed"
+///      cannot be satisfied by a row that matched no arm.
+/// The remaining direction — a corpus that SHRINKS — is guarded upstream, where
+/// it can actually be seen: lazily-spec's `conformance/corpus-counts.json` pins
+/// each fixture's step count and `scripts/check-corpus-floors.mjs` fails when a
+/// count moves without the pin moving with it.
+fn driveHarnessFixture(rel: []const u8) !void {
     var fixture = (try cj.load(rel)) orelse return;
     defer fixture.deinit();
     const allocator = testing.allocator;
@@ -189,7 +207,6 @@ fn driveHarnessFixture(rel: []const u8, minimum_steps: usize) !void {
     };
 
     const steps = try cj.asArray(try cj.required(fixture.value, "steps"));
-    try testing.expect(steps.len >= minimum_steps);
     var executed: usize = 0;
 
     for (steps) |step| {
@@ -308,20 +325,34 @@ fn driveHarnessFixture(rel: []const u8, minimum_steps: usize) !void {
             continue;
         }
 
+        // Fail CLOSED on an op this runner does not know. A fall-through here
+        // would leave `executed` short and the equality below would catch it,
+        // but only anonymously; naming the op is what makes the failure
+        // actionable. `op_type` and `rel` are printed HERE, while the parse tree
+        // that owns their bytes is still alive — a label stashed for a later
+        // report is exactly the borrowed slice that dangles on the one path
+        // that has to stay readable.
+        std.debug.print(
+            "{s}: step {d} carries op type `{s}`, which this replay does not " ++
+                "implement. An unrecognised op is a hard failure, never a skip " ++
+                "(#lzcorpusfloorguard).\n",
+            .{ rel, executed, op_type },
+        );
         return error.UnknownCanonicalReplayOperation;
     }
 
-    // Every step really ran: a loop that silently matched nothing would satisfy
-    // each assertion above over an empty population.
+    // Every step LOADED was EXECUTED. Exact, constant-free, and it tightens by
+    // itself when the corpus grows — which is the whole reason the
+    // `minimum_steps` floor above it is gone (#lzcorpusfloorguard).
     try testing.expectEqual(steps.len, executed);
 }
 
 test "canonical replay: a fingerprint is bound to the log that produced it" {
-    try driveHarnessFixture("replay/fingerprint_log_binding.json", 8);
+    try driveHarnessFixture("replay/fingerprint_log_binding.json");
 }
 
 test "canonical replay: divergence is localized to its first checkpoint" {
-    try driveHarnessFixture("replay/divergence_localization.json", 7);
+    try driveHarnessFixture("replay/divergence_localization.json");
 }
 
 // ---------------------------------------------------------------------------
@@ -390,11 +421,22 @@ test "canonical replay: the observation encoding's equality classes" {
 
     const values = try cj.required(try cj.required(fixture.value, "config"), "values");
     const steps = try cj.asArray(try cj.required(fixture.value, "steps"));
-    // EXACTLY what published lazily-spec carries (14 as of `4010d99`), not a
-    // margin: the three member-framing rows `#lzreplayframing` added would have
-    // landed inside the old `>= 11` slack and this replay would have reported
-    // green without ever running them.
-    try testing.expect(steps.len >= 14);
+    // No step count lives here any more (#lzcorpusfloorguard). It was `>= 11`,
+    // then `>= 14` after `#lzreplayframing` added three member-framing rows that
+    // the `>= 11` slack had swallowed silently. Re-pinning by hand only resets
+    // the same drift clock: the runner keeps a number about a corpus it does not
+    // own, and the next addition lands inside the new margin.
+    //
+    // The pair below carries no number and cannot drift:
+    //   * `steps.len == executed` at the bottom — every step LOADED was
+    //     EXECUTED, so a row added upstream must be dispatched or this reddens;
+    //   * an unrecognised `op.type` is a hard failure, so "executed" cannot be
+    //     satisfied by a row that matched no arm.
+    // A SHRINKING corpus — the one thing a floor did catch — is now guarded
+    // where it happens, in lazily-spec: `conformance/corpus-counts.json` pins
+    // each fixture's step count and `scripts/check-corpus-floors.mjs` fails when
+    // a fixture's count moves without that pin moving, so deleting a step is a
+    // two-file change and visible in review.
 
     var saw_equal = false;
     var saw_different = false;
@@ -442,9 +484,21 @@ test "canonical replay: the observation encoding's equality classes" {
             continue;
         }
 
+        // Fail CLOSED, and NAME the op. Printed here, inside the loop, where the
+        // parse tree that owns `op_type`'s bytes is still alive: stashing the
+        // label for a report emitted after `fixture.deinit()` is the borrowed
+        // slice that dangles on exactly the path that has to stay readable.
+        std.debug.print(
+            "{s}: step {d} carries op type `{s}`, which this replay does not " ++
+                "implement. An unrecognised op is a hard failure, never a skip " ++
+                "(#lzcorpusfloorguard).\n",
+            .{ rel, executed, op_type },
+        );
         return error.UnknownCanonicalEncodingOperation;
     }
 
+    // Every step LOADED was EXECUTED — the constant-free replacement for the
+    // deleted `>= 14` floor (#lzcorpusfloorguard).
     try testing.expectEqual(steps.len, executed);
     // Both outcomes really occurred: a runner that only ever saw `false` would
     // pass every inequality claim with a completely broken encoding.

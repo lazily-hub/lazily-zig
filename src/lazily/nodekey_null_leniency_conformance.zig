@@ -451,8 +451,42 @@ test "lazily/codec: NodeKey null-leniency — both wire forms decode as absent, 
     try meta.finish();
     try cj.verifyProse(&prose);
 
-    try std.testing.expectEqual(@as(usize, 12), replayed);
-    try std.testing.expectEqual(@as(usize, 4), keys_decoded);
+    // Every scenario LOADED was REPLAYED. `scenarios.len()` is the fixture's own
+    // array length and `replayed` books at the PAYLOAD handoff, so a scenario
+    // this runner yields and then skips leaves the two unequal and names itself
+    // through the loop's own diagnostics.
+    //
+    // These three used to read `== 12`, `== 4` and `== 6` — hard-coded counts of
+    // what the canonical fixture happened to carry (#lzcorpusfloorguard). That
+    // is the same number-about-someone-else's-corpus that let `#lzreplayframing`
+    // add three steps to a sibling fixture with every binding still green. The
+    // expectations below are derived from the scenarios this run LOADED instead,
+    // so they move with the corpus and cannot be re-pinned wrong. The corpus
+    // SHRINKING is guarded upstream, in lazily-spec's `corpus-counts.json` /
+    // `scripts/check-corpus-floors.mjs`.
+    try std.testing.expectEqual(scenarios.len(), replayed);
+
+    // The anti-vacuity pair, counted off the SAME loaded array rather than
+    // written down. `key_form` and `codec` are only trustworthy as a source here
+    // because the loop above refuses any scenario whose label its raw wire — and
+    // for msgpack, its raw BYTES — contradicts, so this is a count of frames the
+    // run proved, not a reading-back of the fixture's labelling.
+    var present_scenarios: usize = 0;
+    var msgpack_scenarios: usize = 0;
+    for (scenarios.items) |sc| {
+        if (std.mem.eql(u8, try cj.asStr(try cj.required(sc, "key_form")), "present")) {
+            present_scenarios += 1;
+        }
+        if (std.mem.eql(u8, try cj.asStr(try cj.required(sc, "codec")), "msgpack")) {
+            msgpack_scenarios += 1;
+        }
+    }
+    // A runner that never decodes reports "absent" for everything; the `present`
+    // family is what only a real decode can produce, so it must be non-empty AND
+    // fully accounted for.
+    try std.testing.expect(present_scenarios > 0);
+    try std.testing.expectEqual(present_scenarios, keys_decoded);
     // Every msgpack frame went past the unpacker AND past the byte scan.
-    try std.testing.expectEqual(@as(usize, 6), byte_witnessed);
+    try std.testing.expect(msgpack_scenarios > 0);
+    try std.testing.expectEqual(msgpack_scenarios, byte_witnessed);
 }

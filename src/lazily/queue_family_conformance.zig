@@ -114,18 +114,37 @@ const work_queue_fixtures = [_]Str{
     "collections/workqueue_lease_deadletter.json",
 };
 
-/// Total steps in each corpus.
-const queue_corpus_steps = 31;
-const topic_corpus_steps = 29;
-const work_queue_corpus_steps = 18;
+// The three corpus step totals that used to live here — `queue_corpus_steps =
+// 31`, `topic_corpus_steps = 29`, `work_queue_corpus_steps = 18` — are GONE
+// (#lzcorpusfloorguard). They were a number this runner carried about a corpus
+// it does not own, and `#lzreplayframing` showed what that costs: three steps
+// were added to a canonical fixture and every binding's hard-coded count stayed
+// where it was. Re-pinning by hand just resets the drift clock.
+//
+// What replaces them is `loaded` below: every step LOADED was EXECUTED, which
+// is exact, needs no number, and tightens by itself as the corpus grows. A
+// SHRINKING corpus — the one direction a pinned total did catch — is now
+// guarded upstream in lazily-spec, where the shrink actually happens:
+// `conformance/corpus-counts.json` pins each fixture's step count and
+// `scripts/check-corpus-floors.mjs` fails when a count moves without the pin
+// moving with it.
 
-/// Steps and asserted `invalidates` flags. A step count alone cannot tell a
-/// replay that asserted the matrix from one that skipped it.
+/// Steps LOADED, steps EXECUTED, and asserted `invalidates` flags.
+///
+/// `loaded` is the fixture's own `steps.len`, read before the dispatch loop.
+/// `steps` is booked at the BOTTOM of that loop, so it counts rows that ran all
+/// the way through their assertions — and the dispatch chain has no permissive
+/// tail, so a row that matches no arm returns `error.UnknownOpType` rather than
+/// quietly leaving the two unequal. A step count alone still cannot tell a
+/// replay that asserted the invalidation matrix from one that skipped it, which
+/// is what `flags` is for.
 const ReplayCount = struct {
+    loaded: usize = 0,
     steps: usize = 0,
     flags: usize = 0,
 
     fn add(self: *ReplayCount, other: ReplayCount) void {
+        self.loaded += other.loaded;
         self.steps += other.steps;
         self.flags += other.flags;
     }
@@ -538,8 +557,11 @@ fn replayQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         if (try cj.asBool(node)) try model.close();
     }
 
-    var counts: ReplayCount = .{};
     const steps = try cj.arrayOr(fixture, "steps");
+    // Every row the fixture carries, banked BEFORE the loop. The loop books
+    // `counts.steps` only at its bottom, so the gates' `loaded == steps`
+    // equality reads exactly "every step LOADED was EXECUTED".
+    var counts: ReplayCount = .{ .loaded = steps.len };
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
@@ -1025,8 +1047,11 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
     const before = try allocator.alloc(?u64, ids.items.len);
     defer allocator.free(before);
 
-    var counts: ReplayCount = .{};
     const steps = try cj.arrayOr(fixture, "steps");
+    // Every row the fixture carries, banked BEFORE the loop. The loop books
+    // `counts.steps` only at its bottom, so the gates' `loaded == steps`
+    // equality reads exactly "every step LOADED was EXECUTED".
+    var counts: ReplayCount = .{ .loaded = steps.len };
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
@@ -1545,8 +1570,11 @@ fn replayWorkQueue(comptime Model: type, rel_path: Str) !ReplayCount {
         try testing.expectEqual(@as(usize, 0), (try cj.arrayOr(initial, key)).len);
     }
 
-    var counts: ReplayCount = .{};
     const steps = try cj.arrayOr(fixture, "steps");
+    // Every row the fixture carries, banked BEFORE the loop. The loop books
+    // `counts.steps` only at its bottom, so the gates' `loaded == steps`
+    // equality reads exactly "every step LOADED was EXECUTED".
+    var counts: ReplayCount = .{ .loaded = steps.len };
     for (steps, 0..) |step, index| {
         const op = try cj.required(step, "op");
         const op_type = try cj.asStr(try cj.required(op, "type"));
@@ -1663,13 +1691,13 @@ fn replayWorkQueueCorpus(comptime Model: type) !ReplayCount {
 }
 
 // ===========================================================================
-// The gates — nine replays, exact counts
+// The gates — nine replays, every loaded step executed
 // ===========================================================================
 
 /// Every `queuecell_*` step declares at least `head` and `len`; most declare all
 /// five. Every `workqueue_*` step declares all four. The floor exists only to
-/// catch a matrix that went silently absent — the equality assertions on step
-/// counts are the real gate.
+/// catch a matrix that went silently absent — the loaded-vs-executed equality
+/// on step counts is the real gate.
 const queue_flags_floor = 2;
 const work_queue_flags_per_step = 4;
 
@@ -1678,7 +1706,9 @@ fn expectQueueCorpus(comptime Model: type) !void {
     // A positive count is the only thing that proves this binary drove the
     // fixtures; their presence on disk proves only that they exist.
     try testing.expect(counts.steps > 0);
-    try testing.expectEqual(@as(usize, queue_corpus_steps), counts.steps);
+    // Every step LOADED was EXECUTED (#lzcorpusfloorguard) — the constant-free
+    // successor to `expectEqual(queue_corpus_steps, counts.steps)`.
+    try testing.expectEqual(counts.loaded, counts.steps);
     try testing.expect(counts.flags >= counts.steps * queue_flags_floor);
 }
 
@@ -1700,7 +1730,8 @@ test "lazily/queue-family conformance: QueueCell replays the corpus (async)" {
 fn expectTopicCorpus(comptime Model: type) !void {
     const counts = try replayTopicCorpus(Model);
     try testing.expect(counts.steps > 0);
-    try testing.expectEqual(@as(usize, topic_corpus_steps), counts.steps);
+    // Every step LOADED was EXECUTED (#lzcorpusfloorguard).
+    try testing.expectEqual(counts.loaded, counts.steps);
     try testing.expect(counts.flags > 0);
 }
 
@@ -1722,7 +1753,8 @@ test "lazily/queue-family conformance: TopicCell replays the corpus (async)" {
 fn expectWorkQueueCorpus(comptime Model: type) !void {
     const counts = try replayWorkQueueCorpus(Model);
     try testing.expect(counts.steps > 0);
-    try testing.expectEqual(@as(usize, work_queue_corpus_steps), counts.steps);
+    // Every step LOADED was EXECUTED (#lzcorpusfloorguard).
+    try testing.expectEqual(counts.loaded, counts.steps);
     try testing.expectEqual(counts.steps * work_queue_flags_per_step, counts.flags);
 }
 
@@ -1741,29 +1773,15 @@ test "lazily/queue-family conformance: WorkQueueCell replays the corpus (async)"
     try expectWorkQueueCorpus(AsyncWorkQueueModel);
 }
 
-test "lazily/queue-family conformance: the corpus totals are what this file claims" {
-    if (!corpusPresent()) return error.SkipZigTest;
-    // The nine tests above assert against the constants; this asserts the
-    // constants against the corpus, so a fixture gaining or losing a step is a
-    // failure here rather than nine silent drifts.
-    const totals = struct {
-        fn call(fixtures: []const Str) !usize {
-            var total: usize = 0;
-            for (fixtures) |rel_path| {
-                var parsed = (try cj.load(rel_path)) orelse return error.FixtureMissing;
-                defer parsed.deinit();
-                total += (try cj.arrayOr(parsed.value, "steps")).len;
-            }
-            return total;
-        }
-    };
-    try testing.expectEqual(@as(usize, queue_corpus_steps), try totals.call(&queue_fixtures));
-    try testing.expectEqual(@as(usize, topic_corpus_steps), try totals.call(&topic_fixtures));
-    try testing.expectEqual(
-        @as(usize, work_queue_corpus_steps),
-        try totals.call(&work_queue_fixtures),
-    );
-}
+// There was a tenth test here, "the corpus totals are what this file claims".
+// It re-read every fixture off disk and asserted the three `*_corpus_steps`
+// constants against them, so that a fixture gaining or losing a step failed in
+// one place rather than nine. With the constants deleted it has nothing left to
+// compare: each of the nine gates above now asserts `counts.loaded ==
+// counts.steps` against the fixtures IT drove, which is the same claim made
+// against the bytes this run actually read instead of against a number checked
+// into this file. The shrink half moved to lazily-spec's `corpus-counts.json` /
+// `scripts/check-corpus-floors.mjs` (#lzcorpusfloorguard).
 
 // ===========================================================================
 // The 3×3 ledger — enforced against the source, in both directions
