@@ -540,9 +540,14 @@ KNOWN_UNBOUND_BLOCKS=(
 )
 
 BLOCK_EXCUSES="$(printf '%s\n' "${KNOWN_UNBOUND_BLOCKS[@]:-}")" \
+CORPUS_DIR="$SPEC_DIR" \
+UNCOVERED_FIXTURES="$(printf '%s\n' "${KNOWN_UNCOVERED[@]:-}")" \
 MANIFEST="$MANIFEST" \
 python3 - <<'PY_BLOCKS'
+import json
+import math
 import os
+import struct
 import sys
 
 ledger_path = os.environ["MANIFEST"]
@@ -595,27 +600,231 @@ if unbound:
     )
     sys.exit(1)
 
-# Positive-evidence floor (#lzvacuousrun): zero declared blocks means zero
-# unbound blocks, which reports OK having compared nothing.
+# ---------------------------------------------------------------------------
+# Positive-evidence floor, DERIVED from the corpus (#lzvacuousrun, #lzblockfloorpin).
+# ---------------------------------------------------------------------------
 #
-# Tracks what CI actually inventories, exactly. Pinned 2026-08-09 from CI run
-# 31343252373: 31/31 blocks declared and bound. Do not raise this by the count a
-# change adds while leaving the old margin — a floor carrying slack lets that
-# many blocks go uninventoried with this line still printing OK. Re-read the
-# `assertion-block bind OK` line from a completed CI run and use that total.
-MIN_BLOCKS = int(os.environ.get("MIN_BLOCKS", "31"))
-if len(declared) < MIN_BLOCKS:
+# Zero declared blocks means zero unbound blocks, which reports OK having
+# compared nothing, so the MAGNITUDE has to be asserted before this rung may
+# print. Until now it was asserted against a hand-typed constant with a `>=`:
+#
+#     MIN_BLOCKS = int(os.environ.get("MIN_BLOCKS", "31"))
+#     if len(declared) < MIN_BLOCKS: ...
+#
+# Both halves of that are wrong. A typed number drifts the moment the corpus
+# moves and the only signal is a guard that keeps printing OK over a smaller
+# inventory; and `>=` cannot see a SHRINK that stays above the floor, which is
+# the drift the floor exists to catch. `31` was re-pinned by hand off a CI log
+# (run 31343252373, 2026-08-09) — a number nobody could check without running CI.
+#
+# So compute it, from two things this repo already has to be right about: the
+# canonical corpus on disk, and KNOWN_UNCOVERED. The fixture rungs far above
+# prove those two compose to exactly the opened set — every corpus fixture the
+# suite did not open must appear in KNOWN_UNCOVERED, and every KNOWN_UNCOVERED
+# entry must name a real corpus file the suite did NOT open — so
+# `corpus \ KNOWN_UNCOVERED` IS the opened set, the same rule MIN_FIXTURES is
+# read against, and it currently yields 156 - 18 = 138 fixtures.
+#
+# It is deliberately NOT derived from the manifest. A manifest-derived
+# expectation follows the actual count into the ditch: let the recorder detach
+# and `declared` goes to 0 with the expectation right behind it, green over
+# nothing — the exact #lzvacuousrun failure this floor exists to prevent. The
+# corpus on disk is the independent witness; the manifest is the thing on trial.
+#
+# SCOPE — this makes the NUMBER honest, it does not make the WALK wide.
+# The walk mirrored below is recordDeclaredBlocks() in
+# src/lazily/conformance_manifest.zig: the top-level `assertions` key, plus the
+# `assertions` key of each OBJECT element of the top-level `frames`, `scenarios`
+# and `rejects` arrays. Object-valued only, nothing else, no recursion. That is
+# narrow, and deriving the count must not be read as settling it: under the
+# three-name `{assertions, expect, expected}` object-only rule the same 138
+# opened fixtures carry 716 assertion-block sites / 607 distinct digests, so
+# rung 0 inventories 37 sites — 5.2% — and EVERY `expect`/`expected` block in
+# the corpus falls outside it. This is verbatim the pre-#lzunboundblockguard
+# walk lazily-py had before it widened from 31 to 578. Widening is its own item:
+# each newly surfaced block must then be bound or excused. Deriving the constant
+# is what stops it drifting WHILE that widening is pending.
+
+# blockDigest() from conformance_manifest.zig, byte for byte: FNV-1a over a
+# type-tagged structural rendering, integers and floats folded by their raw
+# little-endian bytes rather than any formatted form. Number typing follows
+# std.json's parseFromNumberSlice — an integer-formatted literal that overflows
+# i64 becomes `.number_string`, and `-0` is a float — because a mis-typed number
+# changes the digest and would split one block into two.
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x00000100000001B3
+MASK = (1 << 64) - 1
+I64_MIN = -(1 << 63)
+I64_MAX = (1 << 63) - 1
+
+
+class Num(object):
+    __slots__ = ("tag", "val")
+
+    def __init__(self, tag, val):
+        self.tag = tag
+        self.val = val
+
+
+def parse_int(text):
+    if text == "-0":          # isNumberFormattedLikeAnInteger() excludes it
+        return Num("f", -0.0)
+    value = int(text)
+    if I64_MIN <= value <= I64_MAX:
+        return Num("i", value)
+    return Num("N", text)     # overflows i64 -> .number_string
+
+
+def parse_float(text):
+    value = float(text)
+    if math.isfinite(value):
+        return Num("f", value)
+    return Num("N", text)
+
+
+def feed(h, raw):
+    for byte in raw:
+        h ^= byte
+        h = (h * FNV_PRIME) & MASK
+    return h
+
+
+def hash_value(h, value):
+    if value is None:
+        return feed(h, b"n")
+    if value is True:
+        return feed(h, b"b1")
+    if value is False:
+        return feed(h, b"b0")
+    if isinstance(value, Num):
+        if value.tag == "i":
+            return feed(feed(h, b"i"), value.val.to_bytes(8, "little", signed=True))
+        if value.tag == "f":
+            return feed(feed(h, b"f"), struct.pack("<d", value.val))
+        return feed(feed(h, b"N"), value.val.encode("utf-8"))
+    if isinstance(value, str):
+        return feed(feed(h, b"s"), value.encode("utf-8"))
+    if isinstance(value, list):
+        h = feed(h, b"[")
+        for item in value:
+            h = hash_value(h, item)
+        return feed(h, b"]")
+    if isinstance(value, dict):
+        h = feed(h, b"{")
+        for key, item in value.items():
+            h = hash_value(feed(feed(h, key.encode("utf-8")), b"="), item)
+        return feed(h, b"}")
+    raise TypeError(repr(value))
+
+
+corpus = os.environ["CORPUS_DIR"]
+uncovered = set()
+for raw in os.environ.get("UNCOVERED_FIXTURES", "").splitlines():
+    raw = raw.strip()
+    if raw:
+        uncovered.add(raw)
+
+canonical = []
+for root, _dirs, files in os.walk(corpus):
+    for name in files:
+        if name.endswith(".json"):
+            canonical.append(
+                os.path.relpath(os.path.join(root, name), corpus)
+            )
+canonical.sort()
+opened = [fixture for fixture in canonical if fixture not in uncovered]
+
+expected_sites = 0
+expected_digests = set()
+for fixture in opened:
+    # utf-8 explicitly: the digest is over BYTES, and a C-locale CI runner
+    # would otherwise decode non-ASCII fixture text differently than Zig reads it.
+    with open(os.path.join(corpus, fixture), encoding="utf-8") as handle:
+        try:
+            doc = json.load(handle, parse_int=parse_int, parse_float=parse_float)
+        except ValueError:
+            # Mirrors recordDeclaredBlocks(): bad JSON contributes nothing
+            # rather than failing. It then shows up as a mismatch below.
+            continue
+    if not isinstance(doc, dict):
+        continue
+    blocks = []
+    top = doc.get("assertions")
+    if isinstance(top, dict):
+        blocks.append(top)
+    for container in ("frames", "scenarios", "rejects"):
+        items = doc.get(container)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            block = item.get("assertions")
+            if isinstance(block, dict):
+                blocks.append(block)
+    for block in blocks:
+        expected_sites += 1
+        expected_digests.add(hash_value(FNV_OFFSET, block))
+
+expected = len(expected_digests)
+
+if len(canonical) == 0:
     sys.stderr.write(
-        "ERROR: only %d distinct assertion blocks were inventoried, expected >= %d.\n"
-        "       The loader-side inventory detached, or fixtures stopped being read.\n"
-        "       Do not lower MIN_BLOCKS to fix this.\n" % (len(declared), MIN_BLOCKS)
+        "ERROR: the corpus at %s listed ZERO fixtures, so the derived assertion-block\n"
+        "       expectation is 0 and this rung would pass having compared nothing.\n"
+        % corpus
     )
+    sys.exit(1)
+if expected == 0:
+    sys.stderr.write(
+        "ERROR: %d opened fixtures in %s carry ZERO assertion blocks under the walk\n"
+        "       in recordDeclaredBlocks(). An expectation of 0 is a green badge over\n"
+        "       an empty comparison (#lzvacuousrun).\n" % (len(opened), corpus)
+    )
+    sys.exit(1)
+
+# EQUALITY, not `>=`. A `>=` floor cannot see a shrink that stays above it, and
+# a shrink is exactly what a detached inventory looks like.
+if len(declared) != expected:
+    direction = "FEWER than" if len(declared) < expected else "MORE than"
+    sys.stderr.write(
+        "ERROR: the runtime inventory declared %d distinct assertion blocks, %s the\n"
+        "       %d derived from the corpus (%d of %d canonical fixtures opened,\n"
+        "       %d block sites under recordDeclaredBlocks()'s walk).\n"
+        % (len(declared), direction, expected, len(opened), len(canonical), expected_sites)
+    )
+    if len(declared) < expected:
+        sys.stderr.write(
+            "       The corpus carries blocks this run did not inventory: either it\n"
+            "       moved and this checkout has not caught up (re-pull lazily-spec and\n"
+            "       re-run the suite), or the loader-side inventory detached and\n"
+            "       fixtures stopped being read. There is no number to lower here —\n"
+            "       the expectation is computed from the corpus, not typed.\n"
+        )
+    else:
+        sys.stderr.write(
+            "       This run inventoried blocks the corpus no longer carries, so the\n"
+            "       corpus the GUARD walked is not the corpus the RUN read: a manifest\n"
+            "       left over from an earlier run, a corpus that shrank underneath it,\n"
+            "       or LAZILY_SPEC_CONFORMANCE_DIR pointing the two halves at different\n"
+            "       trees. Re-run the suite against THIS corpus.\n"
+        )
     sys.exit(1)
 
 print(
     "assertion-block bind OK: %d/%d assertion blocks carried by opened fixtures were"
-    " BOUND to a tracker (%d declared unbindable; floor %d; content-keyed, so a"
-    " runner's block NAME cannot satisfy it)" % (len(declared), len(declared), len(excuses), MIN_BLOCKS)
+    " BOUND to a tracker (%d declared unbindable; %d expected, DERIVED from %d opened"
+    " of %d canonical fixtures — %d sites, narrow walk; content-keyed, so a runner's"
+    " block NAME cannot satisfy it)"
+    % (
+        len(declared),
+        len(declared),
+        len(excuses),
+        expected,
+        len(opened),
+        len(canonical),
+        expected_sites,
+    )
 )
 PY_BLOCKS
 
