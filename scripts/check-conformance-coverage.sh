@@ -455,6 +455,13 @@ fi
 # 0.15.2 skips four tests and opens the same fixtures. Each is EXACT — 139 and
 # 152 both fail.
 #
+# Re-verified 2026-09-11 against lazily-spec `4010d99` (#lzreplayframing): that
+# commit added three STEPS to `replay/canonical_encoding_equality.json` and no
+# fixture and no scenario, so both numbers are unmoved and neither was touched.
+# The floor that DID move for it is a step count inside the runner
+# (`replay_conformance.zig`, 11 -> 14), because a step floor with slack hides new
+# rows exactly the way a fixture floor with slack hides new fixtures.
+#
 # Previously 134/152, pinned 2026-08-11 from CI run 31501252193 against
 # lazily-spec `39df4b3`; 132/147 before that.
 #

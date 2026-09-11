@@ -153,9 +153,13 @@ pub const Value = union(enum) {
 /// `<tag><decimal length>:<body>` — the framing every composite relies on.
 ///
 /// The length prefix is the row of the spec's equality table that is easiest to
-/// get wrong: concatenating member encodings without a length or delimiter makes
-/// `["a","bc"]` and `["ab","c"]` identical, and a harness that cannot tell them
-/// apart certifies a graph that reshaped its own output.
+/// get wrong, and easiest to believe you have pinned when you have not. Dropping
+/// it does NOT make `["a","bc"]` and `["ab","c"]` identical — the `s` in front of
+/// each member still separates them. It makes `["a","sbc"]` and `["as","bc"]`
+/// identical (both `lsassbc`), and `[["a"],"b"]` and `[["a","b"]]` identical
+/// (both `llsasb`), and a harness that cannot tell those apart certifies a graph
+/// that reshaped its own output. Those are the pairs the obligation-3 test
+/// asserts (`#lzreplayframing`).
 fn frame(out: *List, tag: u8, body: []const u8) Allocator.Error!void {
     var buf: [24]u8 = undefined;
     const len_text = std.fmt.bufPrint(&buf, "{d}", .{body.len}) catch unreachable;
@@ -948,6 +952,58 @@ test "obligation 3: the encoding's equality classes" {
     const a_bc: Value = .{ .seq = &.{ .{ .str = "a" }, .{ .str = "bc" } } };
     const ab_c: Value = .{ .seq = &.{ .{ .str = "ab" }, .{ .str = "c" } } };
     try testing.expect(!try digestsEqual(allocator, a_bc, ab_c));
+
+    // ...and that pair, on its own, pins NOTHING about the length prefix
+    // (`#lzreplayframing`). Delete the length from `frame` and each member
+    // becomes `<tag><body>`: `["a","bc"]` is `l` `sa` `sbc` and `["ab","c"]` is
+    // `l` `sab` `sc`, which still differ — the `s` in front of every member did
+    // the separating, not the length. So the row above survives an encoder with
+    // no framing at all, and the obligation needs a pair whose collision the
+    // TAG cannot rescue.
+    //
+    // Which pair that is depends on THIS BINDING'S BYTES, which the corpus
+    // cannot know. The layout here is `<tag><decimal length>:<body>` — `s` for
+    // text, `y` for bytes, `l` for a sequence, `m` for a mapping — so the string
+    // tag is the byte `s`, which IS the reference layout the corpus names. The
+    // corpus's colliding pair is therefore also the local one, kept verbatim
+    // below.
+    //
+    // `["a","sbc"]` and `["as","bc"]` both collapse to `lsassbc` once the length
+    // goes: the `s` that would have separated the members is spelled by the
+    // CONTENT of the first one.
+    const a_sbc: Value = .{ .seq = &.{ .{ .str = "a" }, .{ .str = "sbc" } } };
+    const as_bc: Value = .{ .seq = &.{ .{ .str = "as" }, .{ .str = "bc" } } };
+    try testing.expect(!try digestsEqual(allocator, a_sbc, as_bc));
+
+    // The mapping analogue — a key is framed apart from its value, so
+    // `{"a":"sb"}` and `{"as":"b"}` are two mappings, not one. Both become
+    // `msassb` unframed.
+    const map_a_sb: Value = .{ .map = &.{
+        .{ .key = .{ .str = "a" }, .value = .{ .str = "sb" } },
+    } };
+    const map_as_b: Value = .{ .map = &.{
+        .{ .key = .{ .str = "as" }, .value = .{ .str = "b" } },
+    } };
+    try testing.expect(!try digestsEqual(allocator, map_a_sb, map_as_b));
+
+    // The pair that collides in EVERY layout, whatever the tags are: a nested
+    // container's boundary has no tag to hide behind. `[["a"],"b"]` and
+    // `[["a","b"]]` are both `llsasb` unframed.
+    const nested_a_then_b: Value = .{ .seq = &.{
+        .{ .seq = &.{.{ .str = "a" }} },
+        .{ .str = "b" },
+    } };
+    const nested_ab: Value = .{ .seq = &.{
+        .{ .seq = &.{ .{ .str = "a" }, .{ .str = "b" } } },
+    } };
+    try testing.expect(!try digestsEqual(allocator, nested_a_then_b, nested_ab));
+
+    // The receipt for the layout claim above: pin the bytes rather than only
+    // describe them, because "the string tag is `s`" is the entire reason the
+    // first pair collides, and a comment cannot go red when a tag changes.
+    const framed_a_sbc = try canonicalBytes(allocator, a_sbc);
+    defer allocator.free(framed_a_sbc);
+    try testing.expectEqualStrings("l10:s1:as3:sbc", framed_a_sbc);
 
     // Beyond 2^53, and still exact.
     const big: Value = .{ .int = 9007199254740993 };

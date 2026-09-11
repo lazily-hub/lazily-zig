@@ -390,7 +390,11 @@ test "canonical replay: the observation encoding's equality classes" {
 
     const values = try cj.required(try cj.required(fixture.value, "config"), "values");
     const steps = try cj.asArray(try cj.required(fixture.value, "steps"));
-    try testing.expect(steps.len >= 11);
+    // EXACTLY what published lazily-spec carries (14 as of `4010d99`), not a
+    // margin: the three member-framing rows `#lzreplayframing` added would have
+    // landed inside the old `>= 11` slack and this replay would have reported
+    // green without ever running them.
+    try testing.expect(steps.len >= 14);
 
     var saw_equal = false;
     var saw_different = false;
