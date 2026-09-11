@@ -142,6 +142,24 @@ pub const nodekey_null_leniency_conformance = @import("./lazily/nodekey_null_len
 pub const blob_backend_discriminator_conformance =
     @import("./lazily/blob_backend_discriminator_conformance.zig");
 pub const signaling_conformance = @import("./lazily/signaling_conformance.zig");
+// Replay-equivalence proof (`#lzreplayzig`): a log-bound fingerprint revalidated
+// before any value compare, first-checkpoint divergence localization, and a
+// canonical observation encoding. `replay.zig` carries the harness plus the
+// in-source obligation tests that hold in a bare clone;
+// `replay_conformance.zig` replays the three canonical `replay/*.json` fixtures.
+pub const replay = @import("./lazily/replay.zig");
+pub const ReplayHarness = replay.ReplayHarness;
+pub const ReplayLog = replay.ReplayLog;
+pub const ReplayEvent = replay.ReplayEvent;
+pub const ReplayFingerprint = replay.ReplayFingerprint;
+pub const ReplayCheckpoint = replay.ReplayCheckpoint;
+pub const ReplayDivergence = replay.ReplayDivergence;
+pub const DivergenceReport = replay.DivergenceReport;
+pub const ReplayValue = replay.Value;
+pub const ReplayObservation = replay.Observation;
+pub const canonicalReplayBytes = replay.canonicalBytes;
+pub const canonicalReplayDigest = replay.canonicalDigest;
+pub const replay_conformance = @import("./lazily/replay_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const dependency_map = @import("./lazily/dependency_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;

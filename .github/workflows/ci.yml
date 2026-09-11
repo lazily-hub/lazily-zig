@@ -133,8 +133,8 @@ jobs:
         run: |
           set -euo pipefail
           for d in collections coordination distributed materialization membership \
-                   presence rateshape reactive-graph resilience service signaling \
-                   temporal windowing; do
+                   presence rateshape reactive-graph replay resilience service \
+                   signaling temporal windowing; do
             dir="../lazily-spec/conformance/$d"
             test -d "$dir" || {
               echo "::error::$dir missing — its replay test would skip and CI would report green having tested nothing"

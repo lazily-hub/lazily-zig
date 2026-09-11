@@ -58,13 +58,6 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
-  # Replay-equivalence proof (`lazily-spec/docs/replay-equivalence.md`) is an
-  # optional (MAY) coverage row and lazily-py is the reference implementation;
-  # this binding has no harness yet, so it opens none of the three. Building one
-  # is what removes these entries — they are not permanent carve-outs.
-  "replay/canonical_encoding_equality.json"
-  "replay/divergence_localization.json"
-  "replay/fingerprint_log_binding.json"
   # Register CRDTs (LWW / MV / PnCounter + the CellCrdt projection bit) are
   # implemented here, but this binding has no canonical replay for the new
   # registers corpus yet; the Registers coverage row is `~` until it does.
@@ -455,15 +448,15 @@ fi
 # printing OK.
 #
 # These floors track WHAT CI ACTUALLY REPLAYS, exactly — no margin, no slack.
-# Re-pinned 2026-08-11 against lazily-spec `39df4b3`, which landed
-# `lossless-tree/apply_update_advances_counter.json` and
-# `lossless-tree/out_of_order_delivery_buffers.json` (#lzspecoutoforderfixtures):
-# 134/152 fixtures OPENED, 149/149 scenarios REPLAYED. Read off CI run
-# 31501252193, where all three pinned toolchains report the same two numbers; a
-# local `make test` reproduced them. Each is EXACT — 135 and 150 both fail.
+# Re-pinned 2026-09-11 against lazily-spec `f89d865`, which carries the
+# `conformance/replay/` area this binding now replays (#lzreplayzig):
+# 138/156 fixtures OPENED, 151/151 scenarios REPLAYED. All three pinned
+# toolchains (0.15.2 / 0.16.0 / master) report the same two numbers locally —
+# 0.15.2 skips four tests and opens the same fixtures. Each is EXACT — 139 and
+# 152 both fail.
 #
-# Previously 132/147, pinned 2026-08-09 from CI run 31343252373 against a
-# 150-fixture corpus.
+# Previously 134/152, pinned 2026-08-11 from CI run 31501252193 against
+# lazily-spec `39df4b3`; 132/147 before that.
 #
 # Do NOT raise a floor "by however many this change adds" and leave the old
 # margin in place. That was the convention here, and it is the bug: the floor
@@ -481,8 +474,8 @@ fi
 # An upstream fixture that lands without a zig runner raises `total` and leaves
 # `covered` alone, so it does not trip MIN_FIXTURES; only a replay that STOPS
 # running does.
-MIN_FIXTURES="${MIN_FIXTURES:-134}"
-MIN_SCENARIOS="${MIN_SCENARIOS:-149}"
+MIN_FIXTURES="${MIN_FIXTURES:-138}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-151}"
 
 if [ "$total" -eq 0 ]; then
   echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2
