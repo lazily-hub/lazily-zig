@@ -1579,6 +1579,224 @@ fn Engine(comptime Model: type) type {
             }
         }
 
+        /// Per-key context for the `expect` arms below.
+        ///
+        /// The step block is BOUND to an `AssertionKeys` tracker
+        /// (`#lzzigblockwalk`), so every arm receives the fixture's value
+        /// THROUGH the tracker and the key is booked asserted only once its
+        /// comparison has run. The hand-rolled loop this replaces refused an
+        /// unknown key but bound nothing, so every rung above rung 0 was blind
+        /// to these blocks: their keys were not unread — nothing read them, and
+        /// a step whose whole `expect` stopped being evaluated would have
+        /// reported exactly nothing.
+        const ExpectCtx = struct {
+            engine: *Self,
+            /// The key being evaluated. `dependents_of` and `dependencies_of`
+            /// share one arm and differ only by which degree they sample.
+            key: []const u8,
+            op_id: ?[]const u8,
+            op_value: ?V,
+            op_errored: bool,
+            runs_before: usize,
+            has_error_key: bool,
+        };
+
+        fn expectValue(ctx: ExpectCtx, raw: json.Value) anyerror!void {
+            const self = ctx.engine;
+            // Reading `value` and skipping past it is exactly the
+            // read-then-discard shape this guard exists to refuse. No
+            // fixture in the corpus pairs `value` with `error` today; if
+            // one ever does, it has to grow a real comparison here
+            // rather than a `return` (#lzconsumednotasserted).
+            if (ctx.has_error_key) {
+                std.debug.print(
+                    "  step assertion carries both `value` and `error`; `value` " ++
+                        "would be read and discarded\n",
+                    .{},
+                );
+                return error.ValueAndErrorAssertedTogether;
+            }
+            const want = try asI64(raw);
+            const got = ctx.op_value orelse blk: {
+                // `value` attaches to the step's own op; if that op was
+                // not a read, re-read the node it names.
+                const idx = try self.node(ctx.op_id orelse return error.MissingOpId);
+                break :blk self.model.read(idx) catch {
+                    self.check("value", @as(V, -1), want);
+                    return;
+                };
+            };
+            self.check("value", got, want);
+        }
+
+        fn expectError(ctx: ExpectCtx, raw: json.Value) anyerror!void {
+            // Any non-null error code means "this op must fail"; null
+            // means "must not". The runner does not model error
+            // identity — the fixtures carry the code so the contract is
+            // legible, and this binding's own tests pin which error it
+            // raises.
+            const want_error = switch (raw) {
+                .null => false,
+                .string => true,
+                else => return error.MalformedErrorAssertion,
+            };
+            ctx.engine.check("error", ctx.op_errored, want_error);
+        }
+
+        /// One member of an object-valued `expect` key. The member sweeps below
+        /// go through the CHILD tracker `sub()` hands out, so a member the
+        /// corpus adds is unconsumed rather than silently uncompared — the
+        /// `#lzsubblockkeyset` obligation moves DOWN instead of being discharged
+        /// with a key-set comparison, which would be wrong here: these maps are
+        /// keyed by node id and a fixture names the subset it cares about, not
+        /// the whole graph.
+        const MemberCtx = struct {
+            engine: *Self,
+            /// The parent `expect` key, for the divergence-ledger label.
+            key: []const u8,
+            id: []const u8,
+        };
+
+        fn expectRead(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |id| {
+                try members.assertKeyWith(
+                    id,
+                    MemberCtx{ .engine = ctx.engine, .key = "read", .id = id },
+                    readMember,
+                );
+            }
+        }
+
+        fn readMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const self = m.engine;
+            const want = try asI64(raw);
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "read.{s}", .{m.id}) catch "read";
+            const idx = try self.node(m.id);
+            const got = self.model.read(idx) catch {
+                self.check(sub, @as(V, -1), want);
+                return;
+            };
+            self.check(sub, got, want);
+        }
+
+        fn expectReadable(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |id| {
+                try members.assertKeyWith(
+                    id,
+                    MemberCtx{ .engine = ctx.engine, .key = "readable", .id = id },
+                    readableMember,
+                );
+            }
+        }
+
+        fn readableMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const want = switch (raw) {
+                .bool => |b| b,
+                else => return error.MalformedReadableAssertion,
+            };
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "readable.{s}", .{m.id}) catch "readable";
+            m.engine.check(sub, m.engine.readable(m.id), want);
+        }
+
+        fn expectDegree(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |id| {
+                try members.assertKeyWith(
+                    id,
+                    MemberCtx{ .engine = ctx.engine, .key = ctx.key, .id = id },
+                    degreeMember,
+                );
+            }
+        }
+
+        fn degreeMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const self = m.engine;
+            const dependents = std.mem.eql(u8, m.key, "dependents_of");
+            const want = try asUsize(raw);
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "{s}.{s}", .{ m.key, m.id }) catch m.key;
+            const idx = try self.node(m.id);
+            const got = if (dependents)
+                self.model.dependentCount(idx)
+            else
+                self.model.dependencyCount(idx);
+            self.check(sub, got, want);
+        }
+
+        fn expectComputesOf(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            // Cumulative from the start of the scenario, including the
+            // invocation at creation, and never reset per step. Read
+            // straight off the counter the synthesized compute bumps —
+            // deriving it from the op stream would defeat the fixtures.
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |id| {
+                try members.assertKeyWith(
+                    id,
+                    MemberCtx{ .engine = ctx.engine, .key = "computes_of", .id = id },
+                    computesOfMember,
+                );
+            }
+        }
+
+        fn computesOfMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const want = try asUsize(raw);
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "computes_of.{s}", .{m.id}) catch "computes_of";
+            m.engine.check(sub, compute_counts[try m.engine.node(m.id)], want);
+        }
+
+        fn expectObservedBy(ctx: ExpectCtx, raw: json.Value) anyerror!void {
+            try ctx.engine.checkIdList(
+                "observed_by",
+                EffectLog.runs.items[ctx.runs_before..],
+                try asArray(raw),
+                false,
+            );
+        }
+
+        fn expectObservedCount(ctx: ExpectCtx, raw: json.Value) anyerror!void {
+            ctx.engine.check(
+                "observed_count",
+                EffectLog.runs.items.len - ctx.runs_before,
+                try asUsize(raw),
+            );
+        }
+
+        fn expectCleanupOrder(ctx: ExpectCtx, raw: json.Value) anyerror!void {
+            // Cumulative, not per-step: the individual-disposal
+            // scenario spreads three disposals over three steps and pins
+            // the whole order on the last one.
+            try ctx.engine.checkIdList(
+                "cleanup_order",
+                EffectLog.cleanups.items,
+                try asArray(raw),
+                true,
+            );
+        }
+
+        fn expectScopeOwnedCount(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |name| {
+                try members.assertKeyWith(
+                    name,
+                    MemberCtx{ .engine = ctx.engine, .key = "scope_owned_count", .id = name },
+                    scopeOwnedCountMember,
+                );
+            }
+        }
+
+        fn scopeOwnedCountMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const self = m.engine;
+            const want = try asUsize(raw);
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "scope_owned_count.{s}", .{m.id}) catch "scope_owned_count";
+            self.check(sub, self.model.scopeLen(try self.scope(m.id)), want);
+        }
+
         fn evaluateExpect(
             self: *Self,
             expect: json.Value,
@@ -1607,121 +1825,63 @@ fn Engine(comptime Model: type) type {
 
             const has_error_key = obj.get("error") != null;
 
+            // Rung 0 (`#lznullformblind`, `#lzzigblockwalk`): bind the step's
+            // `expect` block. `where` names the fixture, label and step index so
+            // a tracker diagnostic points at the same site the divergence ledger
+            // spells, and the buffer outlives the tracker because both are this
+            // frame's.
+            var where_buf: [192]u8 = undefined;
+            const where = std.fmt.bufPrint(
+                &where_buf,
+                "reactive-graph {s}{s}#{d}.expect",
+                .{ self.fixture, self.label, self.step },
+            ) catch "reactive-graph steps[].expect";
+            var block = cj.AssertionKeys.init(where, expect);
+
             for (keys[0..nkeys]) |key| {
-                const raw = obj.get(key).?;
+                // `note` is a reserved annotation name, already marked consumed
+                // by `AssertionKeys.init`.
                 if (std.mem.eql(u8, key, "note")) continue;
 
+                const ctx = ExpectCtx{
+                    .engine = self,
+                    .key = key,
+                    .op_id = op_id,
+                    .op_value = op_value,
+                    .op_errored = op_errored,
+                    .runs_before = runs_before,
+                    .has_error_key = has_error_key,
+                };
+
                 if (std.mem.eql(u8, key, "value")) {
-                    // Reading `value` and skipping past it is exactly the
-                    // read-then-discard shape this guard exists to refuse. No
-                    // fixture in the corpus pairs `value` with `error` today; if
-                    // one ever does, it has to grow a real comparison here
-                    // rather than a `continue` (#lzconsumednotasserted).
-                    if (has_error_key) {
-                        std.debug.print(
-                            "  step assertion carries both `value` and `error`; `value` " ++
-                                "would be read and discarded\n",
-                            .{},
-                        );
-                        return error.ValueAndErrorAssertedTogether;
-                    }
-                    const want = try asI64(raw);
-                    const got = op_value orelse blk: {
-                        // `value` attaches to the step's own op; if that op was
-                        // not a read, re-read the node it names.
-                        const idx = try self.node(op_id orelse return error.MissingOpId);
-                        break :blk self.model.read(idx) catch {
-                            self.check("value", @as(V, -1), want);
-                            continue;
-                        };
-                    };
-                    self.check("value", got, want);
+                    try block.assertKeyWith("value", ctx, expectValue);
                 } else if (std.mem.eql(u8, key, "error")) {
-                    // Any non-null error code means "this op must fail"; null
-                    // means "must not". The runner does not model error
-                    // identity — the fixtures carry the code so the contract is
-                    // legible, and this binding's own tests pin which error it
-                    // raises.
-                    const want_error = switch (raw) {
-                        .null => false,
-                        .string => true,
-                        else => return error.MalformedErrorAssertion,
-                    };
-                    self.check("error", op_errored, want_error);
+                    try block.assertKeyWith("error", ctx, expectError);
                 } else if (std.mem.eql(u8, key, "read")) {
-                    const map = try asObject(raw);
-                    for (try sortedKeys(map)) |id| {
-                        const want = try asI64(map.get(id).?);
-                        var k: [96]u8 = undefined;
-                        const sub = std.fmt.bufPrint(&k, "read.{s}", .{id}) catch "read";
-                        const idx = try self.node(id);
-                        const got = self.model.read(idx) catch {
-                            self.check(sub, @as(V, -1), want);
-                            continue;
-                        };
-                        self.check(sub, got, want);
-                    }
+                    try block.assertObjectWith("read", ctx, expectRead);
                 } else if (std.mem.eql(u8, key, "readable")) {
-                    const map = try asObject(raw);
-                    for (try sortedKeys(map)) |id| {
-                        const want = switch (map.get(id).?) {
-                            .bool => |b| b,
-                            else => return error.MalformedReadableAssertion,
-                        };
-                        var k: [96]u8 = undefined;
-                        const sub = std.fmt.bufPrint(&k, "readable.{s}", .{id}) catch "readable";
-                        self.check(sub, self.readable(id), want);
-                    }
-                } else if (std.mem.eql(u8, key, "dependents_of") or
-                    std.mem.eql(u8, key, "dependencies_of"))
-                {
-                    const dependents = std.mem.eql(u8, key, "dependents_of");
-                    const map = try asObject(raw);
-                    for (try sortedKeys(map)) |id| {
-                        const want = try asUsize(map.get(id).?);
-                        var k: [96]u8 = undefined;
-                        const sub = std.fmt.bufPrint(&k, "{s}.{s}", .{ key, id }) catch key;
-                        const idx = try self.node(id);
-                        const got = if (dependents)
-                            self.model.dependentCount(idx)
-                        else
-                            self.model.dependencyCount(idx);
-                        self.check(sub, got, want);
-                    }
+                    try block.assertObjectWith("readable", ctx, expectReadable);
+                } else if (std.mem.eql(u8, key, "dependents_of")) {
+                    try block.assertObjectWith("dependents_of", ctx, expectDegree);
+                } else if (std.mem.eql(u8, key, "dependencies_of")) {
+                    try block.assertObjectWith("dependencies_of", ctx, expectDegree);
                 } else if (std.mem.eql(u8, key, "computes_of")) {
-                    // Cumulative from the start of the scenario, including the
-                    // invocation at creation, and never reset per step. Read
-                    // straight off the counter the synthesized compute bumps —
-                    // deriving it from the op stream would defeat the fixtures.
-                    const map = try asObject(raw);
-                    for (try sortedKeys(map)) |id| {
-                        const want = try asUsize(map.get(id).?);
-                        var k: [96]u8 = undefined;
-                        const sub = std.fmt.bufPrint(&k, "computes_of.{s}", .{id}) catch "computes_of";
-                        self.check(sub, compute_counts[try self.node(id)], want);
-                    }
+                    try block.assertObjectWith("computes_of", ctx, expectComputesOf);
                 } else if (std.mem.eql(u8, key, "observed_by")) {
-                    try self.checkIdList("observed_by", EffectLog.runs.items[runs_before..], try asArray(raw), false);
+                    try block.assertKeyWith("observed_by", ctx, expectObservedBy);
                 } else if (std.mem.eql(u8, key, "observed_count")) {
-                    self.check("observed_count", EffectLog.runs.items.len - runs_before, try asUsize(raw));
+                    try block.assertKeyWith("observed_count", ctx, expectObservedCount);
                 } else if (std.mem.eql(u8, key, "cleanup_order")) {
-                    // Cumulative, not per-step: the individual-disposal
-                    // scenario spreads three disposals over three steps and pins
-                    // the whole order on the last one.
-                    try self.checkIdList("cleanup_order", EffectLog.cleanups.items, try asArray(raw), true);
+                    try block.assertKeyWith("cleanup_order", ctx, expectCleanupOrder);
                 } else if (std.mem.eql(u8, key, "scope_owned_count")) {
-                    const map = try asObject(raw);
-                    for (try sortedKeys(map)) |name| {
-                        const want = try asUsize(map.get(name).?);
-                        var k: [96]u8 = undefined;
-                        const sub = std.fmt.bufPrint(&k, "scope_owned_count.{s}", .{name}) catch "scope_owned_count";
-                        self.check(sub, self.model.scopeLen(try self.scope(name)), want);
-                    }
+                    try block.assertObjectWith("scope_owned_count", ctx, expectScopeOwnedCount);
                 } else {
                     std.debug.print("  UNKNOWN assertion key `{s}`\n", .{key});
                     return error.UnknownAssertionKey;
                 }
             }
+
+            try block.finish();
         }
 
         fn replay(self: *Self, steps: []const json.Value) !void {

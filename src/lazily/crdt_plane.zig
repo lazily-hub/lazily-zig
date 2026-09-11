@@ -618,58 +618,102 @@ test "lazily/crdt_plane: family sync conformance (materialize_on_ingest.json)" {
         const applied = try target.ingest(frame, 1_000);
         try std.testing.expect(applied > 0);
 
-        const expect = obj.get("expect").?.object;
-
-        if (obj.get("reingest")) |ri| {
-            if (ri.bool) {
-                const reapplied = try target.ingest(frame, 1_001);
-                const want: usize = @intCast(expect.get("reingest_applied").?.integer);
-                try std.testing.expectEqual(want, reapplied);
-            }
-        }
-
-        // Membership propagation: exact key set (order-independent).
-        const want_keys = expect.get("target_keys").?.array.items;
-        const got_keys = target.familyKeys(namespace);
-        try std.testing.expectEqual(want_keys.len, got_keys.len);
-        for (want_keys) |wk| {
-            var found = false;
-            for (got_keys) |gk| {
-                if (std.mem.eql(u8, wk.string, suffixOf(gk))) {
-                    found = true;
-                    break;
-                }
-            }
-            try std.testing.expect(found);
-        }
-
-        try std.testing.expectEqual(
-            @as(usize, @intCast(expect.get("target_present_count").?.integer)),
-            got_keys.len,
+        // Rung 0 (`#lzzigblockwalk`): the scenario's `expect` block is BOUND.
+        // Every key below was already read off the raw object and compared, but
+        // binding nothing left the whole block invisible to every rung above —
+        // and `finish()` is what now refuses a key this runner does not answer.
+        var expect = cj.AssertionKeys.init(
+            FAMILY_FIXTURE_REL ++ " expect",
+            obj.get("expect").?,
         );
 
-        // Value adoption / LWW convergence.
-        var vit = expect.get("target_values").?.object.iterator();
-        while (vit.next()) |entry| {
-            const want = entry.value_ptr.bool;
-            const got = stateBool(target.familyValueLww(namespace, entry.key_ptr.*).?);
-            try std.testing.expectEqual(want, got);
+        var reapplied: ?usize = null;
+        if (obj.get("reingest")) |ri| {
+            if (ri.bool) reapplied = try target.ingest(frame, 1_001);
         }
+        if (reapplied) |n| {
+            try expect.assertKey("reingest_applied", n);
+        } else {
+            try expect.excuseKey(
+                "reingest_applied",
+                "this scenario does not set `reingest`, so no second ingest runs and " ++
+                    "there is no re-applied count to compare",
+            );
+        }
+
+        const got_keys = target.familyKeys(namespace);
+
+        // Membership propagation: exact key set (order-independent).
+        try expect.assertKeyWith("target_keys", FamilyCtx{
+            .runtime = &target,
+            .namespace = namespace,
+            .keys = got_keys,
+        }, familyKeySet);
+        try expect.assertKey("target_present_count", got_keys.len);
+
+        // Value adoption / LWW convergence.
+        try expect.assertObjectWith("target_values", FamilyCtx{
+            .runtime = &target,
+            .namespace = namespace,
+            .keys = got_keys,
+        }, familyValueMembers);
 
         // Derived-aggregate transparency: count of `true` entries converges.
         var count_true: usize = 0;
         for (got_keys) |gk| {
             if (stateBool(target.familyValueLww(namespace, suffixOf(gk)).?)) count_true += 1;
         }
-        try std.testing.expectEqual(
-            @as(usize, @intCast(expect.get("target_count_true").?.integer)),
-            count_true,
-        );
+        try expect.assertKey("target_count_true", count_true);
 
         // Both directions: a fixture that says `false` now demands the epoch
         // did NOT move, instead of deleting the check (#lzconsumednotasserted).
-        if (expect.get("target_epoch_bumped")) |eb| {
-            try std.testing.expectEqual(eb.bool, target.membershipEpoch() != epoch_before);
-        }
+        try expect.assertKey(
+            "target_epoch_bumped",
+            target.membershipEpoch() != epoch_before,
+        );
+        try expect.finish();
     }
+}
+
+/// The target runtime plus the family keys it actually carries.
+const FamilyCtx = struct {
+    runtime: *CrdtPlaneRuntime,
+    namespace: []const u8,
+    keys: []const []const u8,
+    key: []const u8 = "",
+};
+
+fn familyKeySet(args: FamilyCtx, want_json: json.Value) anyerror!void {
+    const want_keys = want_json.array.items;
+    try std.testing.expectEqual(want_keys.len, args.keys.len);
+    for (want_keys) |wk| {
+        var found = false;
+        for (args.keys) |gk| {
+            if (std.mem.eql(u8, wk.string, suffixOf(gk))) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+/// `target_values` is object-valued, so its members go through the CHILD
+/// tracker (`#lzsubblockkeyset`).
+fn familyValueMembers(args: FamilyCtx, members: *cj.AssertionKeys) anyerror!void {
+    const obj = switch (members.object) {
+        .object => |o| o,
+        else => return error.ExpectedObject,
+    };
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        var member = args;
+        member.key = entry.key_ptr.*;
+        try members.assertKeyWith(entry.key_ptr.*, member, familyValueMember);
+    }
+}
+
+fn familyValueMember(args: FamilyCtx, want_json: json.Value) anyerror!void {
+    const got = stateBool(args.runtime.familyValueLww(args.namespace, args.key).?);
+    try std.testing.expectEqual(want_json.bool, got);
 }

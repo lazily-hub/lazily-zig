@@ -893,6 +893,7 @@ const FV = i64;
 /// (#lazilyupgradeconformance): naming a fixture is not replaying it, so the
 /// coverage guard is fed by observed reads rather than a source grep.
 const conformance_manifest = @import("conformance_manifest.zig");
+const cj = @import("conformance_json.zig");
 const readFixtureFile = conformance_manifest.specReadFile;
 
 /// The materialization corpus, resolved at RUNTIME so a probe can point this
@@ -1014,14 +1015,23 @@ const Cells = SourceMap([]const u8, FV);
 /// entries only under eager — so only the eager build satisfies this, and
 /// flipping the fixture to `"lazy"` reddens. An unknown string is a hard error,
 /// never `error.SkipZigTest`.
-fn assertDefaultModeMaterializesAtBuild(
+const DefaultModeCtx = struct {
     ctx: *Context,
-    expected: json.Value,
     source_keys: []const []const u8,
     computed_keys: []const []const u8,
     lookup: *Lookup,
-) !void {
-    const mode = try jsonAsString(try jsonFieldRequired(expected, "default_mode"));
+};
+
+// One line, no trailing comma: lazily-spec's assert-with consumption guard reads
+// the LAST parameter of the signature, and `zig fmt` gives a multi-line
+// parameter list a trailing comma that the guard splits into an empty final
+// parameter — so the callback reads as one that never touches its fixture value.
+fn assertDefaultModeMaterializesAtBuild(args: DefaultModeCtx, mode_json: json.Value) anyerror!void {
+    const ctx = args.ctx;
+    const source_keys = args.source_keys;
+    const computed_keys = args.computed_keys;
+    const lookup = args.lookup;
+    const mode = try jsonAsString(mode_json);
 
     var sources = try Cells.init(ctx);
     defer sources.deinit();
@@ -1050,16 +1060,7 @@ fn assertDefaultModeMaterializesAtBuild(
 
 /// Shared checks for the two `spec.val` fixtures (all-slot maps): default mode
 /// eager, eager materializes all, observational transparency eager==lazy.
-fn checkValFixture(ctx: *Context, name: []const u8) !void {
-    const path = try specPath(testing.allocator, name);
-    defer testing.allocator.free(path);
-    const raw = try readFixtureFile(path);
-    defer testing.allocator.free(raw);
-    var parsed = try json.parseFromSlice(json.Value, testing.allocator, raw, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    const fixture = parsed.value;
-    const expected = try jsonFieldRequired(fixture, "expected");
-
+fn checkValFixture(ctx: *Context, fixture: json.Value, block: *cj.AssertionKeys) !void {
     // Build the runtime lookup + declared key order from `spec.val`.
     const val_obj = switch (try jsonFieldRequired(try jsonFieldRequired(fixture, "spec"), "val")) {
         .object => |o| o,
@@ -1082,7 +1083,12 @@ fn checkValFixture(ctx: *Context, name: []const u8) !void {
     // the literal `"eager"` asserted only that the fixture equals itself
     // (`#lzconsumednotasserted`) — a binding whose eager build materialized
     // nothing still passed. Mirrors lazily-rs / lazily-cpp / lazily-cs.
-    try assertDefaultModeMaterializesAtBuild(ctx, expected, &.{}, keys.items, &lookup);
+    try block.assertKeyWith("default_mode", DefaultModeCtx{
+        .ctx = ctx,
+        .source_keys = &.{},
+        .computed_keys = keys.items,
+        .lookup = &lookup,
+    }, assertDefaultModeMaterializesAtBuild);
 
     // Eager = pre-mint loop; lazy = empty, mint-on-access.
     var eager_map = try Slots.init(ctx);
@@ -1093,30 +1099,63 @@ fn checkValFixture(ctx: *Context, name: []const u8) !void {
 
     // eager_materializes_all / lazy_defers_slots
     try testing.expectEqual(keys.items.len, eager_map.presentCount());
-    try expectSameKeySet(try arrayItems(try jsonFieldRequired(expected, "eager_present")), eager_map.presentKeys());
+    try block.assertKeyWith("eager_present", &eager_map, slotsPresentKeySet);
     try testing.expectEqual(@as(usize, 0), lazy_map.presentCount());
 
     // observe_canonical / eager_lazy_observationally_equivalent
-    const observe_obj = switch (try jsonFieldRequired(expected, "observe")) {
+    try block.assertObjectWith("observe", ValObserveCtx{
+        .eager = &eager_map,
+        .lazy = &lazy_map,
+        .lookup = &lookup,
+    }, valObserveMembers);
+}
+
+/// Compare a fixture key list against a map's present key set, both directions.
+/// Two named callbacks rather than one generic factory: lazily-spec's
+/// assert-with consumption guard resolves a callback by NAME, and a
+/// `slotsPresentKeySet` expression hands it the type instead.
+fn slotsPresentKeySet(map: *Slots, want: json.Value) anyerror!void {
+    try expectSameKeySet(try arrayItems(want), map.presentKeys());
+}
+
+fn cellsPresentKeySet(map: *Cells, want: json.Value) anyerror!void {
+    try expectSameKeySet(try arrayItems(want), map.presentKeys());
+}
+
+const ValObserveCtx = struct {
+    eager: *Slots,
+    lazy: *Slots,
+    lookup: *Lookup,
+    key: []const u8 = "",
+};
+
+/// `observe` is object-valued, so its members go through the CHILD tracker
+/// (`#lzsubblockkeyset`): a key the corpus adds is unconsumed rather than
+/// silently uncompared.
+fn valObserveMembers(args: ValObserveCtx, members: *cj.AssertionKeys) anyerror!void {
+    const obj = switch (members.object) {
         .object => |o| o,
         else => return error.ExpectedObject,
     };
-    var oit = observe_obj.iterator();
-    while (oit.next()) |entry| {
-        const want = try jsonAsI64(entry.value_ptr.*);
-        try testing.expectEqual(want, eager_map.get(entry.key_ptr.*).?);
-        try testing.expectEqual(want, try lazy_map.getOrInsertWith(entry.key_ptr.*, lookup.factory()));
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        var member = args;
+        member.key = entry.key_ptr.*;
+        try members.assertKeyWith(entry.key_ptr.*, member, valObserveMember);
     }
+}
+
+fn valObserveMember(args: ValObserveCtx, want_json: json.Value) anyerror!void {
+    const want = try jsonAsI64(want_json);
+    try testing.expectEqual(want, args.eager.get(args.key).?);
+    try testing.expectEqual(want, try args.lazy.getOrInsertWith(args.key, args.lookup.factory()));
 }
 
 test "lazily/reactive_map conformance: observational_transparency" {
     if (!specFixturesPresent()) return error.SkipZigTest;
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
-    try checkValFixture(ctx, "observational_transparency.json");
 
-    // Replay the lazy read sequence on a fresh map; the lazy present set is
-    // exactly the read keys (lazy_defers_slots).
     const path = try specPath(testing.allocator, "observational_transparency.json");
     defer testing.allocator.free(path);
     const raw = try readFixtureFile(path);
@@ -1125,7 +1164,15 @@ test "lazily/reactive_map conformance: observational_transparency" {
     defer parsed.deinit();
     const fixture = parsed.value;
     const expected = try jsonFieldRequired(fixture, "expected");
+    // Rung 0 (`#lzzigblockwalk`): ONE tracker for the fixture's `expected`
+    // block, shared with `checkValFixture` — the keys were all read and
+    // compared, and bound to nothing, so the whole block reported nothing.
+    var block = cj.AssertionKeys.init("observational_transparency.json expected", expected);
 
+    try checkValFixture(ctx, fixture, &block);
+
+    // Replay the lazy read sequence on a fresh map; the lazy present set is
+    // exactly the read keys (lazy_defers_slots).
     const val_obj = switch (try jsonFieldRequired(try jsonFieldRequired(fixture, "spec"), "val")) {
         .object => |o| o,
         else => return error.ExpectedObject,
@@ -1145,15 +1192,14 @@ test "lazily/reactive_map conformance: observational_transparency" {
     for (try arrayItems(try jsonFieldRequired(fixture, "reads"))) |r| {
         _ = try lazy_map.getOrInsertWith(try jsonAsString(r), lookup.factory());
     }
-    try expectSameKeySet(try arrayItems(try jsonFieldRequired(expected, "lazy_present_after_reads")), lazy_map.presentKeys());
+    try block.assertKeyWith("lazy_present_after_reads", &lazy_map, slotsPresentKeySet);
+    try block.finish();
 }
 
 test "lazily/reactive_map conformance: deferral_not_deallocation" {
     if (!specFixturesPresent()) return error.SkipZigTest;
     const ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
-    try checkValFixture(ctx, "deferral_not_deallocation.json");
-
     const path = try specPath(testing.allocator, "deferral_not_deallocation.json");
     defer testing.allocator.free(path);
     const raw = try readFixtureFile(path);
@@ -1162,6 +1208,9 @@ test "lazily/reactive_map conformance: deferral_not_deallocation" {
     defer parsed.deinit();
     const fixture = parsed.value;
     const expected = try jsonFieldRequired(fixture, "expected");
+    var block = cj.AssertionKeys.init("deferral_not_deallocation.json expected", expected);
+
+    try checkValFixture(ctx, fixture, &block);
 
     const val_obj = switch (try jsonFieldRequired(try jsonFieldRequired(fixture, "spec"), "val")) {
         .object => |o| o,
@@ -1182,18 +1231,18 @@ test "lazily/reactive_map conformance: deferral_not_deallocation" {
 
     // present_after_each_read: cumulative present-set size, monotone and
     // unchanged by a re-read (materialize_present_monotone).
-    const want_sizes = try arrayItems(try jsonFieldRequired(expected, "present_after_each_read"));
-    const reads = try arrayItems(try jsonFieldRequired(fixture, "reads"));
-    try testing.expectEqual(want_sizes.len, reads.len);
-    for (reads, want_sizes) |r, want| {
-        _ = try lazy_map.getOrInsertWith(try jsonAsString(r), lookup.factory());
-        try testing.expectEqual(@as(usize, @intCast(try jsonAsI64(want))), lazy_map.presentCount());
-    }
+    try block.assertKeyWith("present_after_each_read", MonotoneCtx{
+        .map = &lazy_map,
+        .lookup = &lookup,
+        .reads = try arrayItems(try jsonFieldRequired(fixture, "reads")),
+    }, monotonePresentCounts);
 
     // lazy_present_after_reads is a subset of eager_present.
-    const lazy_present = try jsonFieldRequired(expected, "lazy_present_after_reads");
-    try expectSameKeySet(try arrayItems(lazy_present), lazy_map.presentKeys());
-    const eager_present = try arrayItems(try jsonFieldRequired(expected, "eager_present"));
+    try block.assertKeyWith("lazy_present_after_reads", &lazy_map, slotsPresentKeySet);
+    // `eager_present` is already asserted by `checkValFixture`; the containment
+    // here is a second, weaker claim over the same key, so it is read through
+    // the tracker's `field` rather than asserted twice.
+    const eager_present = try arrayItems(block.field("eager_present").?);
     for (lazy_map.presentKeys()) |k| {
         var in_eager = false;
         for (eager_present) |e| {
@@ -1203,6 +1252,22 @@ test "lazily/reactive_map conformance: deferral_not_deallocation" {
             }
         }
         try testing.expect(in_eager);
+    }
+    try block.finish();
+}
+
+const MonotoneCtx = struct {
+    map: *Slots,
+    lookup: *Lookup,
+    reads: []const json.Value,
+};
+
+fn monotonePresentCounts(args: MonotoneCtx, want_json: json.Value) anyerror!void {
+    const want_sizes = try arrayItems(want_json);
+    try testing.expectEqual(want_sizes.len, args.reads.len);
+    for (args.reads, want_sizes) |r, want| {
+        _ = try args.map.getOrInsertWith(try jsonAsString(r), args.lookup.factory());
+        try testing.expectEqual(@as(usize, @intCast(try jsonAsI64(want))), args.map.presentCount());
     }
 }
 
@@ -1219,6 +1284,7 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     defer parsed.deinit();
     const fixture = parsed.value;
     const expected = try jsonFieldRequired(fixture, "expected");
+    var block = cj.AssertionKeys.init("entry_kind_orthogonal_to_mode.json expected", expected);
 
     // Split the map's declared entries by kind: input cells vs derived slots.
     // A single ReactiveMap fixes one handle kind, so a mixed-kind fixture is
@@ -1252,7 +1318,12 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     // fixtures, with the entry-kind split — the strategy the fixture names selects
     // the build, and only the build that materializes BOTH kinds has all four
     // declared entries present (under `lazy` only the two source entries would be).
-    try assertDefaultModeMaterializesAtBuild(ctx, expected, cell_keys.items, slot_keys.items, &lookup);
+    try block.assertKeyWith("default_mode", DefaultModeCtx{
+        .ctx = ctx,
+        .source_keys = cell_keys.items,
+        .computed_keys = slot_keys.items,
+        .lookup = &lookup,
+    }, assertDefaultModeMaterializesAtBuild);
 
     // Eager build: every entry present (cells via entry, slots via materializeAll).
     var eager_cells = try Cells.init(ctx);
@@ -1263,9 +1334,14 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     try eager_slots.materializeAll(slot_keys.items, lookup.factory());
     try testing.expectEqual(EntryKind.source, eager_cells.entryKind());
     try testing.expectEqual(EntryKind.computed, eager_slots.entryKind());
-    try testing.expectEqual(
+    try block.assertKeyWith(
+        "eager_present",
         eager_cells.presentCount() + eager_slots.presentCount(),
-        (try arrayItems(try jsonFieldRequired(expected, "eager_present"))).len,
+        struct {
+            fn check(present: usize, want: json.Value) anyerror!void {
+                try testing.expectEqual((try arrayItems(want)).len, present);
+            }
+        }.check,
     );
 
     // Lazy build: cells present at build (input cells always materialized), slots deferred.
@@ -1275,7 +1351,7 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
     var lazy_slots = try Slots.init(ctx);
     defer lazy_slots.deinit();
     try testing.expectEqual(@as(usize, 0), lazy_slots.presentCount());
-    try expectSameKeySet(try arrayItems(try jsonFieldRequired(expected, "lazy_present_at_build")), lazy_cells.presentKeys());
+    try block.assertKeyWith("lazy_present_at_build", &lazy_cells, cellsPresentKeySet);
 
     // Reads (slot pulls) grow only the slot present set.
     for (try arrayItems(try jsonFieldRequired(fixture, "reads"))) |r| {
@@ -1287,26 +1363,25 @@ test "lazily/reactive_map conformance: entry_kind_orthogonal_to_mode" {
         }
     }
     // Combined lazy present set after reads.
-    const want_after = try arrayItems(try jsonFieldRequired(expected, "lazy_present_after_reads"));
-    try testing.expectEqual(want_after.len, lazy_cells.presentCount() + lazy_slots.presentCount());
+    try block.assertKeyWith(
+        "lazy_present_after_reads",
+        lazy_cells.presentCount() + lazy_slots.presentCount(),
+        struct {
+            fn check(present: usize, want: json.Value) anyerror!void {
+                try testing.expectEqual((try arrayItems(want)).len, present);
+            }
+        }.check,
+    );
 
     // Observational transparency across kinds.
-    const observe_obj = switch (try jsonFieldRequired(expected, "observe")) {
-        .object => |o| o,
-        else => return error.ExpectedObject,
-    };
-    var oit = observe_obj.iterator();
-    while (oit.next()) |entry| {
-        const want = try jsonAsI64(entry.value_ptr.*);
-        const key = entry.key_ptr.*;
-        if (eager_cells.isPresent(key) or lazy_cells.isPresent(key)) {
-            try testing.expectEqual(want, eager_cells.get(key).?);
-            try testing.expectEqual(want, lazy_cells.get(key).?);
-        } else {
-            try testing.expectEqual(want, eager_slots.get(key).?);
-            try testing.expectEqual(want, try lazy_slots.getOrInsertWith(key, lookup.factory()));
-        }
-    }
+    try block.assertObjectWith("observe", KindObserveCtx{
+        .eager_cells = &eager_cells,
+        .eager_slots = &eager_slots,
+        .lazy_cells = &lazy_cells,
+        .lazy_slots = &lazy_slots,
+        .lookup = &lookup,
+    }, kindObserveMembers);
+    try block.finish();
 }
 
 test "lazily/reactive_map: deprecated CellMap/SlotMap aliases still resolve" {
@@ -1342,4 +1417,41 @@ test "lazily/reactive_map: EntryKind.fromWireName accepts both spellings, reject
     // Round-trip: the wire name a kind emits parses back to that kind.
     try testing.expectEqual(EntryKind.source, try EntryKind.fromWireName(EntryKind.source.wireName()));
     try testing.expectEqual(EntryKind.computed, try EntryKind.fromWireName(EntryKind.computed.wireName()));
+}
+
+const KindObserveCtx = struct {
+    eager_cells: *Cells,
+    eager_slots: *Slots,
+    lazy_cells: *Cells,
+    lazy_slots: *Slots,
+    lookup: *Lookup,
+    key: []const u8 = "",
+};
+
+fn kindObserveMembers(args: KindObserveCtx, members: *cj.AssertionKeys) anyerror!void {
+    const obj = switch (members.object) {
+        .object => |o| o,
+        else => return error.ExpectedObject,
+    };
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        var member = args;
+        member.key = entry.key_ptr.*;
+        try members.assertKeyWith(entry.key_ptr.*, member, kindObserveMember);
+    }
+}
+
+fn kindObserveMember(args: KindObserveCtx, want_json: json.Value) anyerror!void {
+    const want = try jsonAsI64(want_json);
+    const key = args.key;
+    if (args.eager_cells.isPresent(key) or args.lazy_cells.isPresent(key)) {
+        try testing.expectEqual(want, args.eager_cells.get(key).?);
+        try testing.expectEqual(want, args.lazy_cells.get(key).?);
+    } else {
+        try testing.expectEqual(want, args.eager_slots.get(key).?);
+        try testing.expectEqual(
+            want,
+            try args.lazy_slots.getOrInsertWith(key, args.lookup.factory()),
+        );
+    }
 }

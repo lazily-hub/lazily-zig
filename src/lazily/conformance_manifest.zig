@@ -372,14 +372,66 @@ fn declareBlock(fixture: []const u8, where: []const u8, block: std.json.Value) v
     append(line);
 }
 
-/// Inventory every `assertions` block a freshly read fixture carries: the
-/// top-level one plus any carried per-frame, per-scenario or per-reject.
+/// Key names the canonical corpus uses for an assertion-bearing block
+/// (`#lzzigblockwalk`). The whole set, not the one name this walk used to read:
+/// the corpus spells a block `assertions`, `expect`, `expected`,
+/// `expect_initial` or `expect_after` depending on the fixture family, and a
+/// walk that knows only one of them cannot see the other four.
+pub const BLOCK_NAMES = [_][]const u8{
+    "assertions",
+    "expect",
+    "expect_after",
+    "expect_initial",
+    "expected",
+};
+
+fn isBlockName(key: []const u8) bool {
+    for (BLOCK_NAMES) |name| {
+        if (std.mem.eql(u8, key, name)) return true;
+    }
+    return false;
+}
+
+/// Recursion bound for the inventory walk. The corpus nests a handful of levels
+/// deep; this exists so a hostile or malformed fixture cannot exhaust the test
+/// binary's stack through bookkeeping. Exceeding it contributes no declaration,
+/// which then reports downstream as an inventory below the derived expectation
+/// rather than as silence.
+const MAX_WALK_DEPTH: u8 = 32;
+
+/// Inventory every assertion-bearing block a freshly read fixture carries:
+/// every name in `BLOCK_NAMES`, at EVERY depth, object-valued only.
 ///
 /// Parsing the bytes here rather than asking a runner is the whole point — a
 /// block no runner looks at is exactly the one this rung exists to find. Bad
 /// JSON is silently skipped: bookkeeping never fails a suite, and a fixture that
 /// contributes no declaration shows up downstream as an inventory below the
-/// guard's floor.
+/// guard's derived expectation.
+///
+/// This walk used to read the top-level `assertions` key plus the `assertions`
+/// key of each element of the top-level `frames`/`scenarios`/`rejects` arrays,
+/// and nothing else (`#lzzigblockwalk`). Over the 138 fixtures this suite opens
+/// that inventoried 37 sites / 31 distinct digests, while the same fixtures
+/// carry 722 sites / 613 distinct digests under the rule below — so every
+/// `expect`/`expected` block in the corpus sat outside the rung that exists to
+/// catch a block nothing binds. It is verbatim what lazily-py had before it
+/// widened, and widening there surfaced 25 blocks no runner bound.
+///
+/// Two rules make the declaring side and the binding side agree:
+///
+///   * ARRAY-VALUED tracked keys contribute NO site. `signaling/frames.json`
+///     and `signaling/anti_spoof_session.json` carry array-valued `expect`
+///     keys; a runner binds their ELEMENTS, not the array, so counting the
+///     array would declare a block that cannot be bound by construction.
+///   * A block is emitted and NOT descended into, which is what a runner does —
+///     it binds the block and stops. Descending would inventory a fixture's
+///     `expect` nested inside its own `assertions` as a second, separately
+///     bindable site that no tracker can reach without unwrapping the first.
+///
+/// List labels prefer an element's own `name` string over its index, so a
+/// `where` reported here matches the way the scenario-shaped runners spell the
+/// same site and an excuse written against a reported label keeps matching when
+/// a scenario moves.
 pub fn recordDeclaredBlocks(path: []const u8, bytes: []const u8) void {
     if (resolveManifestPath() == null) return;
     const id = canonicalFixtureId(path);
@@ -393,23 +445,52 @@ pub fn recordDeclaredBlocks(path: []const u8, bytes: []const u8) void {
     ) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
-    const root = parsed.value.object;
+    walkDeclaredBlocks(arena.allocator(), id, parsed.value, "", 0);
+}
 
-    if (root.get("assertions")) |block| declareBlock(id, "assertions", block);
-    for ([_][]const u8{ "frames", "scenarios", "rejects" }) |container| {
-        const items = root.get(container) orelse continue;
-        if (items != .array) continue;
-        for (items.array.items, 0..) |item, index| {
-            if (item != .object) continue;
-            const block = item.object.get("assertions") orelse continue;
-            var where_buf: [128]u8 = undefined;
-            const where = std.fmt.bufPrint(
-                &where_buf,
-                "{s}[{d}].assertions",
-                .{ container, index },
-            ) catch continue;
-            declareBlock(id, where, block);
-        }
+fn walkDeclaredBlocks(
+    allocator: std.mem.Allocator,
+    fixture: []const u8,
+    node: std.json.Value,
+    path: []const u8,
+    depth: u8,
+) void {
+    if (depth >= MAX_WALK_DEPTH) return;
+    switch (node) {
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const value = entry.value_ptr.*;
+                const child = if (path.len == 0)
+                    key
+                else
+                    std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, key }) catch continue;
+                if (isBlockName(key) and value == .object) {
+                    declareBlock(fixture, child, value);
+                    continue;
+                }
+                walkDeclaredBlocks(allocator, fixture, value, child, depth + 1);
+            }
+        },
+        .array => |arr| {
+            for (arr.items, 0..) |item, index| {
+                const label: ?[]const u8 = label: {
+                    if (item != .object) break :label null;
+                    const named = item.object.get("name") orelse break :label null;
+                    break :label switch (named) {
+                        .string => |s| s,
+                        else => null,
+                    };
+                };
+                const child = if (label) |l|
+                    std.fmt.allocPrint(allocator, "{s}[{s}]", .{ path, l }) catch continue
+                else
+                    std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, index }) catch continue;
+                walkDeclaredBlocks(allocator, fixture, item, child, depth + 1);
+            }
+        },
+        else => {},
     }
 }
 

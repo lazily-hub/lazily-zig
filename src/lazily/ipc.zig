@@ -1975,6 +1975,18 @@ test "lazily/ipc: ShmBlobArena descriptor flows through IpcValue.sharedBlob" {
     try std.testing.expectEqualStrings("blob payload", try arena.readBlob(value.SharedBlob));
 }
 
+/// Compare a fixture byte array against the bytes the arena really wrote.
+fn expectByteArray(observed: []const u8, want: std.json.Value) anyerror!void {
+    const items = switch (want) {
+        .array => |a| a.items,
+        else => return error.ExpectedByteArray,
+    };
+    try std.testing.expectEqual(items.len, observed.len);
+    for (items, observed) |w, got| {
+        try std.testing.expectEqual(@as(u8, @intCast(try asU64(w))), got);
+    }
+}
+
 test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
     // Cross-sibling byte contract: the descriptor + 40-byte LZSH header for one
     // write must match the canonical lazily-spec fixture, so rs/py/zig arenas
@@ -2005,23 +2017,34 @@ test "lazily/ipc: ShmBlobArena conformance fixture (arena_blob.json)" {
     defer arena.deinit();
     const desc = try arena.writeBlob(epoch, payload);
 
-    const expected = try field(root, "expected");
-    const descriptor = try field(expected, "descriptor");
-    try std.testing.expectEqual(try asU64(try field(descriptor, "offset")), desc.offset);
-    try std.testing.expectEqual(try asU64(try field(descriptor, "len")), desc.len);
-    try std.testing.expectEqual(
-        try asU64(try field(descriptor, "generation")),
-        desc.generation,
+    // The `expected` block, BOUND (`#lzzigblockwalk`). Reading its keys by hand
+    // compared real bytes but bound nothing, so rung 0 could not see it — and
+    // `payload_region` turned out to be carried by the fixture and read by
+    // nothing at all, which is exactly what an unbound block hides.
+    var expected_keys = cj.AssertionKeys.init(
+        "arena_blob.json expected",
+        try field(root, "expected"),
     );
-    try std.testing.expectEqual(try asU64(try field(descriptor, "epoch")), desc.epoch);
-    try std.testing.expectEqual(
-        try asU64(try field(descriptor, "checksum")),
-        desc.checksum,
+    try expected_keys.assertObjectWith("descriptor", desc, struct {
+        fn check(want: ShmBlobRef, descriptor_keys: *cj.AssertionKeys) anyerror!void {
+            try descriptor_keys.assertKey("offset", want.offset);
+            try descriptor_keys.assertKey("len", want.len);
+            try descriptor_keys.assertKey("generation", want.generation);
+            try descriptor_keys.assertKey("epoch", want.epoch);
+            try descriptor_keys.assertKey("checksum", want.checksum);
+        }
+    }.check);
+    try expected_keys.assertKeyWith(
+        "header_bytes",
+        @as([]const u8, arena.bytes[0..SHM_BLOB_HEADER_LEN]),
+        expectByteArray,
     );
-
-    const header_bytes = try parseByteArray(allocator, try field(expected, "header_bytes"));
-    defer allocator.free(header_bytes);
-    try std.testing.expectEqualSlices(u8, header_bytes, arena.bytes[0..SHM_BLOB_HEADER_LEN]);
+    try expected_keys.assertKeyWith(
+        "payload_region",
+        @as([]const u8, arena.bytes[SHM_BLOB_HEADER_LEN..][0..@intCast(desc.len)]),
+        expectByteArray,
+    );
+    try expected_keys.finish();
 
     // round-trip
     try std.testing.expectEqualSlices(u8, payload, try arena.readBlob(desc));

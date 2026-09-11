@@ -122,7 +122,15 @@ KNOWN_UNCOVERED=(
 #
 # Excuses live here, next to KNOWN_UNCOVERED, so there is ONE place to read what
 # this binding does not prove.
-SCENARIO_EXCUSES=()
+# Written open-and-close on separate lines even while empty: lazily-spec's
+# check-corpus-floors.mjs finds an array by `NAME=(` and then scans for the next
+# line beginning `)`, so a same-line `NAME=()` hands it the CLOSE of whichever
+# array comes next and every entry in between reads as a scenario excuse. That is
+# what made 25 KNOWN_UNBOUND_BLOCKS entries subtract 25 from this binding's
+# derived scenario count (#lzzigblockwalk). The parser is fixed there too; this
+# shape is the half that does not depend on which lazily-spec a checkout has.
+SCENARIO_EXCUSES=(
+)
 
 # excuseScenario <fixture> <scenario-id> <reason>
 #
@@ -535,8 +543,41 @@ fi
 #
 # An unbindable block belongs HERE, as a documented excuse the guard reads every
 # run, not as a runner fabricated to manufacture coverage.
+#
+# Every entry below is a step of one of the six fixtures in
+# reactive_graph_conformance.zig's EXPECTED_SKIPS: the replay stops on an op or
+# an assertion key this binding does not implement, so the steps past that point
+# never run and their `expect` blocks are unreachable rather than unbound. They
+# are written per SITE and not per fixture on purpose — when the op lands, each
+# entry fails as STALE and has to be deleted one at a time, which is what stops
+# the excuse outliving the gap it describes.
 # Format: "fixture|where|reason".
 KNOWN_UNBOUND_BLOCKS=(
+  "reactive-graph/exact_fold_paths_stay_exact.json|steps[2].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/exact_fold_paths_stay_exact.json|steps[3].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/exact_fold_paths_stay_exact.json|steps[4].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/feedback_drain_bound_reports_exhaustion.json|steps[1].expect|skipped in every context: the fixture asserts the novel drain_exhausted key (parked upstream), so reactive_graph_conformance's replay stops on it (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/feedback_drain_bound_reports_exhaustion.json|steps[2].expect|skipped in every context: the fixture asserts the novel drain_exhausted key (parked upstream), so reactive_graph_conformance's replay stops on it (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/feedback_drain_bound_reports_exhaustion.json|steps[3].expect|skipped in every context: the fixture asserts the novel drain_exhausted key (parked upstream), so reactive_graph_conformance's replay stops on it (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_cell_acquires_no_dependency_edge.json|steps[1].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_cell_acquires_no_dependency_edge.json|steps[2].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_cell_acquires_no_dependency_edge.json|steps[3].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_cell_acquires_no_dependency_edge.json|steps[4].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_feed_through_a_formula_coalesces.json|steps[2].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_feed_through_a_formula_coalesces.json|steps[3].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_feed_through_a_formula_coalesces.json|steps[4].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_feed_through_a_formula_coalesces.json|steps[5].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_feed_through_a_formula_coalesces.json|steps[6].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_feed_through_a_formula_coalesces.json|steps[7].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_folds_synchronously_in_batch.json|steps[1].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_folds_synchronously_in_batch.json|steps[2].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_folds_synchronously_in_batch.json|steps[3].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_per_settled_cone_not_per_write.json|steps[1].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_per_settled_cone_not_per_write.json|steps[2].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_per_settled_cone_not_per_write.json|steps[3].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_per_settled_cone_not_per_write.json|steps[4].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_per_settled_cone_not_per_write.json|steps[5].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
+  "reactive-graph/merge_per_settled_cone_not_per_write.json|steps[6].expect|skipped in every context: the fixture drives a merge_cell op and this binding's reactive graph has no merge-feed node kind, so reactive_graph_conformance's replay stops on the op (EXPECTED_SKIPS) and no later step's expect is reached"
 )
 
 BLOCK_EXCUSES="$(printf '%s\n' "${KNOWN_UNBOUND_BLOCKS[@]:-}")" \
@@ -577,6 +618,13 @@ for raw in os.environ.get("BLOCK_EXCUSES", "").splitlines():
         sys.exit(1)
     excuses["%s|%s" % (parts[0], parts[1])] = parts[2]
 
+declared_sites = {}   # "fixture|where" -> digest
+declared_fixtures = set()
+for digest, sites in declared.items():
+    for site in sites:
+        declared_sites[site] = digest
+        declared_fixtures.add(site.split("|", 1)[0])
+
 unbound = []
 for digest, sites in sorted(declared.items()):
     if digest in bound:
@@ -584,6 +632,34 @@ for digest, sites in sorted(declared.items()):
     for site in sorted(sites):
         if site not in excuses:
             unbound.append(site)
+
+# BOTH the other directions, or the ledger rots into a list nobody can audit.
+# An excuse naming a site this run did not inventory describes a block that
+# moved or is gone; an excuse naming a site whose digest a runner DID bind hides
+# nothing and is the same false green the excuse was written to avoid.
+stale = []
+for site in sorted(excuses):
+    fixture = site.split("|", 1)[0]
+    digest = declared_sites.get(site)
+    if digest is None:
+        # Out of scope rather than stale when the fixture was not opened at all:
+        # a `zig build test` filtered to one module would otherwise print a wall
+        # of noise for every fixture it did not reach.
+        if fixture in declared_fixtures:
+            stale.append((site, "the opened fixture no longer carries this block"))
+        continue
+    if digest in bound:
+        stale.append((site, "a runner DOES bind this block now"))
+
+if stale:
+    sys.stderr.write(
+        "ERROR: %d KNOWN_UNBOUND_BLOCKS entr(ies) are stale — the gap each described\n"
+        "       has been closed, so the excuse now hides nothing:\n" % len(stale)
+    )
+    for site, why in stale:
+        sys.stderr.write("         %s: %s\n" % (site, why))
+    sys.stderr.write("       Delete each one.\n")
+    sys.exit(1)
 
 if unbound:
     sys.stderr.write(
@@ -631,19 +707,25 @@ if unbound:
 # nothing — the exact #lzvacuousrun failure this floor exists to prevent. The
 # corpus on disk is the independent witness; the manifest is the thing on trial.
 #
-# SCOPE — this makes the NUMBER honest, it does not make the WALK wide.
-# The walk mirrored below is recordDeclaredBlocks() in
-# src/lazily/conformance_manifest.zig: the top-level `assertions` key, plus the
-# `assertions` key of each OBJECT element of the top-level `frames`, `scenarios`
-# and `rejects` arrays. Object-valued only, nothing else, no recursion. That is
-# narrow, and deriving the count must not be read as settling it: under the
-# three-name `{assertions, expect, expected}` object-only rule the same 138
-# opened fixtures carry 716 assertion-block sites / 607 distinct digests, so
-# rung 0 inventories 37 sites — 5.2% — and EVERY `expect`/`expected` block in
-# the corpus falls outside it. This is verbatim the pre-#lzunboundblockguard
-# walk lazily-py had before it widened from 31 to 578. Widening is its own item:
-# each newly surfaced block must then be bound or excused. Deriving the constant
-# is what stops it drifting WHILE that widening is pending.
+# SCOPE — the walk mirrored below is recordDeclaredBlocks() in
+# src/lazily/conformance_manifest.zig, and the two must stay one rule: every
+# name in BLOCK_NAMES (`assertions`, `expect`, `expect_after`, `expect_initial`,
+# `expected`) at EVERY depth, OBJECT-VALUED ONLY, a block emitted and not
+# descended into.
+#
+# It used to be the top-level `assertions` key plus the `assertions` key of each
+# OBJECT element of the top-level `frames`/`scenarios`/`rejects` arrays, with no
+# recursion (`#lzzigblockwalk`). That inventoried 37 sites / 31 distinct digests
+# of the 722 / 613 the same 138 opened fixtures carry — 5.2% — so EVERY
+# `expect`/`expected` block in the corpus sat outside the rung that exists to
+# catch a block nothing binds, and none of them could be reported unbound. It was
+# verbatim the pre-#lzunboundblockguard walk lazily-py had before it widened, and
+# widening there surfaced 25 real ones. Widening here surfaced 204 digests over
+# 239 sites, every one of them now bound by a tracker or excused below.
+#
+# Array-valued tracked keys contribute NO site: a runner binds the ELEMENTS of
+# `signaling/frames.json`'s array-valued `expect`, never the array, so counting
+# the array would declare a block unbindable by construction.
 
 # blockDigest() from conformance_manifest.zig, byte for byte: FNV-1a over a
 # type-tagged structural rendering, integers and floats folded by their raw
@@ -717,6 +799,32 @@ def hash_value(h, value):
     raise TypeError(repr(value))
 
 
+# The walk rule, one definition. `recordDeclaredBlocks()` in
+# src/lazily/conformance_manifest.zig is the other half and they must agree
+# exactly: a derived expectation that walked the corpus differently from the
+# inventory it is compared against would be worse than the typed constant it
+# replaced. Only the block VALUES are needed here — the runtime ledger carries
+# the `where` labels — but the traversal is the same one, including the
+# emit-and-do-not-descend rule, because descending would count a fixture's
+# `expect` nested inside its own `assertions` as a second site no tracker can
+# reach without unwrapping the first.
+BLOCK_NAMES = ("assertions", "expect", "expect_after", "expect_initial", "expected")
+
+
+def iter_declared_blocks(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in BLOCK_NAMES and isinstance(value, dict):
+                yield value
+                continue
+            for block in iter_declared_blocks(value):
+                yield block
+    elif isinstance(node, list):
+        for item in node:
+            for block in iter_declared_blocks(item):
+                yield block
+
+
 corpus = os.environ["CORPUS_DIR"]
 uncovered = set()
 for raw in os.environ.get("UNCOVERED_FIXTURES", "").splitlines():
@@ -748,21 +856,7 @@ for fixture in opened:
             continue
     if not isinstance(doc, dict):
         continue
-    blocks = []
-    top = doc.get("assertions")
-    if isinstance(top, dict):
-        blocks.append(top)
-    for container in ("frames", "scenarios", "rejects"):
-        items = doc.get(container)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            block = item.get("assertions")
-            if isinstance(block, dict):
-                blocks.append(block)
-    for block in blocks:
+    for block in iter_declared_blocks(doc):
         expected_sites += 1
         expected_digests.add(hash_value(FNV_OFFSET, block))
 
@@ -814,7 +908,8 @@ if len(declared) != expected:
 print(
     "assertion-block bind OK: %d/%d assertion blocks carried by opened fixtures were"
     " BOUND to a tracker (%d declared unbindable; %d expected, DERIVED from %d opened"
-    " of %d canonical fixtures — %d sites, narrow walk; content-keyed, so a runner's"
+    " of %d canonical fixtures — %d sites, every block name at every depth;"
+    " content-keyed, so a runner's"
     " block NAME cannot satisfy it)"
     % (
         len(declared),

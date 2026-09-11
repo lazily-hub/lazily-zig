@@ -120,25 +120,45 @@ fn expectReconnect(actual: core_mod.LatestDurableReconnect, expected: cj.Value) 
     }
 }
 
-fn expectState(projection: anytype, expected: cj.Value) !void {
-    try testing.expectEqual(
-        try cj.asU64(try cj.required(expected, "generation")),
-        projection.generation(),
-    );
-    const entries = try cj.asArray(try cj.required(expected, "entries"));
-    try testing.expectEqual(entries.len, projection.count());
-    for (entries) |expected_entry| {
-        const key = try cj.asStr(try cj.required(expected_entry, "key"));
-        const state = projection.state(key) orelse return error.ExpectedKey;
-        try expectRevision(state.desired, try cj.required(expected_entry, "desired"));
-        try expectEnvelope(state.inflight, try cj.required(expected_entry, "inflight"));
-        try expectOptionalU64(state.durable_through, try cj.required(expected_entry, "durable_through"));
-    }
+/// Compare a step's `expected` block against the projection, THROUGH an
+/// `AssertionKeys` tracker (`#lzzigblockwalk`).
+///
+/// The reads this replaces were real comparisons that bound nothing, so all 22
+/// per-step `expected` blocks of `egress/latest_durable_projection.json` sat
+/// outside rung 0 — a runner that stopped evaluating them would have reported
+/// nothing rather than a gap. `entries` is array-valued, so it carries no
+/// key-set obligation and its per-entry sweep stays inside `assertKeyWith`.
+fn expectState(where: []const u8, projection: anytype, expected: cj.Value) !void {
+    var block = cj.AssertionKeys.init(where, expected);
+    try block.assertKey("generation", projection.generation());
+    try block.assertKeyWith("entries", projection, struct {
+        fn check(p: @TypeOf(projection), want: cj.Value) anyerror!void {
+            const entries = try cj.asArray(want);
+            try testing.expectEqual(entries.len, p.count());
+            for (entries) |expected_entry| {
+                const key = try cj.asStr(try cj.required(expected_entry, "key"));
+                const state = p.state(key) orelse return error.ExpectedKey;
+                try expectRevision(state.desired, try cj.required(expected_entry, "desired"));
+                try expectEnvelope(state.inflight, try cj.required(expected_entry, "inflight"));
+                try expectOptionalU64(
+                    state.durable_through,
+                    try cj.required(expected_entry, "durable_through"),
+                );
+            }
+        }
+    }.check);
+    try block.finish();
 }
 
 fn replay(projection: anytype, scenario: cj.Value) !usize {
     var count: usize = 0;
-    for (try cj.asArray(try cj.required(scenario, "steps"))) |step| {
+    for (try cj.asArray(try cj.required(scenario, "steps")), 0..) |step, index| {
+        var where_buf: [192]u8 = undefined;
+        const where = std.fmt.bufPrint(
+            &where_buf,
+            "{s} #{d}.expected",
+            .{ fixture_path, index },
+        ) catch fixture_path;
         const op = try cj.required(step, "op");
         const expected_return = try cj.required(step, "returns");
         const key = try cj.optStr(op, "key");
@@ -184,7 +204,7 @@ fn replay(projection: anytype, scenario: cj.Value) !usize {
                 expected_return,
             );
         } else return error.UnknownOperation;
-        try expectState(projection, try cj.required(step, "expected"));
+        try expectState(where, projection, try cj.required(step, "expected"));
         count += 1;
     }
     return count;

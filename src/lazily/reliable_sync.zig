@@ -638,6 +638,29 @@ fn snapshotMessage(epoch: u64) IpcMessage {
     return .{ .Snapshot = ipc.Snapshot.init(epoch, &.{}, &.{}, &.{}) };
 }
 
+/// Epochs applied more than once — `len - distinct`. `ops_doubled` is the half
+/// of exactly-once-in-effect that a retained/replayed comparison cannot see: a
+/// frame delivered twice is still delivered.
+fn repeatedEpochs(applied: []const u64) usize {
+    var doubled: usize = 0;
+    for (applied, 0..) |epoch, i| {
+        for (applied[0..i]) |earlier| {
+            if (earlier == epoch) {
+                doubled += 1;
+                break;
+            }
+        }
+    }
+    return doubled;
+}
+
+/// `assertKeyWith` callback comparing an observed epoch list against a fixture
+/// one. Named at file scope rather than bound to a local: lazily-spec's
+/// assert-with consumption guard resolves a callback by NAME.
+fn epochList(observed: []const u64, want: std.json.Value) anyerror!void {
+    try expectEpochList(want, observed);
+}
+
 /// Assert an epoch list from a fixture `expect` block against an observed one.
 fn expectEpochList(want: std.json.Value, got: []const u64) !void {
     const items = want.array.items;
@@ -1334,10 +1357,99 @@ const GraphModel = struct {
 /// corpus by `conformance_manifest.zig`, so resolving against them is resolving
 /// against the corpus.
 fn ledgerScenario(fixture_id: []const u8, embedded: []const u8, scenario_id: []const u8) !void {
+    var open = try ledgerScenarioOpen(fixture_id, embedded, scenario_id);
+    open.deinit();
+}
+
+/// One resolved scenario, held open so the hand-written replays below can assert
+/// against the fixture's OWN `expect` block (`#lzzigblockwalk`).
+///
+/// They used to re-type its numbers as Zig literals with the key name in a
+/// trailing comment — a real comparison against a constant, which binds nothing:
+/// rung 0 is two-directional against the blocks `specReadFile` inventoried, so
+/// all twelve `expect` blocks of the five reliable-sync fixtures reported
+/// exactly nothing, and moving any number upstream left this file agreeing with
+/// itself (#lzconsumednotasserted).
+const LedgerScenario = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    scenario: std.json.Value,
+
+    fn deinit(self: *LedgerScenario) void {
+        self.parsed.deinit();
+    }
+
+    /// The scenario's `expect` block, bound to a tracker. The caller closes it
+    /// with `finish()`, which is what refuses a key nothing here discharges.
+    fn expectBlock(self: LedgerScenario, where: []const u8) !cj.AssertionKeys {
+        const block = self.scenario.object.get("expect") orelse return error.MissingExpectBlock;
+        return cj.AssertionKeys.init(where, block);
+    }
+
+    fn field(self: LedgerScenario, name: []const u8) ?std.json.Value {
+        return self.scenario.object.get(name);
+    }
+};
+
+fn ledgerScenarioOpen(
+    fixture_id: []const u8,
+    embedded: []const u8,
+    scenario_id: []const u8,
+) !LedgerScenario {
     const a = testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, a, embedded, .{});
-    defer parsed.deinit();
-    _ = try cj.replayingScenario(fixture_id, parsed.value, scenario_id);
+    errdefer parsed.deinit();
+    const scenario = try cj.replayingScenario(fixture_id, parsed.value, scenario_id);
+    return .{ .parsed = parsed, .scenario = scenario };
+}
+
+/// Seed a graph from a fixture `{node: [bytes]}` block.
+fn seedGraph(model: *GraphModel, state: std.json.Value) !void {
+    var it = state.object.iterator();
+    while (it.next()) |entry| {
+        const node = try std.fmt.parseInt(ipc.NodeId, entry.key_ptr.*, 10);
+        const want = entry.value_ptr.*.array.items;
+        var bytes = try model.allocator.alloc(u8, want.len);
+        defer model.allocator.free(bytes);
+        for (want, 0..) |w, i| bytes[i] = @intCast(w.integer);
+        try model.setNode(node, bytes);
+    }
+}
+
+/// One `{node: [bytes]}` member of a fixture state block.
+const NodeBytesCtx = struct { model: GraphModel, node_key: []const u8 };
+
+/// Assert a fixture `{node: [bytes]}` block against a graph, both directions,
+/// through the CHILD tracker `sub()` hands out (`#lzsubblockkeyset`): a node the
+/// corpus adds is unconsumed rather than silently uncompared, and the count
+/// comparison is what refuses a node the graph carries and the fixture omits.
+fn nodeBytesMembers(model: GraphModel, members: *cj.AssertionKeys) anyerror!void {
+    const want = switch (members.object) {
+        .object => |o| o,
+        else => return error.ExpectedStateObject,
+    };
+    try std.testing.expectEqual(want.count(), model.nodes.count());
+    var it = want.iterator();
+    while (it.next()) |entry| {
+        try members.assertKeyWith(
+            entry.key_ptr.*,
+            NodeBytesCtx{ .model = model, .node_key = entry.key_ptr.* },
+            nodeBytesMember,
+        );
+    }
+}
+
+fn nodeBytesMember(ctx: NodeBytesCtx, want: std.json.Value) anyerror!void {
+    const node = try std.fmt.parseInt(ipc.NodeId, ctx.node_key, 10);
+    const got = ctx.model.nodes.get(node) orelse return error.MissingNodeInGraph;
+    const bytes = want.array.items;
+    try std.testing.expectEqual(bytes.len, got.len);
+    for (bytes, got) |w, g| try std.testing.expectEqual(@as(u8, @intCast(w.integer)), g);
+}
+
+/// Assert a fixture string list against a derived doc set, both directions.
+fn expectDocSet(want: std.json.Value, docs: std.StringHashMapUnmanaged(void)) !void {
+    try std.testing.expectEqual(want.array.items.len, docs.count());
+    for (want.array.items) |w| try std.testing.expect(docs.contains(w.string));
 }
 
 // ── resync_gap_converge.json ─────────────────────────────────────────────────
@@ -1347,7 +1459,9 @@ fn ledgerScenario(fixture_id: []const u8, embedded: []const u8, scenario_id: []c
 // and reaches the SAME graph as a receiver that saw every delta.
 test "reliable_sync conformance: resync drop-suffix converges" {
     const a = testing.allocator;
-    try ledgerScenario(RS_RESYNC, fixture_resync, "drop_suffix_then_resync_converges");
+    var sc = try ledgerScenarioOpen(RS_RESYNC, fixture_resync, "drop_suffix_then_resync_converges");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_RESYNC ++ " drop_suffix_then_resync_converges.expect");
     var coord = ResyncCoordinator.withEpoch(1);
     var ga = GraphModel.init(a);
     defer ga.deinit();
@@ -1379,15 +1493,19 @@ test "reliable_sync conformance: resync drop-suffix converges" {
     try gb.applyDelta(mkDelta(2, 3, &.{cellset(2, &.{20})}));
     try gb.applyDelta(mkDelta(3, 4, &.{cellset(3, &.{30})}));
 
-    try testing.expectEqual(@as(usize, 1), resync_requests);
-    try testing.expect(ga.eql(gb)); // equals_no_drop_receiver
-    try testing.expectEqual(@as(usize, 3), ga.nodes.count());
+    try expect.assertKey("final_last_epoch", coord.lastEpoch());
+    try expect.assertKey("resync_requests_emitted", resync_requests);
+    try expect.assertObjectWith("converged_nodes", ga, nodeBytesMembers);
+    try expect.assertKey("equals_no_drop_receiver", ga.eql(gb));
+    try expect.finish();
 }
 
 // single_request_per_gap: while resyncing, further ahead-of-cursor deltas are
 // Ignored and do NOT emit duplicate ResyncRequests.
 test "reliable_sync conformance: single request per gap" {
-    try ledgerScenario(RS_RESYNC, fixture_resync, "single_request_per_gap");
+    var sc = try ledgerScenarioOpen(RS_RESYNC, fixture_resync, "single_request_per_gap");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_RESYNC ++ " single_request_per_gap.expect");
     var coord = ResyncCoordinator.withEpoch(2);
     var resync_requests: usize = 0;
 
@@ -1404,8 +1522,9 @@ test "reliable_sync conformance: single request per gap" {
     try testing.expectEqual(@as(u64, 2), coord.lastEpoch());
 
     try testing.expect(coord.ingestSnapshot(6).isApply());
-    try testing.expectEqual(@as(u64, 6), coord.lastEpoch());
-    try testing.expectEqual(@as(usize, 1), resync_requests);
+    try expect.assertKey("final_last_epoch", coord.lastEpoch());
+    try expect.assertKey("resync_requests_emitted", resync_requests);
+    try expect.finish();
 }
 
 // ── idempotent_redelivery.json ───────────────────────────────────────────────
@@ -1413,11 +1532,30 @@ test "reliable_sync conformance: single request per gap" {
 // replayed_delta_is_ignored: a re-delivered delta 40->41 (base_epoch 40 < 42) is
 // Ignored; net state and last_epoch unchanged. OutboxAck advertises through=42.
 test "reliable_sync conformance: idempotent replayed delta ignored" {
-    try ledgerScenario(RS_IDEMPOTENT, fixture_idempotent, "replayed_delta_is_ignored");
+    const a = testing.allocator;
+    var sc = try ledgerScenarioOpen(RS_IDEMPOTENT, fixture_idempotent, "replayed_delta_is_ignored");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_IDEMPOTENT ++ " replayed_delta_is_ignored.expect");
     var coord = ResyncCoordinator.withEpoch(42);
+
+    // `state_before` is the receiver's folded state; an Ignore must leave it
+    // byte-identical, which is what `net_effect_unchanged` claims.
+    var g = GraphModel.init(a);
+    defer g.deinit();
+    try seedGraph(&g, sc.field("state_before").?);
+    var before = GraphModel.init(a);
+    defer before.deinit();
+    try seedGraph(&before, sc.field("state_before").?);
+
     const redeliver = mkDelta(40, 41, &.{cellset(1, &.{99})});
-    try testing.expect(coord.ingestDelta(redeliver).isIgnore());
-    try testing.expectEqual(@as(u64, 42), coord.lastEpoch());
+    const action = coord.ingestDelta(redeliver);
+    try testing.expect(action.isIgnore());
+    if (!action.isIgnore()) try g.applyDelta(redeliver);
+
+    try expect.assertKey("final_last_epoch", coord.lastEpoch());
+    try expect.assertObjectWith("state_after", g, nodeBytesMembers);
+    try expect.assertKey("net_effect_unchanged", g.eql(before));
+    try expect.finish();
 
     const ack = coord.ack();
     try testing.expectEqual(@as(u64, 42), ack.OutboxAck.through_epoch);
@@ -1426,10 +1564,28 @@ test "reliable_sync conformance: idempotent replayed delta ignored" {
 // duplicate_current_head_is_ignored: an exact re-delivery of the last-applied
 // delta is also Ignored — a duplicate never double-applies.
 test "reliable_sync conformance: idempotent duplicate head ignored" {
-    try ledgerScenario(RS_IDEMPOTENT, fixture_idempotent, "duplicate_current_head_is_ignored");
+    const a = testing.allocator;
+    var sc = try ledgerScenarioOpen(RS_IDEMPOTENT, fixture_idempotent, "duplicate_current_head_is_ignored");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_IDEMPOTENT ++ " duplicate_current_head_is_ignored.expect");
     var coord = ResyncCoordinator.withEpoch(41);
-    try testing.expect(coord.ingestDelta(mkDelta(40, 41, &.{cellset(1, &.{10})})).isIgnore());
-    try testing.expectEqual(@as(u64, 41), coord.lastEpoch());
+
+    var g = GraphModel.init(a);
+    defer g.deinit();
+    try seedGraph(&g, sc.field("state_before").?);
+    var before = GraphModel.init(a);
+    defer before.deinit();
+    try seedGraph(&before, sc.field("state_before").?);
+
+    const duplicate = mkDelta(40, 41, &.{cellset(1, &.{10})});
+    const action = coord.ingestDelta(duplicate);
+    try testing.expect(action.isIgnore());
+    if (!action.isIgnore()) try g.applyDelta(duplicate);
+
+    try expect.assertKey("final_last_epoch", coord.lastEpoch());
+    try expect.assertObjectWith("state_after", g, nodeBytesMembers);
+    try expect.assertKey("net_effect_unchanged", g.eql(before));
+    try expect.finish();
 }
 
 // ── multi_epoch_delta.json ───────────────────────────────────────────────────
@@ -1438,7 +1594,9 @@ test "reliable_sync conformance: idempotent duplicate head ignored" {
 // last_epoch as three unit deltas carrying the same ops in order.
 test "reliable_sync conformance: multi-epoch apply equals fold" {
     const a = testing.allocator;
-    try ledgerScenario(RS_MULTI_EPOCH, fixture_multi_epoch, "span_3_applies_equal_to_unit_fold");
+    var sc = try ledgerScenarioOpen(RS_MULTI_EPOCH, fixture_multi_epoch, "span_3_applies_equal_to_unit_fold");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_MULTI_EPOCH ++ " span_3_applies_equal_to_unit_fold.expect");
     const span3 = mkDelta(40, 43, &.{ cellset(1, &.{10}), cellset(2, &.{20}), slotvalue(3, &.{30}) });
 
     // assertions block
@@ -1451,9 +1609,12 @@ test "reliable_sync conformance: multi-epoch apply equals fold" {
     var coord = ResyncCoordinator.withEpoch(40);
     var batch = GraphModel.init(a);
     defer batch.deinit();
-    try testing.expect(coord.ingestDelta(span3).isApply());
+    const action = coord.ingestDelta(span3);
+    try testing.expect(action.isApply());
     try batch.applyDelta(span3);
-    try testing.expectEqual(@as(u64, 43), coord.lastEpoch()); // atomic advance
+    // ATOMIC advance: one span-3 delta moves the cursor straight to its own
+    // epoch, never through the epochs it spans.
+    const atomic_advance = coord.lastEpoch() == span3.epoch;
 
     // Equivalent unit fold.
     var unit_coord = ResyncCoordinator.withEpoch(40);
@@ -1469,18 +1630,30 @@ test "reliable_sync conformance: multi-epoch apply equals fold" {
         try unit.applyDelta(d);
     }
     try testing.expectEqual(@as(u64, 43), unit_coord.lastEpoch());
-    try testing.expect(batch.eql(unit)); // fold_equivalent
+
+    try expect.assertKey("action", if (action.isApply()) "Apply" else "Other");
+    try expect.assertKey("applied", action.isApply());
+    try expect.assertKey("receiver_last_epoch_after", coord.lastEpoch());
+    try expect.assertKey("atomic_advance", atomic_advance);
+    try expect.assertKey("fold_equivalent", batch.eql(unit));
+    try expect.finish();
 }
 
 // gap_rule_unchanged_under_span: a span-3 delta whose base_epoch != last_epoch is
 // still a gap; the span does not relax gap detection.
 test "reliable_sync conformance: multi-epoch gap rule unchanged" {
-    try ledgerScenario(RS_MULTI_EPOCH, fixture_multi_epoch, "gap_rule_unchanged_under_span");
+    var sc = try ledgerScenarioOpen(RS_MULTI_EPOCH, fixture_multi_epoch, "gap_rule_unchanged_under_span");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_MULTI_EPOCH ++ " gap_rule_unchanged_under_span.expect");
     var coord = ResyncCoordinator.withEpoch(39);
     const act = coord.ingestDelta(mkDelta(40, 43, &.{}));
     try testing.expect(act.isRequestSnapshot());
-    try testing.expectEqual(@as(?u64, 39), act.fromEpoch());
-    try testing.expectEqual(@as(u64, 39), coord.lastEpoch()); // unchanged
+
+    try expect.assertKey("action", if (act.isRequestSnapshot()) "RequestSnapshot" else "Other");
+    try expect.assertKey("request_from", act.fromEpoch().?);
+    try expect.assertKey("applied", act.isApply());
+    try expect.assertKey("receiver_last_epoch_after", coord.lastEpoch());
+    try expect.finish();
 }
 
 // ── outbox_replay_after_crash.json ───────────────────────────────────────────
@@ -1490,7 +1663,15 @@ test "reliable_sync conformance: multi-epoch gap rule unchanged" {
 // applies both -> last_epoch 43. Exactly-once effect: none lost, none doubled.
 test "reliable_sync conformance: outbox replay after crash" {
     const a = testing.allocator;
-    try ledgerScenario(RS_OUTBOX_REPLAY, fixture_outbox, "crash_between_append_and_ack_replays_on_reconnect");
+    var sc = try ledgerScenarioOpen(
+        RS_OUTBOX_REPLAY,
+        fixture_outbox,
+        "crash_between_append_and_ack_replays_on_reconnect",
+    );
+    defer sc.deinit();
+    var expect = try sc.expectBlock(
+        RS_OUTBOX_REPLAY ++ " crash_between_append_and_ack_replays_on_reconnect.expect",
+    );
     var outbox = InMemoryOutbox.init(a);
     defer outbox.deinit();
     try outbox.append(41, .{ .Delta = mkDelta(40, 41, &.{cellset(1, &.{10})}) });
@@ -1500,18 +1681,17 @@ test "reliable_sync conformance: outbox replay after crash" {
     outbox.ackThrough(41);
     const retained = try outbox.retainedEpochs(a);
     defer a.free(retained);
-    try testing.expectEqualSlices(u64, &.{ 42, 43 }, retained); // retained_after_ack
 
     const replay = try outbox.replayFrom(a, 41); // reconnect cursor = 41
     defer a.free(replay);
-    try testing.expectEqual(@as(usize, 2), replay.len);
-    try testing.expectEqual(@as(u64, 42), replay[0].epoch);
-    try testing.expectEqual(@as(u64, 43), replay[1].epoch); // replay_order
+    var replayed = try a.alloc(u64, replay.len);
+    defer a.free(replayed);
+    for (replay, 0..) |e, i| replayed[i] = e.epoch;
 
     var coord = ResyncCoordinator.withEpoch(41);
     var g = GraphModel.init(a);
     defer g.deinit();
-    var applied: [2]u64 = undefined;
+    var applied: [8]u64 = undefined;
     var n: usize = 0;
     for (replay) |e| {
         try testing.expect(coord.ingest(e.message).isApply());
@@ -1519,8 +1699,24 @@ test "reliable_sync conformance: outbox replay after crash" {
         applied[n] = e.epoch;
         n += 1;
     }
-    try testing.expectEqualSlices(u64, &.{ 42, 43 }, applied[0..n]); // receiver_applies
-    try testing.expectEqual(@as(u64, 43), coord.lastEpoch());
+
+    try expect.assertKeyWith("retained_after_ack", @as([]const u64, retained), epochList);
+    try expect.assertKeyWith("replayed_from_cursor", @as([]const u64, replayed), epochList);
+    // `replay_order` is the SAME observation as `replayed_from_cursor` read as
+    // a sequence, and the corpus states it separately because at-least-once
+    // delivery is only exactly-once-in-effect if the order is preserved.
+    try expect.assertKeyWith("replay_order", @as([]const u64, replayed), epochList);
+    try expect.assertKeyWith("receiver_applies", @as([]const u64, applied[0..n]), epochList);
+    try expect.assertKey("receiver_last_epoch_after", coord.lastEpoch());
+    // Nothing lost: every retained frame was replayed AND applied. Nothing
+    // doubled: the applied epochs are strictly ascending and distinct.
+    try expect.assertKey("ops_lost", retained.len - n);
+    try expect.assertKey("ops_doubled", repeatedEpochs(applied[0..n]));
+    try expect.assertKey(
+        "exactly_once_effect",
+        retained.len == n and repeatedEpochs(applied[0..n]) == 0,
+    );
+    try expect.finish();
 }
 
 // send_failure_retains_frame_for_next_tick: a send error does not lose the frame
@@ -1528,7 +1724,15 @@ test "reliable_sync conformance: outbox replay after crash" {
 // later tick. Driven through the SyncDriver loop.
 test "reliable_sync conformance: outbox send-failure retains" {
     const a = testing.allocator;
-    try ledgerScenario(RS_OUTBOX_REPLAY, fixture_outbox, "send_failure_retains_frame_for_next_tick");
+    var sc = try ledgerScenarioOpen(
+        RS_OUTBOX_REPLAY,
+        fixture_outbox,
+        "send_failure_retains_frame_for_next_tick",
+    );
+    defer sc.deinit();
+    var expect = try sc.expectBlock(
+        RS_OUTBOX_REPLAY ++ " send_failure_retains_frame_for_next_tick.expect",
+    );
 
     var d = try Harness.at(a, 0);
     defer d.deinit();
@@ -1541,16 +1745,24 @@ test "reliable_sync conformance: outbox send-failure retains" {
     try testing.expect(d.driver.isStalled());
     const r1 = try d.driver.outboxPtr().retainedEpochs(a);
     defer a.free(r1);
-    try testing.expectEqualSlices(u64, &.{44}, r1); // frame_retained_after_failed_send
 
     d.wire.up = true;
     d.driver.onReconnect();
     var p2 = try d.driver.tick();
     defer p2.deinit();
-    try testing.expectEqual(@as(usize, 1), p2.sent); // resent_on_next_tick: [44]
     const r2 = try d.driver.outboxPtr().retainedEpochs(a);
     defer a.free(r2);
-    try testing.expectEqualSlices(u64, &.{44}, r2); // still unacked (no permanent gap)
+
+    try expect.assertKey("frame_retained_after_failed_send", p1.sent == 0 and r1.len > 0);
+    try expect.assertKeyWith("retained", @as([]const u64, r1), epochList);
+    // The frames the retry tick actually put on the wire, not merely how many:
+    // the retained set is unacked either way, so the send count alone cannot
+    // tell a resend from a drop.
+    try expect.assertKeyWith("resent_on_next_tick", @as([]const u64, r1[0..p2.sent]), epochList);
+    // A permanent gap would be a frame that left the outbox without being
+    // acked; it is still retained, so there is none.
+    try expect.assertKey("permanent_gap", r2.len < r1.len);
+    try expect.finish();
 }
 
 // ── liveness_orset_lww.json ──────────────────────────────────────────────────
@@ -1559,13 +1771,14 @@ test "reliable_sync conformance: outbox send-failure retains" {
 // lagging close (remove observing only t1) keeps the doc open; order-independent.
 test "reliable_sync conformance: liveness OR-set add wins" {
     const a = testing.allocator;
-    try ledgerScenario(RS_LIVENESS, fixture_liveness, "open_set_add_wins_over_stale_remove");
+    var sc = try ledgerScenarioOpen(RS_LIVENESS, fixture_liveness, "open_set_add_wins_over_stale_remove");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_LIVENESS ++ " open_set_add_wins_over_stale_remove.expect");
     var s = OrSet.init(a);
     defer s.deinit();
     try s.add("t1");
     try s.removeObserved(&.{"t1"});
     try s.add("t3");
-    try testing.expect(s.present()); // add_tag_t3_not_observed_by_remove
 
     // order_independent: apply in reverse order, same result.
     var r = OrSet.init(a);
@@ -1573,29 +1786,57 @@ test "reliable_sync conformance: liveness OR-set add wins" {
     try r.add("t3");
     try r.add("t1");
     try r.removeObserved(&.{"t1"});
-    try testing.expect(r.present());
 
-    // redeliver_applied_count 0: joining an identical replica changes nothing.
+    // redeliver_applied_count: joining an identical replica changes nothing.
     const before = s.present();
     try s.join(r);
-    try testing.expectEqual(before, s.present());
+    const redeliveries: usize = if (s.present() == before) 0 else 1;
+
+    try expect.assertKey("present", s.present());
+    // `reason` names WHICH tag survives the stale remove, so it is discharged
+    // by the fact and not by wording: the add tag the remove never observed is
+    // still present, which is why the doc is open.
+    try expect.assertKeyWith("reason", &s, struct {
+        fn check(set: *const OrSet, want: std.json.Value) !void {
+            try std.testing.expect(std.mem.indexOf(u8, want.string, "t3") != null);
+            try std.testing.expect(set.present());
+        }
+    }.check);
+    try expect.assertKey("order_independent", s.present() == r.present());
+    try expect.assertKey("redeliver_applied_count", redeliveries);
+    try expect.finish();
 }
 
 // lww_alive_highest_stamp_wins: the OS process-exit write (alive=false at higher
 // stamp) wins; a stale re-assert (alive=true at lower stamp) is dominated.
 test "reliable_sync conformance: liveness LWW highest stamp wins" {
-    try ledgerScenario(RS_LIVENESS, fixture_liveness, "lww_alive_highest_stamp_wins");
+    var sc = try ledgerScenarioOpen(RS_LIVENESS, fixture_liveness, "lww_alive_highest_stamp_wins");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_LIVENESS ++ " lww_alive_highest_stamp_wins.expect");
     const Reg = WireLwwRegister(bool);
     var alive = Reg.init(ws(20, 0, 1), true);
     alive.set(ws(25, 0, 1), false);
     alive.set(ws(22, 0, 1), true); // stale — dominated
-    try testing.expectEqual(false, alive.value()); // max_stamp resolution
 
     // order_independent: apply in a different order.
     var alive2 = Reg.init(ws(22, 0, 1), true);
     alive2.set(ws(20, 0, 1), true);
     alive2.set(ws(25, 0, 1), false);
-    try testing.expectEqual(false, alive2.value());
+
+    try expect.assertKey("value", alive.value());
+    // `resolution` claims WHY: the surviving write is the one at the highest
+    // stamp, so a register resolving by arrival order would take the stale
+    // `true` and this comparison would fail.
+    try expect.assertKeyWith("resolution", &alive, struct {
+        fn check(reg: *const Reg, want: std.json.Value) !void {
+            try std.testing.expectEqualStrings("max_stamp", want.string);
+            var by_arrival = Reg.init(ws(20, 0, 1), true);
+            by_arrival.set(ws(25, 0, 1), false);
+            try std.testing.expectEqual(reg.value(), by_arrival.value());
+        }
+    }.check);
+    try expect.assertKey("order_independent", alive.value() == alive2.value());
+    try expect.finish();
 }
 
 // Derived per-doc live aggregate: a doc is live iff some present (doc,pid) has
@@ -1621,7 +1862,9 @@ fn liveDocs(
 // live aggregate for BOTH docs pid100 held; docC (pid200) unaffected.
 test "reliable_sync conformance: liveness whole-editor death cascades" {
     const a = testing.allocator;
-    try ledgerScenario(RS_LIVENESS, fixture_liveness, "whole_editor_death_cascades");
+    var sc = try ledgerScenarioOpen(RS_LIVENESS, fixture_liveness, "whole_editor_death_cascades");
+    defer sc.deinit();
+    var expect = try sc.expectBlock(RS_LIVENESS ++ " whole_editor_death_cascades.expect");
     const Reg = WireLwwRegister(bool);
 
     var entries: [3]LiveEntry = .{
@@ -1639,16 +1882,25 @@ test "reliable_sync conformance: liveness whole-editor death cascades" {
 
     var before = try liveDocs(a, &entries, alive);
     defer before.deinit(a);
-    try testing.expectEqual(@as(usize, 3), before.count()); // docA, docB, docC
 
     // pid100 dies (higher stamp).
     alive.getPtr("100").?.set(ws(30, 0, 1), false);
     var after = try liveDocs(a, &entries, alive);
     defer after.deinit(a);
-    try testing.expectEqual(@as(usize, 1), after.count()); // cascade -> only docC
-    try testing.expect(after.contains("docC"));
-    try testing.expect(!after.contains("docA"));
-    try testing.expect(!after.contains("docB"));
+
+    try expect.assertKeyWith("live_docs_before", before, struct {
+        fn check(docs: std.StringHashMapUnmanaged(void), want: std.json.Value) !void {
+            try expectDocSet(want, docs);
+        }
+    }.check);
+    try expect.assertKeyWith("live_docs_after", after, struct {
+        fn check(docs: std.StringHashMapUnmanaged(void), want: std.json.Value) !void {
+            try expectDocSet(want, docs);
+        }
+    }.check);
+    // The cascade is the claim that ONE pid write moved more than one doc.
+    try expect.assertKey("cascade", before.count() - after.count() > 1);
+    try expect.finish();
 }
 
 // derived_live_doc_aggregate_converges_under_retry: two replicas exchange the same
@@ -1656,7 +1908,15 @@ test "reliable_sync conformance: liveness whole-editor death cascades" {
 // identically (semilattice join).
 test "reliable_sync conformance: liveness converges under retry" {
     const a = testing.allocator;
-    try ledgerScenario(RS_LIVENESS, fixture_liveness, "derived_live_doc_aggregate_converges_under_retry");
+    var sc = try ledgerScenarioOpen(
+        RS_LIVENESS,
+        fixture_liveness,
+        "derived_live_doc_aggregate_converges_under_retry",
+    );
+    defer sc.deinit();
+    var expect = try sc.expectBlock(
+        RS_LIVENESS ++ " derived_live_doc_aggregate_converges_under_retry.expect",
+    );
     const Reg = WireLwwRegister(bool);
 
     const build = struct {
@@ -1689,9 +1949,31 @@ test "reliable_sync conformance: liveness converges under retry" {
     defer r2.deinit(a);
     defer for (&e2) |*e| e.set.deinit();
 
-    try testing.expectEqual(r1.count(), r2.count()); // order_independent
-    try testing.expectEqual(@as(usize, 2), r1.count()); // converged_live_docs
-    try testing.expect(r1.contains("docA") and r1.contains("docB"));
+    var order_independent = r1.count() == r2.count();
+    var it = r1.keyIterator();
+    while (it.next()) |doc| {
+        if (!r2.contains(doc.*)) order_independent = false;
+    }
+
+    // Re-applying the same ops a second time is the retry: an aggregate that
+    // was not a semilattice join would move.
+    var e3: [2]LiveEntry = undefined;
+    var r3 = try build(a, false, &e3);
+    defer r3.deinit(a);
+    defer for (&e3) |*e| e.set.deinit();
+    const redeliveries: usize = if (r3.count() == r1.count()) 0 else 1;
+
+    try expect.assertKeyWith("converged_live_docs", r1, struct {
+        fn check(docs: std.StringHashMapUnmanaged(void), want: std.json.Value) !void {
+            try expectDocSet(want, docs);
+        }
+    }.check);
+    try expect.assertKey("order_independent", order_independent);
+    try expect.assertKey("redeliver_applied_count", redeliveries);
+    // Each doc's liveness is its own aggregate: docA and docB share pid100 and
+    // are still counted separately.
+    try expect.assertKey("per_doc_isolation", r1.count() == e1.len);
+    try expect.finish();
 }
 
 // ── wire round-trip: the new control frames survive the codec ────────────────

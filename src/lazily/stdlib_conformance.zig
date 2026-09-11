@@ -14,37 +14,57 @@ const Actual = struct {
     generation: ?u64 = null,
 };
 
-fn assertExpected(expected: corpus.Value, actual: Actual) !void {
+/// Compare a step's `expect` block against what the run produced, THROUGH an
+/// `AssertionKeys` tracker (`#lzzigblockwalk`).
+///
+/// The loop this replaces read each key straight off the object and compared it
+/// with `std.testing`, which is a real comparison but binds nothing: rung 0 is
+/// two-directional against the blocks `specReadFile` inventoried at read time,
+/// so all 54 `expect` blocks of the three stdlib fixtures were invisible to
+/// every rung above it — their keys were not unread, nothing read them, and a
+/// runner that stopped evaluating them would have reported exactly nothing.
+///
+/// Every arm now goes through `assertKey`, which reads the key, books it
+/// asserted and compares the fixture's own value against `actual` by its Zig
+/// type — the same comparison, with the bookkeeping the ledger needs.
+fn assertExpected(where: []const u8, expected: corpus.Value, actual: Actual) !void {
     const object = switch (expected) {
         .object => |object| object,
         else => return error.ExpectedObject,
     };
+    var block = corpus.AssertionKeys.init(where, expected);
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         const key = entry.key_ptr.*;
-        const value = entry.value_ptr.*;
         if (std.mem.eql(u8, key, "outcome")) {
-            try std.testing.expectEqualStrings(try corpus.asStr(value), actual.outcome);
+            try block.assertKey("outcome", actual.outcome);
         } else if (std.mem.eql(u8, key, "deadline")) {
-            try std.testing.expectEqual(try corpus.asU64(value), actual.deadline.?);
+            try block.assertKey("deadline", actual.deadline.?);
         } else if (std.mem.eql(u8, key, "fired_at")) {
-            try std.testing.expectEqual(try corpus.asU64(value), actual.fired_at.?);
+            try block.assertKey("fired_at", actual.fired_at.?);
         } else if (std.mem.eql(u8, key, "reason")) {
-            try std.testing.expectEqualStrings(try corpus.asStr(value), actual.reason.?);
+            try block.assertKey("reason", actual.reason.?);
         } else if (std.mem.eql(u8, key, "value")) {
-            try std.testing.expectEqualStrings(try corpus.asStr(value), actual.value.?);
+            try block.assertKey("value", actual.value.?);
         } else if (std.mem.eql(u8, key, "operation_calls")) {
-            try std.testing.expectEqual(try corpus.asU64(value), actual.operation_calls.?);
+            try block.assertKey("operation_calls", actual.operation_calls.?);
         } else if (std.mem.eql(u8, key, "cancellation_calls")) {
-            try std.testing.expectEqual(try corpus.asU64(value), actual.cancellation_calls.?);
+            try block.assertKey("cancellation_calls", actual.cancellation_calls.?);
         } else if (std.mem.eql(u8, key, "revision")) {
-            try std.testing.expectEqual(try corpus.asU64(value), actual.revision.?);
+            try block.assertKey("revision", actual.revision.?);
         } else if (std.mem.eql(u8, key, "generation")) {
-            try std.testing.expectEqual(try corpus.asU64(value), actual.generation.?);
+            try block.assertKey("generation", actual.generation.?);
         } else {
             return error.UnknownExpectation;
         }
     }
+    try block.finish();
+}
+
+/// `<fixture> #<step> expect`, for the tracker's diagnostics. The buffer is the
+/// caller's frame and outlives the tracker built from it.
+fn stepWhere(buf: []u8, label: []const u8, index: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "{s} #{d}.expect", .{ label, index }) catch label;
 }
 
 fn stringField(value: corpus.Value, name: []const u8) ![]const u8 {
@@ -66,9 +86,11 @@ fn timerError(err: portable.TimerError) []const u8 {
     };
 }
 
-fn replayTimer(scenario: corpus.Value) !void {
+fn replayTimer(label: []const u8, scenario: corpus.Value) !void {
     var timer: ?portable.Timer = null;
-    for (try corpus.asArray(try corpus.required(scenario, "steps"))) |step| {
+    for (try corpus.asArray(try corpus.required(scenario, "steps")), 0..) |step, index| {
+        var where_buf: [192]u8 = undefined;
+        const where = stepWhere(&where_buf, label, index);
         const op = try stringField(step, "op");
         var actual: Actual = undefined;
         if (std.mem.eql(u8, op, "start")) {
@@ -77,7 +99,7 @@ fn replayTimer(scenario: corpus.Value) !void {
                 try u64Field(step, "duration"),
             ) catch |err| {
                 actual = .{ .outcome = "unavailable", .reason = timerError(err) };
-                try assertExpected(try corpus.required(step, "expect"), actual);
+                try assertExpected(where, try corpus.required(step, "expect"), actual);
                 continue;
             };
             actual = .{ .outcome = "pending", .deadline = timer.?.deadline };
@@ -88,7 +110,7 @@ fn replayTimer(scenario: corpus.Value) !void {
                     .deadline = timer.?.deadline,
                     .reason = timerError(err),
                 };
-                try assertExpected(try corpus.required(step, "expect"), actual);
+                try assertExpected(where, try corpus.required(step, "expect"), actual);
                 continue;
             };
             actual = switch (observation.outcome) {
@@ -105,7 +127,7 @@ fn replayTimer(scenario: corpus.Value) !void {
             std.debug.print("stdlib timer: unknown op `{s}`\n", .{op});
             return error.UnsupportedTimerStep;
         }
-        try assertExpected(try corpus.required(step, "expect"), actual);
+        try assertExpected(where, try corpus.required(step, "expect"), actual);
     }
 }
 
@@ -168,9 +190,11 @@ fn timeoutOutcome(outcome: portable.TimeoutOutcome) []const u8 {
     };
 }
 
-fn replayTimeout(scenario: corpus.Value) !void {
+fn replayTimeout(label: []const u8, scenario: corpus.Value) !void {
     var timeout: ?portable.Timeout = null;
-    for (try corpus.asArray(try corpus.required(scenario, "steps"))) |step| {
+    for (try corpus.asArray(try corpus.required(scenario, "steps")), 0..) |step, index| {
+        var where_buf: [192]u8 = undefined;
+        const where = stepWhere(&where_buf, label, index);
         const op = try stringField(step, "op");
         var actual: Actual = undefined;
         if (std.mem.eql(u8, op, "start")) {
@@ -207,7 +231,7 @@ fn replayTimeout(scenario: corpus.Value) !void {
             std.debug.print("stdlib timeout: unknown op `{s}`\n", .{op});
             return error.UnsupportedTimeoutStep;
         }
-        try assertExpected(try corpus.required(step, "expect"), actual);
+        try assertExpected(where, try corpus.required(step, "expect"), actual);
     }
 }
 
@@ -231,9 +255,11 @@ fn barrierActual(observation: portable.BarrierObservation) Actual {
     };
 }
 
-fn replayBarrier(scenario: corpus.Value) !void {
+fn replayBarrier(label: []const u8, scenario: corpus.Value) !void {
     var barrier: ?portable.RevisionBarrier = null;
-    for (try corpus.asArray(try corpus.required(scenario, "steps"))) |step| {
+    for (try corpus.asArray(try corpus.required(scenario, "steps")), 0..) |step, index| {
+        var where_buf: [192]u8 = undefined;
+        const where = stepWhere(&where_buf, label, index);
         const op = try stringField(step, "op");
         var observation: portable.BarrierObservation = undefined;
         var cancellation = CancellationContext{ .state = "pending" };
@@ -274,7 +300,7 @@ fn replayBarrier(scenario: corpus.Value) !void {
         } else return error.UnsupportedBarrierStep;
         var actual = barrierActual(observation);
         if (std.mem.eql(u8, op, "observe")) actual.cancellation_calls = cancellation.calls;
-        try assertExpected(try corpus.required(step, "expect"), actual);
+        try assertExpected(where, try corpus.required(step, "expect"), actual);
     }
 }
 
@@ -291,11 +317,11 @@ fn replayFixture(name: []const u8) !void {
         // body that stops short of replaying stops being booked.
         const scenario = try sc.replay();
         if (std.mem.eql(u8, feature, "stdlib_timer_v1")) {
-            try replayTimer(scenario);
+            try replayTimer(name, scenario);
         } else if (std.mem.eql(u8, feature, "stdlib_timeout_v1")) {
-            try replayTimeout(scenario);
+            try replayTimeout(name, scenario);
         } else if (std.mem.eql(u8, feature, "stdlib_revision_barrier_v1")) {
-            try replayBarrier(scenario);
+            try replayBarrier(name, scenario);
         } else return error.UnsupportedFeature;
     }
     for (try corpus.asArray(try corpus.required(fixture.value, "mutations"))) |mutation| {
