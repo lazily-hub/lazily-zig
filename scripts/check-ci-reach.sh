@@ -311,6 +311,155 @@ EXPECTED_MAKE_INVOKED_TARGETS=(
 	fmt
 )
 
+# ------------------------------------------------------------- activation pin
+#
+# 5. ACTIVATION. Everything above pins what a gate's CI step RUNS. Nothing above
+#    pins whether that step runs AT ALL. A pinned step can be unique, uniquely
+#    named, unconditional, spell its gate exactly — and sit in a job or a
+#    workflow that never executes (#verifyworkflowactually). `ci-reach.conf`
+#    says listing a workflow "is a claim that it runs on every push/PR"; until
+#    now that claim was a COMMENT, and it is the premise the other four pins
+#    rest on.
+#
+# MEASURED on this tree, pre-pin, each mutation on its own, restored between
+# runs, exit status read from the process and never through a pipe:
+#
+#   mutation                                                      verdict
+#   job-level `if: false` on ci-reach                             OK, byte-identical, exit 0
+#   job-level `if: false` on test                                 OK, byte-identical, exit 0
+#   job-level `if: false` on fmt                                  OK, byte-identical, exit 0
+#   `if: ${{ github.event_name == 'schedule' }}` on lean-formal   OK, byte-identical, exit 0
+#   job-level `continue-on-error: true` on ci-reach               OK, byte-identical, exit 0
+#   test's `continue-on-error` widened to plain `true`            OK, byte-identical, exit 0
+#   test's `continue-on-error` retargeted at `'0.15.2'`           OK, byte-identical, exit 0
+#   `on:` reduced to `workflow_dispatch`                          OK, byte-identical, exit 0
+#   `branches: [main]` narrowed to `[release]`                    OK, byte-identical, exit 0
+#   `paths: ['src/**']` introduced on push                        OK, byte-identical, exit 0
+#   test's matrix reduced to `zig: ['master']`                    OK, byte-identical, exit 0
+#   test's `master` leg renamed to `nightly`                      OK, byte-identical, exit 0
+#
+# Twelve states, twelve byte-identical OKs. The one activation mutation this
+# file ALREADY caught is a gate step moved from `test` to `lean-formal`: the step
+# pin's first field is the job, so the pin stops resolving and reports the step
+# gone. That is #reversereachdirection's, not this commit's, and it is the reason
+# the job field was there.
+#
+# EXACT VALUES, NOT ABSENCES, and this repo is the reason the whole family pins
+# it that way. `test`'s job-level `continue-on-error: ${{ matrix.zig ==
+# 'master' }}` is CORRECT here: 0.17.0-dev's internal test-runner protocol
+# deadlocks, the advisory master leg is documented at the top of this workflow,
+# and both pinned releases gate. A rule reading "no job-level
+# continue-on-error" would red a healthy config, and a guard that reds on a
+# correct tree gets its rule deleted rather than its mutation. So the value is
+# pinned as a LITERAL in both directions: absent -> present, present -> absent,
+# and present -> a different expression are each named.
+
+# The exact top-level `on:` keys of every workflow `ci-reach.conf` counts,
+# comma-joined and sorted. Only the counted workflows: a workflow nothing here
+# claims reach for has nothing to pin.
+EXPECTED_TRIGGERS=(
+	".github/workflows/ci.yml|pull_request,push,workflow_dispatch"
+)
+
+# The exact filters under each trigger: every sub-key of that trigger as
+# `key=v1,v2`, sorted by key and joined with `;`. An empty field means the
+# trigger carries no filters at all.
+#
+# THE COMPARISON IS AGAINST THE WHOLE STRING, so a sub-key this file never
+# anticipated — `paths-ignore:`, `branches-ignore:`, `tags:`, `types:` — is
+# named the same way instead of falling outside the pin. That matters more than
+# the keys it does anticipate: an absence rule has to enumerate what may not
+# appear, and the next filter invented is the one it does not list.
+#
+# NO BINDING IN THIS FAMILY HAS A `paths:` FILTER TODAY, so this half is
+# fails-when-INTRODUCED rather than fails-when-stale, and it is not
+# hypothetical. A `paths:` filter that does not list `Makefile` means the very
+# edit that retires a gate — deleting it from `check:` — does not trigger the
+# workflow that would have caught it. The guard would be green because it never
+# ran.
+EXPECTED_TRIGGER_FILTERS=(
+	".github/workflows/ci.yml|pull_request|"
+	".github/workflows/ci.yml|push|branches=main"
+	".github/workflows/ci.yml|workflow_dispatch|"
+)
+
+# The jobs that carry reach for a gate, by SET EQUALITY against the jobs the
+# pins above actually resolved to: the job field of every EXPECTED_STEP_FOR_TARGET
+# entry that resolved to exactly one step, plus the job of every step CI invokes
+# an EXPECTED_MAKE_INVOKED_TARGETS gate from.
+#
+# `fmt` is in this list for the second reason, and it is why the list is not
+# redundant with the step pins' job fields. A make-invoked gate deliberately
+# gets no step pin, so before this NOTHING in this file named the job its
+# `make fmt` step lives in: `if: false` on the `fmt` job removed the formatting
+# gate for all three pinned toolchains without changing one character of any pin
+# above. The step pin's job field covers the other three jobs for free; this
+# list is what covers the one it cannot.
+EXPECTED_GATE_JOBS=(
+	ci-reach
+	fmt
+	lean-formal
+	test
+)
+
+# Per gate job, the EXACT job-level activation keys, as
+# `continue-on-error=<v>;if=<v>;needs=<v>`. Empty means the key is ABSENT, which
+# is the normal case here and is asserted rather than assumed — the whole point
+# of pinning values instead of forbidding them.
+#
+# `needs:` is in the serialization for the same reason `paths:` is in the
+# trigger filters: no gate job here has one, and a gate job made to depend on a
+# job that can be skipped never runs, with `if:` and `continue-on-error:` both
+# still absent. Fails-when-introduced.
+EXPECTED_JOB_ACTIVATION=(
+	"ci-reach|continue-on-error=;if=;needs="
+	"fmt|continue-on-error=;if=;needs="
+	"lean-formal|continue-on-error=;if=;needs="
+	"test|continue-on-error=\${{ matrix.zig == 'master' }};if=;needs="
+)
+
+# Per gate job, the exact matrix axes and legs, as `axis=leg,leg` sorted by axis
+# and joined with `;`. Empty means the job has no matrix, which the three
+# single-run jobs assert rather than merely happen to have.
+#
+# THIS IS THE OTHER HALF OF `test`'s ACTIVATION PIN, not decoration, and the
+# question it answers is which legs are BLOCKING.
+# `continue-on-error: ${{ matrix.zig == 'master' }}` is keyed on a matrix VALUE,
+# so the expression is meaningless without the set of values it is evaluated
+# over:
+#
+#   - Reduce the matrix to `zig: ['master']`. The continue-on-error expression
+#     is UNCHANGED, so EXPECTED_JOB_ACTIVATION is satisfied, and every leg of
+#     the job is now advisory. That is this commit's own defect one level down —
+#     the job still runs, still reports, and enforces nothing. MEASURED
+#     byte-identical pre-pin. The leg set is the only thing here that catches
+#     it; the activation pin cannot, and does not claim to.
+#   - Rename the `master` leg to `nightly`, or retarget the expression at
+#     `'0.15.2'`, and a BLOCKING toolchain becomes advisory with no other trace.
+#     The retarget is caught by EXPECTED_JOB_ACTIVATION (the expression
+#     changed); the rename by this pin (the leg set changed). Each is invisible
+#     to the other pin.
+#
+# So neither subsumes the other and both are required: an advisory predicate is
+# only meaningful against a known leg set, and a leg set only meaningful against
+# a known predicate. "Which legs gate" is a fact about the PAIR, and pinning one
+# half of a pair is the passes-when-stale shape this family has already removed
+# twice.
+#
+# STILL OPEN, said plainly rather than implied: this pin does not read
+# GitHub's branch protection, so it cannot see a required-checks list that never
+# named `Zig 0.15.2` in the first place. A blocking leg here is blocking for the
+# workflow's own conclusion; whether a red workflow blocks a MERGE is a
+# repository setting no file in this tree can observe. The same limit applies to
+# EXPECTED_TRIGGERS: it proves the workflow is triggered, not that anything
+# refuses a merge when it fails.
+EXPECTED_JOB_MATRIX=(
+	"ci-reach|"
+	"fmt|"
+	"lean-formal|"
+	"test|zig=0.15.2,0.16.0,master"
+)
+
 # Pin lookups. `|` is the field separator, so a step name containing one is
 # refused further down rather than silently splitting.
 pinned_step_for() {
@@ -730,6 +879,203 @@ ci_step_commands() {
 # the attribution dropped.
 ci_commands() { ci_step_commands "$@" | cut -f5-; }
 
+# --------------------------------------------------------- activation scraping
+#
+# The workflow's `on:` block and each job's activation keys
+# (#verifyworkflowactually). Separate readers from ci_step_commands, on purpose:
+# that parser deliberately only looks inside `run:` bodies, and these are the
+# keys that decide whether a `run:` body runs at all. Folding them in would mean
+# one parser with two incompatible notions of what a line is.
+#
+# Both emit raw TAB rows and are assembled into one canonical string per subject
+# in the shell, so each comparison site does string equality against a pin
+# rather than re-implementing the shape rules.
+#
+# ANYTHING THE SHAPE RULES DO NOT COVER IS REFUSED, never skipped. A parser that
+# reads nothing out of a shape it did not expect hands its pin an empty value,
+# and an empty value compared against an "absent" pin PASSES — the vacuity every
+# other refusal in this file exists to stop, with the added insult that the
+# vacuous pass looks like a healthy one. So flow-style `on: [push]`, a nested map
+# where a filter list belongs, a matrix `include:`/`exclude:` entry, and an
+# `if:`/`needs:`/`continue-on-error:` whose value is not a scalar or a flow list
+# each emit a sentinel row the shell turns into a hard failure naming the line.
+#
+# THE INDENTATION CONTRACT IS TWO SPACES PER LEVEL, which is what this workflow
+# uses and what the sentinel rows enforce for the lines they cover. It is NOT
+# enforced for a line inside a `run:` body, which can be indented any way at
+# all — a body line at column 0 would end the `jobs:` block for the reader below
+# and silently hide every job after it. That is why the job set this reader
+# discovers is cross-checked against the job set ci_step_commands discovers,
+# further down: a job with `run:` steps and no activation row is a hard failure,
+# not a job with no activation.
+wf_triggers() {
+	awk '
+		function flushsub() {
+			if (sk != "") { printf "%s\t%s\t%s=%s\n", curfile, trig, sk, vals; sk = ""; vals = "" }
+		}
+		function flowlist(v,   n, a, i, out) {
+			gsub(/^\[[[:space:]]*|[[:space:]]*\]$/, "", v)
+			if (v == "") return ""
+			n = split(v, a, /[[:space:]]*,[[:space:]]*/)
+			out = ""
+			for (i = 1; i <= n; i++) {
+				gsub(/^['\''"]|['\''"]$/, "", a[i])
+				out = out (out == "" ? "" : ",") a[i]
+			}
+			return out
+		}
+		FNR == 1 { flushsub(); curfile = FILENAME; inon = 0; trig = "" }
+		{
+			line = $0
+			sub(/[[:space:]]+$/, "", line)
+			if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+			indent = match(line, /[^ ]/) - 1
+
+			if (line ~ /^on:[[:space:]]*$/) { flushsub(); inon = 1; trig = ""; next }
+			# Flow-style or inline `on:` is refused rather than parsed: the pin
+			# would otherwise compare against whatever this reader failed to read.
+			if (line ~ /^on:/) { printf "%s\t!SHAPE\t%s\n", curfile, line; inon = 0; next }
+			if (indent == 0) { flushsub(); inon = 0; trig = ""; next }
+			if (!inon) next
+
+			if (indent == 2) {
+				flushsub()
+				if (line !~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/) { printf "%s\t!SHAPE\t%s\n", curfile, line; next }
+				trig = line; sub(/^  /, "", trig); sub(/:[[:space:]]*$/, "", trig)
+				# Presence row: a trigger with no filters at all still has to
+				# appear in EXPECTED_TRIGGERS.
+				printf "%s\t%s\t\n", curfile, trig
+				next
+			}
+			if (trig == "") { printf "%s\t!SHAPE\t%s\n", curfile, line; next }
+
+			if (indent == 4) {
+				flushsub()
+				if (line !~ /^    [A-Za-z0-9_.-]+:/) { printf "%s\t!SHAPE\t%s\n", curfile, line; next }
+				k = line; sub(/^    /, "", k); sub(/:.*$/, "", k)
+				v = line; sub(/^    [A-Za-z0-9_.-]+:[[:space:]]*/, "", v)
+				if (v == "") { sk = k; vals = ""; next }
+				if (v ~ /^\[.*\]$/) { printf "%s\t%s\t%s=%s\n", curfile, trig, k, flowlist(v); next }
+				gsub(/^['\''"]|['\''"]$/, "", v)
+				printf "%s\t%s\t%s=%s\n", curfile, trig, k, v
+				next
+			}
+
+			if (indent == 6 && line ~ /^      -[[:space:]]/) {
+				if (sk == "") { printf "%s\t!SHAPE\t%s\n", curfile, line; next }
+				v = line; sub(/^      -[[:space:]]*/, "", v)
+				# A `- key: value` item here is a map, not a filter string.
+				if (v ~ /:[[:space:]]/) { printf "%s\t!SHAPE\t%s\n", curfile, line; next }
+				gsub(/^['\''"]|['\''"]$/, "", v)
+				vals = vals (vals == "" ? "" : ",") v
+				next
+			}
+
+			printf "%s\t!SHAPE\t%s\n", curfile, line
+		}
+		END { flushsub() }
+	' "$@"
+}
+
+# Rows are `workflow<TAB>job<TAB>key<TAB>value`, where key is `PRESENT` for the
+# job itself, one of the three activation keys, or `matrix`.
+wf_job_activation() {
+	awk '
+		function flushaxis() {
+			if (axis != "") { printf "%s\t%s\tmatrix\t%s=%s\n", curfile, job, axis, vals; axis = ""; vals = "" }
+		}
+		function bad(l) { printf "%s\t!SHAPE\t\t%s\n", curfile, l }
+		function flowlist(v,   n, a, i, out) {
+			gsub(/^\[[[:space:]]*|[[:space:]]*\]$/, "", v)
+			if (v == "") return ""
+			n = split(v, a, /[[:space:]]*,[[:space:]]*/)
+			out = ""
+			for (i = 1; i <= n; i++) {
+				gsub(/^['\''"]|['\''"]$/, "", a[i])
+				out = out (out == "" ? "" : ",") a[i]
+			}
+			return out
+		}
+		FNR == 1 { flushaxis(); curfile = FILENAME; injobs = 0; job = ""; mode = ""; sub2 = "" }
+		{
+			line = $0
+			sub(/[[:space:]]+$/, "", line)
+			if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+			indent = match(line, /[^ ]/) - 1
+
+			if (line ~ /^jobs:[[:space:]]*$/) { flushaxis(); injobs = 1; job = ""; mode = ""; sub2 = ""; next }
+			if (indent == 0) { flushaxis(); injobs = 0; job = ""; mode = ""; sub2 = ""; next }
+			if (!injobs) next
+
+			if (indent == 2) {
+				flushaxis()
+				if (line !~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/) { bad(line); next }
+				job = line; sub(/^  /, "", job); sub(/:[[:space:]]*$/, "", job)
+				mode = ""; sub2 = ""
+				printf "%s\t%s\tPRESENT\t\n", curfile, job
+				next
+			}
+			if (job == "") { bad(line); next }
+
+			if (indent == 4) {
+				flushaxis()
+				sub2 = ""
+				if (line !~ /^    [A-Za-z0-9_.-]+:/) { bad(line); next }
+				k = line; sub(/^    /, "", k); sub(/:.*$/, "", k)
+				mode = (k == "strategy") ? "strategy" : "other"
+				if (k == "if" || k == "continue-on-error" || k == "needs") {
+					v = line; sub(/^    [A-Za-z0-9_.-]+:[[:space:]]*/, "", v)
+					# An empty value means a block list or map follows, and this
+					# reader would report the key ABSENT — which is exactly the
+					# pinned value for all three keys here, so it would pass.
+					if (v == "") { bad(line); next }
+					if (v ~ /^\[.*\]$/) { printf "%s\t%s\t%s\t%s\n", curfile, job, k, flowlist(v); next }
+					printf "%s\t%s\t%s\t%s\n", curfile, job, k, v
+				}
+				next
+			}
+
+			# Only `strategy:` has a sub-tree this reader looks into. Everything
+			# under `steps:` and under any other job key is skipped here and read
+			# by ci_step_commands instead.
+			if (mode != "strategy") next
+
+			if (indent == 6) {
+				flushaxis()
+				if (line !~ /^      [A-Za-z0-9_.-]+:/) { bad(line); next }
+				k = line; sub(/^      /, "", k); sub(/:.*$/, "", k)
+				sub2 = (k == "matrix") ? "matrix" : ""
+				next
+			}
+			if (sub2 != "matrix") next
+
+			if (indent == 8) {
+				flushaxis()
+				if (line !~ /^        [A-Za-z0-9_.-]+:/) { bad(line); next }
+				k = line; sub(/^        /, "", k); sub(/:.*$/, "", k)
+				# `include:`/`exclude:` add and remove whole legs, so a matrix
+				# carrying one is not described by its axes alone.
+				if (k == "include" || k == "exclude") { bad(line); next }
+				v = line; sub(/^        [A-Za-z0-9_.-]+:[[:space:]]*/, "", v)
+				if (v == "") { axis = k; vals = ""; next }
+				if (v ~ /^\[.*\]$/) { printf "%s\t%s\tmatrix\t%s=%s\n", curfile, job, k, flowlist(v); next }
+				bad(line); next
+			}
+			if (indent == 10 && line ~ /^          -[[:space:]]/) {
+				if (axis == "") { bad(line); next }
+				v = line; sub(/^          -[[:space:]]*/, "", v)
+				if (v ~ /:[[:space:]]/) { bad(line); next }
+				gsub(/^['\''"]|['\''"]$/, "", v)
+				vals = vals (vals == "" ? "" : ",") v
+				next
+			}
+
+			bad(line)
+		}
+		END { flushaxis() }
+	' "$@"
+}
+
 # ------------------------------------------------------------------- normalizing
 
 # Reduce command text to anchors, one per line, each a space-separated token list.
@@ -839,7 +1185,9 @@ root_anchor="$(mktemp)"
 ci_steps="$(mktemp)"
 step_index="$(mktemp)"
 step_dir="$(mktemp -d)"
-trap 'rm -rf "$ci_raw" "$ci_anchor" "$root_anchor" "$ci_steps" "$step_index" "$step_dir"' EXIT
+wf_trig="$(mktemp)"
+wf_act="$(mktemp)"
+trap 'rm -rf "$ci_raw" "$ci_anchor" "$root_anchor" "$ci_steps" "$step_index" "$step_dir" "$wf_trig" "$wf_act"' EXIT
 ci_commands "${workflows[@]}" >"$ci_raw"
 anchors <"$ci_raw" | sort -u >"$ci_anchor"
 
@@ -913,6 +1261,31 @@ if [ "$step_count" -eq 0 ]; then
 	exit 1
 fi
 
+# ---------------------------------------------------- activation scrape
+#
+# The `on:` block and every job's activation keys (#verifyworkflowactually),
+# read once here so every comparison below is equality against a pin.
+wf_triggers "${workflows[@]}" >"$wf_trig"
+wf_job_activation "${workflows[@]}" >"$wf_act"
+
+# A shape neither reader parses is refused BEFORE any pin is compared. An
+# unparsed `if:` reads as absent, absent is the pinned value for three of the
+# four gate jobs here, and the comparison would then pass on a value nothing
+# read.
+bad_shape="$(awk -F'\t' '$2 == "!SHAPE" { print "  - " $1 ": " $NF }' "$wf_trig" "$wf_act" | sort -u)"
+if [ -n "$bad_shape" ]; then
+	echo "check-ci-reach: a line in an \`on:\` or job-activation position has a shape the activation" >&2
+	echo "                readers do not parse, so the pins below would compare against a value" >&2
+	echo "                nothing read:" >&2
+	printf '%s\n' "$bad_shape" >&2
+	echo "                Spell it in the two-space block style the rest of the workflow uses, or" >&2
+	echo "                teach wf_triggers/wf_job_activation the shape. Flow-style \`on: [push]\`, a" >&2
+	echo "                block list where a scalar is expected, and a matrix \`include:\`/\`exclude:\`" >&2
+	echo "                are the three that land here most often." >&2
+	exit 1
+fi
+
+
 
 # Does CI contain a command whose tokens contain this anchor as an in-order
 # subsequence? Extra flags and arguments on the CI side are fine; missing ones are
@@ -945,6 +1318,22 @@ make_invokes() {
 		}
 		END { exit found ? 0 : 1 }
 	' "$ci_anchor"
+}
+
+# The same question asked of ONE step's anchors instead of the flat union, so a
+# make-invoked gate's JOB can be pinned even though its step deliberately is not
+# (#verifyworkflowactually). Which job runs `make <target>` is a fact about CI's
+# structure, not about what the recipe became, so pinning it asserts nothing
+# about the recipe — which is the reason the step itself gets no pin.
+step_invokes_make() {
+	awk -v target="$2" '
+		{
+			n = split($0, t, / /)
+			if (t[1] != "make") next
+			for (i = 2; i <= n; i++) if (t[i] == target) { found = 1; exit }
+		}
+		END { exit found ? 0 : 1 }
+	' "$step_dir/$1"
 }
 
 is_excused() {
@@ -989,6 +1378,7 @@ stepmap_off=""
 stepmap_off_count=0
 mi_found=""
 mi_found_set=" "
+gatejob_found_set=" "
 
 while IFS= read -r target; do
 	[ -n "$target" ] || continue
@@ -1091,7 +1481,20 @@ while IFS= read -r target; do
 	fi
 
 	if is_make_invoked_pinned "$target"; then
-		: # verdict for these is the make-invocation pin, checked after the loop
+		# Verdict for these is the make-invocation pin, checked after the loop.
+		# The JOB is recorded here all the same: EXPECTED_GATE_JOBS is what pins
+		# whether the step that runs `make <target>` runs at all.
+		_i=0
+		while [ "$_i" -lt "$step_count" ]; do
+			_i=$((_i + 1))
+			if step_invokes_make "$_i" "$target"; then
+				_j="$(awk -F'\t' -v i="$_i" '$1 == i { print $2; exit }' "$step_index")"
+				case "$gatejob_found_set" in
+				*" $_j "*) ;;
+				*) gatejob_found_set="$gatejob_found_set$_j " ;;
+				esac
+			fi
+		done
 	elif pinned_entry="$(pinned_step_for "$target")"; then
 		pin_job="${pinned_entry%%|*}"
 		pin_step="${pinned_entry#*|}"
@@ -1106,6 +1509,10 @@ while IFS= read -r target; do
 		else
 			pin_idx="$(awk -F'\t' -v j="$pin_job" -v s="$pin_step" \
 				'$2 == j && $3 == s { print $1; exit }' "$step_index")"
+			case "$gatejob_found_set" in
+			*" $pin_job "*) ;;
+			*) gatejob_found_set="$gatejob_found_set$pin_job " ;;
+			esac
 			step_hit=1
 			while IFS= read -r a; do
 				[ -n "$a" ] || continue
@@ -1378,6 +1785,402 @@ if [ "$mi_absent_count" -gt 0 ]; then
 	status=1
 fi
 
+# THE ACTIVATION PINS (#verifyworkflowactually), each by set equality or exact
+# string equality, each naming what changed and in which direction. These are
+# the only checks in this file that read something other than `run:` bodies and
+# Makefile recipes: everything above asks what a step runs, and these ask whether
+# it runs.
+trig_bad=""
+trig_bad_count=0
+for _wf in "${workflows[@]}"; do
+	_want="(no EXPECTED_TRIGGERS entry)"
+	for _e in ${EXPECTED_TRIGGERS[@]+"${EXPECTED_TRIGGERS[@]}"}; do
+		case "$_e" in
+		"$_wf|"*) _want="${_e#*|}" ;;
+		esac
+	done
+	_got="$(awk -F'\t' -v w="$_wf" '$1 == w && $2 != "" { print $2 }' "$wf_trig" | sort -u | paste -sd, -)"
+	# An empty trigger set is set-equal to an empty pin, so it is refused here
+	# rather than compared: a workflow with no `on:` at all runs on nothing, and
+	# a pin that approves it is the vacuity this whole section exists to remove.
+	if [ -z "$_got" ]; then
+		echo "check-ci-reach: no top-level \`on:\` trigger parsed out of '$_wf'. Every gate this guard" >&2
+		echo "                reports reached is reached by a workflow that then runs on nothing." >&2
+		exit 1
+	fi
+	if [ "$_got" != "$_want" ]; then
+		trig_bad="$trig_bad$_wf	$_want	$_got"$'\n'
+		trig_bad_count=$((trig_bad_count + 1))
+	fi
+done
+
+filt_bad=""
+filt_bad_count=0
+filt_stale=""
+filt_stale_count=0
+trig_pairs=" "
+trig_total=0
+while IFS="$(printf '\t')" read -r _wf _trig; do
+	[ -n "$_trig" ] || continue
+	trig_pairs="$trig_pairs$_wf|$_trig "
+	trig_total=$((trig_total + 1))
+	_got="$(awk -F'\t' -v w="$_wf" -v t="$_trig" \
+		'$1 == w && $2 == t && $3 != "" { print $3 }' "$wf_trig" | sort -u | paste -sd';' -)"
+	_want="(no EXPECTED_TRIGGER_FILTERS entry)"
+	for _e in ${EXPECTED_TRIGGER_FILTERS[@]+"${EXPECTED_TRIGGER_FILTERS[@]}"}; do
+		case "$_e" in
+		"$_wf|$_trig|"*) _want="${_e#*|*|}" ;;
+		esac
+	done
+	if [ "$_got" != "$_want" ]; then
+		filt_bad="$filt_bad$_wf	$_trig	$_want	$_got"$'\n'
+		filt_bad_count=$((filt_bad_count + 1))
+	fi
+done < <(awk -F'\t' '$2 != "" { print $1 "\t" $2 }' "$wf_trig" | sort -u)
+
+# The other direction: a pinned filter entry for a trigger that is gone. The
+# trigger-set pin above already reports the missing trigger, and this reports the
+# pin left behind, so neither a stale pin nor a stale workflow reads as healthy.
+for _e in ${EXPECTED_TRIGGER_FILTERS[@]+"${EXPECTED_TRIGGER_FILTERS[@]}"}; do
+	# The first TWO fields. `${_e%|*}` strips from the LAST `|`, so a filter value
+	# containing one — which the pin format allows on purpose — would shift the key.
+	_rest="${_e#*|}"
+	_p="${_e%%|*}|${_rest%%|*}"
+	case "$trig_pairs" in
+	*" $_p "*) continue ;;
+	esac
+	filt_stale="$filt_stale$_e"$'\n'
+	filt_stale_count=$((filt_stale_count + 1))
+done
+
+# The job reader is a different parser from ci_step_commands, so a job it fails
+# to see would silently have no activation to compare — and "no activation" is
+# the pinned value for three of the four gate jobs, so it would PASS. Cross-check
+# the two readers against each other before trusting either.
+act_job_set=" "
+while IFS= read -r _j; do
+	[ -n "$_j" ] || continue
+	act_job_set="$act_job_set$_j "
+done < <(awk -F'\t' '$3 == "PRESENT" { print $2 }' "$wf_act" | sort -u)
+
+reader_skew=""
+reader_skew_count=0
+while IFS= read -r _j; do
+	[ -n "$_j" ] || continue
+	case "$act_job_set" in
+	*" $_j "*) continue ;;
+	esac
+	reader_skew="$reader_skew$_j"$'\n'
+	reader_skew_count=$((reader_skew_count + 1))
+done < <(awk -F'\t' '{ print $2 }' "$ci_steps" | sort -u)
+
+# Two job-level `if:` lines in one job, or two `continue-on-error:` lines, make
+# the serialization below depend on which one this reader kept. Refuse instead.
+dup_act="$(awk -F'\t' '
+	$3 == "if" || $3 == "continue-on-error" || $3 == "needs" { n[$2 "\t" $3]++ }
+	END { for (k in n) if (n[k] > 1) print "  - " k " appears " n[k] " times" }
+' "$wf_act" | sort)"
+
+# `|` separates a pin's fields and `;` joins the values inside one, so either
+# character is refused where it would make a pin AMBIGUOUS — and only there.
+#
+# A `|` IS ALLOWED INSIDE AN ACTIVATION OR FILTER VALUE, deliberately. A GitHub
+# `if:` expression using `||` is ordinary, and every lookup that reads a value
+# strips a FIXED number of leading fields (`${_e#*|}` for a job, two steps for a
+# trigger) rather than splitting on every `|`, so a value containing one is read
+# correctly. Refusing it would red a legitimate config over a character the
+# guard does not need — the same mistake as forbidding job-level
+# continue-on-error outright, which is the mistake this whole section exists to
+# avoid.
+#
+# What IS refused is a separator in pin STRUCTURE — a job id, a trigger name, a
+# filter key, an activation key, a matrix axis or leg — and a `;` inside a
+# value, which is the serialization's own joiner and which no GitHub expression,
+# branch pattern or matrix leg here needs.
+sep_in_value="$(
+	awk -F'\t' '$2 != "!SHAPE" && ($2 ~ /[|;]/ || $3 ~ /[|;]/) { print "  - job id or key: " $0 }' "$wf_act"
+	awk -F'\t' '$2 != "!SHAPE" && ($2 ~ /[|;]/ || $3 ~ /^[^=]*[|;]/) { print "  - trigger name or filter key: " $0 }' "$wf_trig"
+	awk -F'\t' '$2 != "!SHAPE" && $3 == "matrix" && $4 ~ /[|;]/ { print "  - matrix axis or leg: " $0 }' "$wf_act"
+	awk -F'\t' '$2 != "!SHAPE" && ($3 == "if" || $3 == "continue-on-error" || $3 == "needs") && $4 ~ /;/ { print "  - activation value: " $0 }' "$wf_act"
+	awk -F'\t' '$2 != "!SHAPE" && $3 ~ /=.*;/ { print "  - filter value: " $0 }' "$wf_trig"
+)"
+
+# Serialized, one canonical string per job, so the comparison is equality
+# against a literal rather than a rule re-implemented per key.
+job_activation() {
+	awk -F'\t' -v j="$1" '
+		$2 == j && $3 == "continue-on-error" { c = $4 }
+		$2 == j && $3 == "if" { i = $4 }
+		$2 == j && $3 == "needs" { n = $4 }
+		END { printf "continue-on-error=%s;if=%s;needs=%s", c, i, n }
+	' "$wf_act"
+}
+
+job_matrix() {
+	awk -F'\t' -v j="$1" '$2 == j && $3 == "matrix" { print $4 }' "$wf_act" |
+		sort -u | paste -sd';' -
+}
+
+# EXPECTED_GATE_JOBS against the jobs the pins above RESOLVED to, both
+# directions. `gatejob_found_set` was filled in the loop: the job field of every
+# step pin that resolved to exactly one step, plus the job of every step CI
+# invokes a make-invoked gate from.
+gatejob_unpinned=""
+gatejob_unpinned_count=0
+gatejob_absent=""
+gatejob_absent_count=0
+pinned_gatejobs=" "
+for _t in ${EXPECTED_GATE_JOBS[@]+"${EXPECTED_GATE_JOBS[@]}"}; do
+	pinned_gatejobs="$pinned_gatejobs$_t "
+done
+for _j in $gatejob_found_set; do
+	case "$pinned_gatejobs" in
+	*" $_j "*) continue ;;
+	esac
+	gatejob_unpinned="$gatejob_unpinned$_j"$'\n'
+	gatejob_unpinned_count=$((gatejob_unpinned_count + 1))
+done
+for _j in ${EXPECTED_GATE_JOBS[@]+"${EXPECTED_GATE_JOBS[@]}"}; do
+	case "$gatejob_found_set" in
+	*" $_j "*) continue ;;
+	esac
+	gatejob_absent="$gatejob_absent$_j"$'\n'
+	gatejob_absent_count=$((gatejob_absent_count + 1))
+done
+
+# EVERY CELL TERMINATES IN A PIN. EXPECTED_JOB_ACTIVATION and
+# EXPECTED_JOB_MATRIX are keyed by job, so their key sets are asserted equal to
+# EXPECTED_GATE_JOBS rather than merely looked up: without this, adding a gate
+# job to EXPECTED_GATE_JOBS and forgetting its activation entry would leave that
+# job's `if:` compared against nothing.
+pinkey_bad=""
+pinkey_bad_count=0
+for _name in EXPECTED_JOB_ACTIVATION EXPECTED_JOB_MATRIX; do
+	eval '_entries=(${'"$_name"'[@]+"${'"$_name"'[@]}"})'
+	_seen=" "
+	for _e in ${_entries[@]+"${_entries[@]}"}; do
+		_j="${_e%%|*}"
+		_seen="$_seen$_j "
+		case "$pinned_gatejobs" in
+		*" $_j "*) continue ;;
+		esac
+		pinkey_bad="$pinkey_bad$_name	$_j	names a job that is not in EXPECTED_GATE_JOBS"$'\n'
+		pinkey_bad_count=$((pinkey_bad_count + 1))
+	done
+	for _j in ${EXPECTED_GATE_JOBS[@]+"${EXPECTED_GATE_JOBS[@]}"}; do
+		case "$_seen" in
+		*" $_j "*) continue ;;
+		esac
+		pinkey_bad="$pinkey_bad$_name	$_j	is a gate job with no entry, so its value is compared against nothing"$'\n'
+		pinkey_bad_count=$((pinkey_bad_count + 1))
+	done
+done
+
+act_bad=""
+act_bad_count=0
+mx_bad=""
+mx_bad_count=0
+for _j in ${EXPECTED_GATE_JOBS[@]+"${EXPECTED_GATE_JOBS[@]}"}; do
+	case "$act_job_set" in
+	*" $_j "*) ;;
+	*)
+		act_bad="$act_bad$_j	(job absent from the workflow)	-"$'\n'
+		act_bad_count=$((act_bad_count + 1))
+		continue
+		;;
+	esac
+	_want="(no EXPECTED_JOB_ACTIVATION entry)"
+	for _e in ${EXPECTED_JOB_ACTIVATION[@]+"${EXPECTED_JOB_ACTIVATION[@]}"}; do
+		case "$_e" in
+		"$_j|"*) _want="${_e#*|}" ;;
+		esac
+	done
+	_got="$(job_activation "$_j")"
+	if [ "$_got" != "$_want" ]; then
+		act_bad="$act_bad$_j	$_want	$_got"$'\n'
+		act_bad_count=$((act_bad_count + 1))
+	fi
+	_want="(no EXPECTED_JOB_MATRIX entry)"
+	for _e in ${EXPECTED_JOB_MATRIX[@]+"${EXPECTED_JOB_MATRIX[@]}"}; do
+		case "$_e" in
+		"$_j|"*) _want="${_e#*|}" ;;
+		esac
+	done
+	_got="$(job_matrix "$_j")"
+	if [ "$_got" != "$_want" ]; then
+		mx_bad="$mx_bad$_j	$_want	$_got"$'\n'
+		mx_bad_count=$((mx_bad_count + 1))
+	fi
+done
+
+if [ -n "$dup_act" ]; then
+	echo >&2
+	echo "check-ci-reach: a job declares the same activation key twice, so which value this guard" >&2
+	echo "                pins depends on which one it happened to keep:" >&2
+	printf '%s\n' "$dup_act" >&2
+	status=1
+fi
+
+if [ -n "$sep_in_value" ]; then
+	echo >&2
+	echo "check-ci-reach: a pin separator appears where a pin's STRUCTURE is, so the pin cannot be" >&2
+	echo "                read back unambiguously — a '|' or ';' in a job id, trigger name, filter" >&2
+	echo "                key, matrix axis or matrix leg, or a ';' inside a value:" >&2
+	printf '%s\n' "$sep_in_value" >&2
+	status=1
+fi
+
+if [ "$reader_skew_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $reader_skew_count job(s) have run: steps but no job-level activation was parsed for" >&2
+	echo "                them:" >&2
+	while IFS= read -r j; do
+		[ -n "$j" ] || continue
+		echo "  - $j" >&2
+	done <<<"$reader_skew"
+	echo >&2
+	echo "  ci_step_commands and wf_job_activation are two readers of the same file and they" >&2
+	echo "  disagree about which jobs exist. 'No activation parsed' is the PINNED value for" >&2
+	echo "  three of the four gate jobs here, so a job the activation reader cannot see would" >&2
+	echo "  pass its \`if:\` pin vacuously. The usual cause is a run: body line at column 0," >&2
+	echo "  which ends the \`jobs:\` block for the activation reader and hides every job after" >&2
+	echo "  it. Indent the body." >&2
+	status=1
+fi
+
+if [ "$trig_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $trig_bad_count workflow(s) whose top-level \`on:\` triggers are not the pinned set:" >&2
+	while IFS="$(printf '\t')" read -r w want got; do
+		[ -n "$w" ] || continue
+		echo "  - $w" >&2
+		echo "      EXPECTED_TRIGGERS: $want" >&2
+		echo "      workflow says:     $got" >&2
+	done <<<"$trig_bad"
+	echo >&2
+	echo "  MEASURED as the reason this pin exists: with \`on:\` reduced to \`workflow_dispatch\`," >&2
+	echo "  every gate in this workflow still read as reached and this guard's whole output was" >&2
+	echo "  byte-identical to healthy at exit 0 — a workflow that runs on no push and no PR," >&2
+	echo "  approved. Listing a workflow in $CONF is a CLAIM that it runs on every push/PR; this" >&2
+	echo "  is where that claim stops being a comment. If the trigger set changed on purpose," >&2
+	echo "  that is a behaviour change: update EXPECTED_TRIGGERS in the same reviewable diff." >&2
+	status=1
+fi
+
+if [ "$filt_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $filt_bad_count trigger(s) whose filters are not the pinned set:" >&2
+	while IFS="$(printf '\t')" read -r w t want got; do
+		[ -n "$w" ] || continue
+		echo "  - $w	on: $t" >&2
+		echo "      EXPECTED_TRIGGER_FILTERS: $want" >&2
+		echo "      workflow says:            $got" >&2
+	done <<<"$filt_bad"
+	echo >&2
+	echo "  A trigger that fires is not a trigger that fires for the change in front of it. A" >&2
+	echo "  narrowed \`branches:\` leaves the workflow running on a branch nobody pushes; an" >&2
+	echo "  introduced \`paths:\` that does not list Makefile means the edit that RETIRES a gate" >&2
+	echo "  does not trigger the workflow that would have caught it. Both were measured" >&2
+	echo "  byte-identical at exit 0 before this pin. No binding in this family has a \`paths:\`" >&2
+	echo "  filter, so seeing one here is a change to REVIEW, not a pin to update reflexively." >&2
+	status=1
+fi
+
+if [ "$filt_stale_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $filt_stale_count EXPECTED_TRIGGER_FILTERS entr(ies) name a trigger this workflow does" >&2
+	echo "                not have:" >&2
+	while IFS= read -r e; do
+		[ -n "$e" ] || continue
+		echo "  - $e" >&2
+	done <<<"$filt_stale"
+	echo >&2
+	echo "  The trigger pin above reports the trigger that left; this reports the filter pin" >&2
+	echo "  left behind, so a half-applied edit cannot read as healthy from either side." >&2
+	status=1
+fi
+
+if [ "$gatejob_unpinned_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $gatejob_unpinned_count job(s) carry reach for a gate and are not in EXPECTED_GATE_JOBS:" >&2
+	while IFS= read -r j; do
+		[ -n "$j" ] || continue
+		echo "  - $j" >&2
+	done <<<"$gatejob_unpinned"
+	echo >&2
+	echo "  Whether a job runs is pinned per job, so a gate that moved into an unlisted job has" >&2
+	echo "  no activation pin at all. Add the job here together with its EXPECTED_JOB_ACTIVATION" >&2
+	echo "  and EXPECTED_JOB_MATRIX entries." >&2
+	status=1
+fi
+
+if [ "$gatejob_absent_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $gatejob_absent_count job(s) in EXPECTED_GATE_JOBS carry reach for no gate:" >&2
+	while IFS= read -r j; do
+		[ -n "$j" ] || continue
+		echo "  - $j" >&2
+	done <<<"$gatejob_absent"
+	echo >&2
+	echo "  The job was renamed or deleted, or every gate it ran moved elsewhere. The step and" >&2
+	echo "  make-invocation pins above report the gate side; this reports the job whose" >&2
+	echo "  activation is now pinned for nothing." >&2
+	status=1
+fi
+
+if [ "$pinkey_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $pinkey_bad_count activation pin key(s) do not line up with EXPECTED_GATE_JOBS:" >&2
+	while IFS="$(printf '\t')" read -r n j why; do
+		[ -n "$n" ] || continue
+		echo "  - $n: '$j' $why" >&2
+	done <<<"$pinkey_bad"
+	echo >&2
+	echo "  Every cell of the partition has to terminate in a pin. A gate job with no" >&2
+	echo "  EXPECTED_JOB_ACTIVATION entry has its \`if:\` compared against nothing, which passes" >&2
+	echo "  for any value it could hold." >&2
+	status=1
+fi
+
+if [ "$act_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $act_bad_count gate job(s) whose job-level activation is not the pinned value:" >&2
+	while IFS="$(printf '\t')" read -r j want got; do
+		[ -n "$j" ] || continue
+		echo "  - $j" >&2
+		echo "      EXPECTED_JOB_ACTIVATION: $want" >&2
+		echo "      workflow says:           $got" >&2
+	done <<<"$act_bad"
+	echo >&2
+	echo "  An empty value means the key is ABSENT. This pin is VALUES, not absences, on purpose:" >&2
+	echo "  \`test\`'s \`continue-on-error: \${{ matrix.zig == 'master' }}\` is correct here — the" >&2
+	echo "  advisory master leg is documented at the top of the workflow — and a rule forbidding" >&2
+	echo "  job-level continue-on-error outright would red a healthy tree and get itself deleted." >&2
+	echo "  So a change in EITHER direction is named: absent -> present removes a gate, present ->" >&2
+	echo "  absent restores one, and present -> a different expression retargets which matrix leg" >&2
+	echo "  is advisory. All three were byte-identical at exit 0 before this pin." >&2
+	status=1
+fi
+
+if [ "$mx_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $mx_bad_count gate job(s) whose matrix legs are not the pinned set:" >&2
+	while IFS="$(printf '\t')" read -r j want got; do
+		[ -n "$j" ] || continue
+		echo "  - $j" >&2
+		echo "      EXPECTED_JOB_MATRIX: $want" >&2
+		echo "      workflow says:       $got" >&2
+	done <<<"$mx_bad"
+	echo >&2
+	echo "  The leg set is the other half of a continue-on-error keyed on a matrix value, and" >&2
+	echo "  neither half is checkable alone. MEASURED byte-identical at exit 0 before this pin:" >&2
+	echo "  reducing \`test\`'s matrix to \`zig: ['master']\` left the continue-on-error expression" >&2
+	echo "  untouched — so the activation pin was satisfied — while making every leg of the job" >&2
+	echo "  advisory. Renaming the \`master\` leg does the converse. Which legs GATE is a fact" >&2
+	echo "  about the pair, so both are pinned." >&2
+	status=1
+fi
+
 if [ "$stale_count" -gt 0 ]; then
 	echo >&2
 	while IFS= read -r t; do
@@ -1404,6 +2207,10 @@ if [ "$status" -eq 0 ]; then
 		"$nogate_count" "$gate_targets" "$MAKE_BIN" "$ROOT_TARGET"
 	printf 'pinned   %s gate(s) reached INSIDE their pinned CI step, %s through `make <target>` and unpinnable, over %s named run: step(s)\n' \
 		"$stepmap_ok" "${#EXPECTED_MAKE_INVOKED_TARGETS[@]}" "$step_count"
+	printf 'pinned   %s trigger(s) over %s workflow(s) match EXPECTED_TRIGGERS and their filters EXPECTED_TRIGGER_FILTERS\n' \
+		"$trig_total" "$workflow_count"
+	printf 'pinned   %s gate job(s) match EXPECTED_GATE_JOBS, each with its exact `if:`, `needs:`, `continue-on-error:` and matrix legs\n' \
+		"${#EXPECTED_GATE_JOBS[@]}"
 	echo "check-ci-reach: OK — $reached target(s) reached by CI, $excused_ok excused, $nogate_count carrying no gate"
 fi
 exit "$status"
