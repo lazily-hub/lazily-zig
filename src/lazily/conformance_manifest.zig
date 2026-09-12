@@ -372,6 +372,46 @@ fn declareBlock(fixture: []const u8, where: []const u8, block: std.json.Value) v
     append(line);
 }
 
+/// Where the inventory walk sends a site.
+///
+/// Production writes a manifest line. The synthetic probe in this file's tests
+/// collects LABELS instead, which is the only way to test the walk on shapes the
+/// corpus does not carry: the corpus exercises exactly ONE array-valued tracked
+/// key (`signaling/anti_spoof_session.json`, eight of them, all plain-object
+/// elements), so a walk that over-widened — counting a scalar element, counting a
+/// nested array's contents, renumbering a mixed array — would be green against
+/// the corpus and wrong (`#lzarrayelementsites`).
+const BlockSink = struct {
+    fixture: []const u8 = "",
+    capture: ?*CapturedBlocks = null,
+
+    fn emit(self: BlockSink, where: []const u8, block: std.json.Value) void {
+        if (self.capture) |c| {
+            c.push(where);
+            return;
+        }
+        declareBlock(self.fixture, where, block);
+    }
+};
+
+/// Test-only collector for `BlockSink`. Bounded inline, so a probe allocates
+/// nothing and an over-wide walk overflows into a visible length mismatch rather
+/// than into a resize.
+const CapturedBlocks = struct {
+    labels: [32][]const u8 = undefined,
+    len: usize = 0,
+
+    fn push(self: *CapturedBlocks, where: []const u8) void {
+        if (self.len == self.labels.len) return;
+        self.labels[self.len] = where;
+        self.len += 1;
+    }
+
+    fn seen(self: *const CapturedBlocks) []const []const u8 {
+        return self.labels[0..self.len];
+    }
+};
+
 /// Key names the canonical corpus uses for an assertion-bearing block
 /// (`#lzzigblockwalk`). The whole set, not the one name this walk used to read:
 /// the corpus spells a block `assertions`, `expect`, `expected`,
@@ -400,7 +440,8 @@ fn isBlockName(key: []const u8) bool {
 const MAX_WALK_DEPTH: u8 = 32;
 
 /// Inventory every assertion-bearing block a freshly read fixture carries:
-/// every name in `BLOCK_NAMES`, at EVERY depth, object-valued only.
+/// every name in `BLOCK_NAMES`, at EVERY depth, object-valued or one
+/// plain-object element of an array-valued one.
 ///
 /// Parsing the bytes here rather than asking a runner is the whole point — a
 /// block no runner looks at is exactly the one this rung exists to find. Bad
@@ -412,26 +453,50 @@ const MAX_WALK_DEPTH: u8 = 32;
 /// key of each element of the top-level `frames`/`scenarios`/`rejects` arrays,
 /// and nothing else (`#lzzigblockwalk`). Over the 138 fixtures this suite opens
 /// that inventoried 37 sites / 31 distinct digests, while the same fixtures
-/// carry 722 sites / 613 distinct digests under the rule below — so every
+/// carry 734 sites / 625 distinct digests under the rule below — so every
 /// `expect`/`expected` block in the corpus sat outside the rung that exists to
 /// catch a block nothing binds. It is verbatim what lazily-py had before it
 /// widened, and widening there surfaced 25 blocks no runner bound.
 ///
 /// Two rules make the declaring side and the binding side agree:
 ///
-///   * ARRAY-VALUED tracked keys contribute NO site. `signaling/frames.json`
-///     and `signaling/anti_spoof_session.json` carry array-valued `expect`
-///     keys; a runner binds their ELEMENTS, not the array, so counting the
-///     array would declare a block that cannot be bound by construction.
+///   * An ARRAY-VALUED tracked key contributes one site per PLAIN-OBJECT
+///     ELEMENT, labelled `<path>[<index>]` (`#lzarrayelementsites`). A runner
+///     binds the elements, not the array — so the array itself is still not a
+///     site, and the elements now are. This clause used to say array-valued
+///     keys contribute NOTHING, on those same grounds, which pointed at a site
+///     nobody ever emitted: `signaling/anti_spoof_session.json`'s eight
+///     array-valued `expect` keys carry twelve plain-object elements, every one
+///     of them an expected outbound signaling frame the replay already read and
+///     compared, and all twelve sat outside rung 0. Falsifying one of those
+///     values was caught; a runner that stopped asserting them was not.
 ///   * A block is emitted and NOT descended into, which is what a runner does —
 ///     it binds the block and stops. Descending would inventory a fixture's
 ///     `expect` nested inside its own `assertions` as a second, separately
 ///     bindable site that no tracker can reach without unwrapping the first.
+///     An emitted ELEMENT follows the same rule, for the same reason.
+///
+/// The element rule is deliberately narrow, and identical in all seven bindings
+/// that carry it:
+///
+///   * ONE LEVEL ONLY. `[[{...}]]` emits nothing — the inner array is not an
+///     element block, and its contents are reached only by the ordinary
+///     descend, which needs a tracked key of its own.
+///   * PLAIN OBJECTS ONLY. A scalar, array or null element emits nothing.
+///   * TRUE INDEXES. In `[{...}, 3, {...}]` the sites are `expect[0]` and
+///     `expect[2]`; numbering the objects consecutively would name the second
+///     one `expect[1]`, a label no reader could line up against the fixture.
 ///
 /// List labels prefer an element's own `name` string over its index, so a
 /// `where` reported here matches the way the scenario-shaped runners spell the
 /// same site and an excuse written against a reported label keeps matching when
-/// a scenario moves.
+/// a scenario moves. That preference applies ONLY to an array reached by
+/// DESCENT — that is, held at an UNTRACKED key, where the label names a
+/// container the walk is passing through. An element site of a TRACKED key is
+/// always `[<index>]`: it names a block, the rule has to be the same byte for
+/// byte in every binding, and the guard's python twin computes the site COUNT
+/// from the corpus with no access to a runner's naming convention, so a
+/// name-preferring element label would be a label only this half can spell.
 pub fn recordDeclaredBlocks(path: []const u8, bytes: []const u8) void {
     if (resolveManifestPath() == null) return;
     const id = canonicalFixtureId(path);
@@ -445,12 +510,12 @@ pub fn recordDeclaredBlocks(path: []const u8, bytes: []const u8) void {
     ) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
-    walkDeclaredBlocks(arena.allocator(), id, parsed.value, "", 0);
+    walkDeclaredBlocks(arena.allocator(), .{ .fixture = id }, parsed.value, "", 0);
 }
 
 fn walkDeclaredBlocks(
     allocator: std.mem.Allocator,
-    fixture: []const u8,
+    sink: BlockSink,
     node: std.json.Value,
     path: []const u8,
     depth: u8,
@@ -466,11 +531,25 @@ fn walkDeclaredBlocks(
                     key
                 else
                     std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, key }) catch continue;
-                if (isBlockName(key) and value == .object) {
-                    declareBlock(fixture, child, value);
-                    continue;
+                if (isBlockName(key)) {
+                    switch (value) {
+                        .object => {
+                            sink.emit(child, value);
+                            continue;
+                        },
+                        // ONE site per plain-object element, by TRUE index
+                        // (`#lzarrayelementsites`).
+                        .array => |arr| {
+                            declareArrayElements(allocator, sink, arr, child, depth);
+                            continue;
+                        },
+                        // A tracked key holding a scalar is not a block, and the
+                        // descend below is a no-op on one; left to fall through
+                        // so this switch says nothing the walk does not do.
+                        else => {},
+                    }
                 }
-                walkDeclaredBlocks(allocator, fixture, value, child, depth + 1);
+                walkDeclaredBlocks(allocator, sink, value, child, depth + 1);
             }
         },
         .array => |arr| {
@@ -487,10 +566,40 @@ fn walkDeclaredBlocks(
                     std.fmt.allocPrint(allocator, "{s}[{s}]", .{ path, l }) catch continue
                 else
                     std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, index }) catch continue;
-                walkDeclaredBlocks(allocator, fixture, item, child, depth + 1);
+                walkDeclaredBlocks(allocator, sink, item, child, depth + 1);
             }
         },
         else => {},
+    }
+}
+
+/// The elements of an array held at a TRACKED key (`#lzarrayelementsites`).
+///
+/// Emitted and not descended into, exactly as an object-valued tracked key is.
+/// A non-object element is NOT a site and is descended instead, which is what
+/// the walk did with every element of such an array before this rule existed —
+/// so a tracked key holding `[[{"expect": {...}}]]` still reaches the inner
+/// `expect` by its own tracked key and never as an element block.
+///
+/// The index is the element's TRUE position, so a mixed array's object elements
+/// keep the positions a reader can look up in the fixture.
+fn declareArrayElements(
+    allocator: std.mem.Allocator,
+    sink: BlockSink,
+    arr: std.json.Array,
+    path: []const u8,
+    depth: u8,
+) void {
+    // The elements sit one level below the array-holding key, the depth the
+    // array node itself would have been visited at.
+    if (depth + 1 >= MAX_WALK_DEPTH) return;
+    for (arr.items, 0..) |item, index| {
+        const child = std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, index }) catch continue;
+        if (item == .object) {
+            sink.emit(child, item);
+            continue;
+        }
+        walkDeclaredBlocks(allocator, sink, item, child, depth + 1);
     }
 }
 
@@ -662,6 +771,145 @@ test "conformance manifest: vendored fixture copies match the canonical corpus" 
             return err;
         };
     }
+}
+
+/// Run the REAL inventory walk over `json` and hand back the labels it emitted.
+///
+/// The walk under test is `walkDeclaredBlocks` itself — not a copy of its rule —
+/// because a probe against a re-stated rule tests the copy and nothing else.
+fn probeDeclaredBlocks(
+    arena: std.mem.Allocator,
+    json: []const u8,
+    capture: *CapturedBlocks,
+) !void {
+    const value = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        json,
+        .{ .allocate = .alloc_always },
+    );
+    walkDeclaredBlocks(arena, .{ .capture = capture }, value, "", 0);
+}
+
+test "conformance manifest: an array-valued tracked key declares its plain-object elements" {
+    // The corpus carries exactly ONE array-valued tracked-key shape — eight
+    // `expect` arrays in `signaling/anti_spoof_session.json`, every element a
+    // plain object — so it cannot catch an OVER-wide rule. These are the shapes
+    // it does not carry (`#lzarrayelementsites`).
+    const cases = [_]struct {
+        what: []const u8,
+        json: []const u8,
+        want: []const []const u8,
+    }{
+        .{
+            .what = "object-valued: the key itself, unchanged",
+            .json = "{\"expect\": {\"a\": 1}}",
+            .want = &.{"expect"},
+        },
+        .{
+            .what = "array of 2 objects: one site each",
+            .json = "{\"expect\": [{\"a\": 1}, {\"b\": 2}]}",
+            .want = &.{ "expect[0]", "expect[1]" },
+        },
+        .{
+            .what = "array of scalars: no site",
+            .json = "{\"expect\": [1, 2, 3]}",
+            .want = &.{},
+        },
+        .{
+            .what = "mixed array: TRUE indexes, so [0] and [2]",
+            .json = "{\"expect\": [{\"a\": 1}, 3, {\"b\": 2}]}",
+            .want = &.{ "expect[0]", "expect[2]" },
+        },
+        .{
+            .what = "nested array: one level only, so no site",
+            .json = "{\"expect\": [[{\"a\": 1}]]}",
+            .want = &.{},
+        },
+        .{
+            .what = "untracked key holding an array of objects: no site",
+            .json = "{\"frames\": [{\"a\": 1}, {\"b\": 2}]}",
+            .want = &.{},
+        },
+        .{
+            // The other half of the pair: an element is emitted and NOT
+            // descended into, exactly as an object-valued tracked key is, so a
+            // tracked key nested inside an element is not a second bindable site.
+            .what = "an emitted element is not descended into",
+            .json = "{\"expect\": [{\"expect\": {\"a\": 1}}]}",
+            .want = &.{"expect[0]"},
+        },
+        .{
+            // Element labels are ALWAYS indexes. The name preference belongs to
+            // an array reached by DESCENT, and `steps` below shows it still does.
+            .what = "a `name` field does not rename an element site",
+            .json = "{\"steps\": [{\"name\": \"s\", \"expect\": [{\"name\": \"f\"}]}]}",
+            .want = &.{"steps[s].expect[0]"},
+        },
+    };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var capture = CapturedBlocks{};
+        try probeDeclaredBlocks(arena.allocator(), case.json, &capture);
+        const got = capture.seen();
+        std.testing.expectEqual(case.want.len, got.len) catch |err| {
+            std.debug.print("walk case `{s}` emitted {d} site(s):\n", .{ case.what, got.len });
+            for (got) |label| std.debug.print("  {s}\n", .{label});
+            return err;
+        };
+        for (case.want, got) |want, label| {
+            std.testing.expectEqualStrings(want, label) catch |err| {
+                std.debug.print("walk case `{s}`: wanted `{s}`, got `{s}`\n", .{ case.what, want, label });
+                return err;
+            };
+        }
+    }
+}
+
+test "conformance manifest: same-array element sites are named separately" {
+    // Label DISAMBIGUATION, on the corpus shape the rule exists for. A per-array
+    // label would collapse a three-frame step's three expected frames into one
+    // site, and the bind ledger is a SET — collapsed labels make two detached
+    // binds indistinguishable from one, which is the set-identity failure this
+    // family cares about. All twelve, in full, so a renumbering is visible too.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const path = try specPath(arena.allocator(), "signaling/anti_spoof_session.json");
+    const bytes = specReadFile(path) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(bytes);
+
+    var capture = CapturedBlocks{};
+    const value = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        bytes,
+        .{ .allocate = .alloc_always },
+    );
+    walkDeclaredBlocks(arena.allocator(), .{ .capture = &capture }, value, "", 0);
+
+    const want = [_][]const u8{
+        "assertions",
+        "steps[0].expect[0]",
+        "steps[1].expect[0]",
+        "steps[1].expect[1]",
+        "steps[2].expect[0]",
+        "steps[2].expect[1]",
+        "steps[2].expect[2]",
+        "steps[3].expect[0]",
+        "steps[4].expect[0]",
+        "steps[5].expect[0]",
+        "steps[6].expect[0]",
+        "steps[7].expect[0]",
+        "steps[7].expect[1]",
+    };
+    const got = capture.seen();
+    std.testing.expectEqual(want.len, got.len) catch |err| {
+        for (got) |label| std.debug.print("  {s}\n", .{label});
+        return err;
+    };
+    for (want, got) |w, label| try std.testing.expectEqualStrings(w, label);
 }
 
 test "conformance manifest: ids are relative to the conformance root" {

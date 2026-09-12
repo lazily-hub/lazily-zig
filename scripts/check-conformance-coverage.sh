@@ -839,22 +839,34 @@ if len(excuses) != EXPECTED_LEDGERED_BLOCKS:
 # SCOPE — the walk mirrored below is recordDeclaredBlocks() in
 # src/lazily/conformance_manifest.zig, and the two must stay one rule: every
 # name in BLOCK_NAMES (`assertions`, `expect`, `expect_after`, `expect_initial`,
-# `expected`) at EVERY depth, OBJECT-VALUED ONLY, a block emitted and not
-# descended into.
+# `expected`) at EVERY depth, OBJECT-VALUED or ONE PLAIN-OBJECT ELEMENT of an
+# ARRAY-VALUED one, a block emitted and not descended into.
+#
+# The two halves are WIDENED IN STEP and pinned against each other by the
+# equalities below, which is what makes widening safe to do at all: a site the
+# runtime inventories and this walk does not derive fails as MORE than expected,
+# and a site this walk derives that the runtime does not enumerate fails as
+# FEWER. Neither half can be widened alone and stay green.
 #
 # It used to be the top-level `assertions` key plus the `assertions` key of each
 # OBJECT element of the top-level `frames`/`scenarios`/`rejects` arrays, with no
 # recursion (`#lzzigblockwalk`). That inventoried 37 sites / 31 distinct digests
-# of the 722 / 613 the same 138 opened fixtures carry — 5.2% — so EVERY
+# of the 734 / 625 the same 138 opened fixtures carry — 5.0% — so EVERY
 # `expect`/`expected` block in the corpus sat outside the rung that exists to
 # catch a block nothing binds, and none of them could be reported unbound. It was
 # verbatim the pre-#lzunboundblockguard walk lazily-py had before it widened, and
 # widening there surfaced 25 real ones. Widening here surfaced 204 digests over
 # 239 sites, every one of them now bound by a tracker or excused below.
 #
-# Array-valued tracked keys contribute NO site: a runner binds the ELEMENTS of
-# `signaling/frames.json`'s array-valued `expect`, never the array, so counting
-# the array would declare a block unbindable by construction.
+# An ARRAY-VALUED tracked key contributes one site per PLAIN-OBJECT ELEMENT
+# (#lzarrayelementsites). A runner binds the ELEMENTS, never the array, so the
+# array itself is still not a site — and the elements are. This clause used to
+# read "array-valued tracked keys contribute NO site" on exactly that reasoning,
+# which pointed at a site nobody ever emitted: the eight array-valued `expect`
+# keys of `signaling/anti_spoof_session.json` carry TWELVE plain-object elements,
+# each an expected outbound signaling frame the replay already read and compared,
+# and every one of them sat outside rung 0. That is the whole gap, corpus-wide:
+# 722 sites / 613 digests before, 734 / 625 after, in one fixture.
 
 # blockDigest() from conformance_manifest.zig, byte for byte: FNV-1a over a
 # type-tagged structural rendering, integers and floats folded by their raw
@@ -943,9 +955,27 @@ BLOCK_NAMES = ("assertions", "expect", "expect_after", "expect_initial", "expect
 def iter_declared_blocks(node):
     if isinstance(node, dict):
         for key, value in node.items():
-            if key in BLOCK_NAMES and isinstance(value, dict):
-                yield value
-                continue
+            if key in BLOCK_NAMES:
+                if isinstance(value, dict):
+                    yield value
+                    continue
+                # ONE site per PLAIN-OBJECT element of an array-valued tracked
+                # key (#lzarrayelementsites). One level only: a non-object
+                # element — scalar, null, or a NESTED ARRAY — is not a site and
+                # is descended instead, which is what this walk did with every
+                # element of such an array before the rule existed. The zig half
+                # labels them `<path>[<index>]` by TRUE index; only the COUNT is
+                # needed here, which is exactly why the label rule may not depend
+                # on anything this half cannot see (a runner's `name`-preferring
+                # convention, say).
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            yield item
+                            continue
+                        for block in iter_declared_blocks(item):
+                            yield block
+                    continue
             for block in iter_declared_blocks(value):
                 yield block
     elif isinstance(node, list):

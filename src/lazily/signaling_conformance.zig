@@ -23,8 +23,13 @@
 //!   bytes exactly.
 //! - **anti_spoof_session.json** — the `inputs` are replayed through a real
 //!   `SignalingRoom` and every outbound frame must match the transcript, both
-//!   in destination connection and in wire shape. The three fixture-level
-//!   `assertions` are then checked against what the room actually emitted.
+//!   in destination connection and in wire shape. Each expected frame is BOUND
+//!   as its own assertion block, `steps[N].expect[M]` (`#lzarrayelementsites`):
+//!   the twelve elements of this fixture's eight array-valued `expect` keys are
+//!   the corpus's only array-valued tracked keys, and until they were bound
+//!   they were compared here while every rung scoped to a bound block reported
+//!   nothing about them. The three fixture-level `assertions` are then checked
+//!   against what the room actually emitted.
 
 const std = @import("std");
 const testing = std.testing;
@@ -271,6 +276,27 @@ const ConnTable = struct {
     }
 };
 
+/// Carry the delivered connection and the name table into `assertKeyWith`, whose
+/// check is a comptime function and so cannot close over either. The comparison
+/// is the transcript's `to` NAME resolved through the same table the replay
+/// registers connections in — never a hardcoded id, which would leave the
+/// fixture's value out of the comparison entirely.
+const FrameTarget = struct {
+    conns: *ConnTable,
+    got_conn: u64,
+
+    fn check(self: FrameTarget, want: Value) anyerror!void {
+        const want_name = try cj.asStr(want);
+        const want_conn = try self.conns.idOf(want_name);
+        if (want_conn == self.got_conn) return;
+        std.debug.print(
+            "delivered to conn {d}, transcript says `{s}` (conn {d})\n",
+            .{ self.got_conn, want_name, want_conn },
+        );
+        return error.OutboundRoutedToWrongConnection;
+    }
+};
+
 test "signaling conformance: anti_spoof_session.json" {
     const allocator = testing.allocator;
     var parsed = (try cj.load("signaling/anti_spoof_session.json")) orelse {
@@ -342,20 +368,39 @@ test "signaling conformance: anti_spoof_session.json" {
         }
 
         for (expect, out.items, 0..) |want, got, fi| {
-            const want_conn = try conns.idOf(try cj.asStr(try cj.required(want, "to")));
-            if (want_conn != got.to_conn) {
-                std.debug.print(
-                    "step {d} frame {d}: delivered to conn {d}, transcript says {s}\n",
-                    .{ si, fi, got.to_conn, try cj.asStr(try cj.required(want, "to")) },
-                );
-                return error.OutboundRoutedToWrongConnection;
-            }
+            // Each expected frame is BOUND as its own assertion block
+            // (`#lzarrayelementsites`). These twelve elements were read and
+            // compared here all along and none of them was bound, so rung 0 —
+            // and every rung scoped to a bound block — reported nothing about
+            // them: falsifying a `to` or a `frame` was caught, a runner that
+            // stopped comparing them was not. The label is the canonical
+            // `steps[N].expect[M]` the inventory walk spells, so a diagnostic
+            // and a ledger entry name the same site.
+            var where_buf: [128]u8 = undefined;
+            const where = try std.fmt.bufPrint(
+                &where_buf,
+                "signaling/anti_spoof_session.json steps[{d}].expect[{d}]",
+                .{ si, fi },
+            );
+            var frame_keys = cj.AssertionKeys.init(where, want);
+            frame_keys.assertKeyWith(
+                "to",
+                FrameTarget{ .conns = &conns, .got_conn = got.to_conn },
+                FrameTarget.check,
+            ) catch |err| {
+                std.debug.print("step {d} frame {d} routing diverged\n", .{ si, fi });
+                return err;
+            };
             var encoded = try cj.encodeToValue(got.frame);
             defer encoded.deinit();
-            cj.expectJsonEql(try cj.required(want, "frame"), encoded.value) catch |err| {
+            // Structural, so the frame's KEY SET is compared in BOTH directions
+            // at every depth — a field the room emits that the transcript omits
+            // fails here, not just a field the transcript names.
+            frame_keys.assertKeyStructural("frame", encoded.value) catch |err| {
                 std.debug.print("step {d} frame {d} diverged\n", .{ si, fi });
                 return err;
             };
+            try frame_keys.finish();
 
             switch (got.frame) {
                 .welcome => |w| {
