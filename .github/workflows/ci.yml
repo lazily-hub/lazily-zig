@@ -158,17 +158,30 @@ jobs:
       # build.zig falls back to LAZILY_CONFORMANCE_MANIFEST when the option is
       # absent — but running the command CI runs and the command `make check`
       # runs as two different spellings is how the two drift apart.
+      # ONE evidence nonce per job (#lzstalemanifest), minted before the suite
+      # and read back by the coverage guard step below. `make check` gets this
+      # from a `:=` variable in the Makefile; CI needs $GITHUB_ENV because the
+      # suite and the guard are two separate `run:` shells and a nonce minted
+      # inside either one would be invisible to the other. Same reason the two
+      # spellings of the manifest path are kept in step: the knob has to be the
+      # same knob on both sides or they drift.
+      - name: Mint conformance evidence nonce (#lzstalemanifest)
+        run: |
+          echo "LAZILY_CONFORMANCE_RUN_ID=$(date +%s%N)-$$-${{ matrix.zig }}" >>"$GITHUB_ENV"
+
       - name: Test
         run: |
           mkdir -p build && : > build/conformance-fixtures-loaded.txt
           if [ "${{ matrix.zig }}" = master ]; then
             timeout 90 env LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
               zig build test --summary all \
-              -Dconformance-manifest="$PWD/build/conformance-fixtures-loaded.txt"
+              -Dconformance-manifest="$PWD/build/conformance-fixtures-loaded.txt" \
+              -Dconformance-run-id="$LAZILY_CONFORMANCE_RUN_ID"
           else
             LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
               zig build test --summary all \
-              -Dconformance-manifest="$PWD/build/conformance-fixtures-loaded.txt"
+              -Dconformance-manifest="$PWD/build/conformance-fixtures-loaded.txt" \
+              -Dconformance-run-id="$LAZILY_CONFORMANCE_RUN_ID"
           fi
 
       # Cross-binding wire compatibility, run by `make check` and by no binding's
@@ -184,7 +197,11 @@ jobs:
 
       # A fixture that lands upstream and is replayed by nobody here must fail
       # the build, not wait to be noticed. Runs on every toolchain in the matrix
-      # because the manifest is per-run evidence, not a cached artifact.
+      # because the manifest is per-run evidence, not a cached artifact — and
+      # since #lzstalemanifest the guard PROVES that rather than assuming it:
+      # the nonce below has to match the one stamped into the manifest by the
+      # Test step above, so a manifest left behind by any other run is refused
+      # instead of being read as this job's coverage.
       - name: Conformance coverage guard
         run: |
           LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \

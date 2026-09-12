@@ -8,6 +8,22 @@ LEAN_DIR ?= ../lazily-formal
 # path would scatter partial manifests instead of accumulating one union.
 CONFORMANCE_MANIFEST ?= $(CURDIR)/build/conformance-fixtures-loaded.txt
 
+# ONE evidence nonce per `make` invocation (#lzstalemanifest). The suite stamps
+# it as the first line of the manifest and the coverage guard refuses evidence
+# carrying any other id, so "the runtime manifest says these bytes were read"
+# becomes a claim about THIS run rather than about some run, ever.
+#
+# `:=` and not `=`. A recursively-expanded variable re-runs the shell at every
+# reference, so `test` would stamp one id and `conformance-coverage` would demand
+# a different one — which fails closed, and reads like a bug in the guard rather
+# than a bug here. Simply-expanded means the shell runs once, at parse time, and
+# both recipes see the same bytes.
+#
+# Nanoseconds plus the pid of the expanding shell: unique per invocation even for
+# two `make`s started in the same nanosecond. Any unique-per-invocation value
+# would do; this one needs no uuidgen on the PATH.
+CONFORMANCE_RUN_ID := $(shell printf '%s-%s' "$$(date +%s%N)" "$$$$")
+
 .PHONY: \
 	check \
 fmt \
@@ -64,8 +80,10 @@ fmt-fix:
 # `mise run test`) is unaffected by any of this.
 test:
 	@mkdir -p $(dir $(CONFORMANCE_MANIFEST)) && : > $(CONFORMANCE_MANIFEST)
-	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) $(ZIG) build test \
-		-Dconformance-manifest=$(CONFORMANCE_MANIFEST)
+	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) \
+	LAZILY_CONFORMANCE_RUN_ID=$(CONFORMANCE_RUN_ID) $(ZIG) build test \
+		-Dconformance-manifest=$(CONFORMANCE_MANIFEST) \
+		-Dconformance-run-id=$(CONFORMANCE_RUN_ID)
 
 test-interop-peer:
 	$(ZIG) build interop-peer-check
@@ -86,7 +104,9 @@ test-lean-formal:
 # having just run with the recorder attached — a missing manifest is missing
 # evidence and fails.
 conformance-coverage: test
-	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) ./scripts/check-conformance-coverage.sh
+	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) \
+	LAZILY_CONFORMANCE_RUN_ID=$(CONFORMANCE_RUN_ID) \
+		./scripts/check-conformance-coverage.sh
 
 # CI-reachability guard (#lzcheckcireachguard). Fails when a target above runs a
 # gate no CI workflow step reaches — the drift that hid #lzinteroppeerci in every

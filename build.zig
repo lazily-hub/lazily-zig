@@ -251,6 +251,15 @@ pub fn build(b: *std.Build) void {
         "conformance-manifest",
         "Absolute runtime conformance evidence path",
     ) orelse buildEnvVar(b, "LAZILY_CONFORMANCE_MANIFEST");
+    // Per-invocation evidence nonce (`#lzstalemanifest`). Same two spellings as
+    // the manifest, for the same reason: CI passes the option and `make test`
+    // passes the option, so the command CI runs and the command `make check`
+    // runs cannot drift into two different knobs.
+    const conformance_run_id = b.option(
+        []const u8,
+        "conformance-run-id",
+        "Per-invocation conformance evidence nonce",
+    ) orelse buildEnvVar(b, "LAZILY_CONFORMANCE_RUN_ID");
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -459,6 +468,13 @@ pub fn build(b: *std.Build) void {
     // truncated manifest empty — reported downstream as missing evidence, which
     // is correct but useless. Collecting evidence requires actually running.
     //
+    // The nonce is pushed the same way and for the same reason
+    // (`#lzstalemanifest`): the recorder stamps it as the first line of the
+    // manifest, and `scripts/check-conformance-coverage.sh` refuses evidence
+    // whose stamp is not this invocation's. `has_side_effects` is what keeps
+    // that refusal from ever being the ordinary outcome — see below for why the
+    // guard is still worth having on top of the flag.
+    //
     // NEVER set a secret-bearing variable here. `setEnvironmentVariable` clones
     // this step's map from zig's own environment, and `failed command:` renders
     // the child map DIFFED against the parent
@@ -470,6 +486,16 @@ pub fn build(b: *std.Build) void {
     // caller-side `env -u TOKEN make check` MANUFACTURES the diff, because the
     // scrub removes the variable from the parent while anything that
     // re-injects it into the child makes it child-only (#lzzigenvsecretleak).
+    //
+    // `LAZILY_CONFORMANCE_RUN_ID` is set here deliberately and is safe under
+    // that rule WITHOUT relaxing it: its value is a nonce with no meaning
+    // outside the build that minted it, so disclosing it in a `failed command:`
+    // line discloses nothing. The rule is unchanged — a path and a nonce are
+    // safe, a token is not, and nothing else may be added here without the same
+    // argument. In practice `make test` exports the nonce to `zig build` too, so
+    // it is identical on both sides of the diff and is not printed at all; a
+    // caller passing only `-Dconformance-run-id` makes it child-only and it IS
+    // printed, which is fine for a nonce and would not be for a secret.
     if (conformance_manifest) |manifest_path| {
         for (run_test.dependencies.items) |dep| {
             // `Step` spells its kind `id` on 0.16.0 and `tag` on nightly. Both
@@ -482,6 +508,9 @@ pub fn build(b: *std.Build) void {
             if (kind != .run) continue;
             const run: *std.Build.Step.Run = @fieldParentPtr("step", dep);
             run.setEnvironmentVariable("LAZILY_CONFORMANCE_MANIFEST", manifest_path);
+            if (conformance_run_id) |rid| {
+                run.setEnvironmentVariable("LAZILY_CONFORMANCE_RUN_ID", rid);
+            }
             run.has_side_effects = true;
         }
     }

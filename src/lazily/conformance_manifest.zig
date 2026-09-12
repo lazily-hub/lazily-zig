@@ -42,10 +42,31 @@ const MARKER = "lazily-spec/conformance/";
 
 const ENV_NAME = "LAZILY_CONFORMANCE_MANIFEST";
 
+/// Name of the per-invocation run-id nonce (`#lzstalemanifest`), shared with
+/// every sibling binding, with the Makefile, and with
+/// `scripts/check-conformance-coverage.sh`.
+const RUN_ID_ENV_NAME = "LAZILY_CONFORMANCE_RUN_ID";
+
+/// Prefix of the FIRST line every process writing this manifest emits
+/// (`#lzstalemanifest`). Cross-binding fixed shape: `# lazily-run-id <value>`.
+///
+/// `#` rather than `@`: the three evidence channels already claim `@`, and a
+/// corpus-relative fixture id can begin with neither, so the guard still splits
+/// the file with plain greps and needs no second file, no second environment
+/// variable and no second build.zig wiring.
+pub const RUN_ID_LINE_PREFIX = "# lazily-run-id ";
+
 var mutex: ParkingMutex = .{};
 var manifest_path_buf: [4096]u8 = undefined;
 var manifest_path: ?[:0]const u8 = null;
 var manifest_resolved: bool = false;
+var run_id_buf: [4096]u8 = undefined;
+var run_id: ?[:0]const u8 = null;
+var run_id_resolved: bool = false;
+/// Per-PROCESS, not per-file: each of the dozen test binaries appends its own
+/// stamp to the shared manifest, and the guard demands they all carry the
+/// current invocation's id.
+var run_id_stamped: bool = false;
 
 /// Read a conformance fixture and record the fact that its bytes were opened.
 ///
@@ -646,15 +667,52 @@ fn append(id: []const u8) void {
     const fd: linux.fd_t = @intCast(fd_raw);
     defer _ = linux.close(fd);
 
+    // The run-id stamp goes out BEFORE this process's first evidence line
+    // (`#lzstalemanifest`), so the first line of the manifest is always a stamp
+    // and no evidence can precede the id that dates it. Written by the test
+    // BINARY and never by the Makefile on purpose: a Makefile-written stamp
+    // would date a manifest whose evidence a skipped or cached run never
+    // produced, which is the hole wearing the fix's uniform — worse than the
+    // status quo, because an empty-but-stamped manifest passes the `-s` check
+    // that an empty one fails.
+    //
+    // Unset run id writes no stamp. That is not a silent pass: the guard
+    // refuses a manifest carrying no stamp, so a suite run without the nonce
+    // reports missing evidence rather than green.
+    if (!run_id_stamped) {
+        run_id_stamped = true;
+        if (resolveRunId()) |rid| {
+            var stamp_buf: [4096]u8 = undefined;
+            const stamp = std.fmt.bufPrint(
+                &stamp_buf,
+                RUN_ID_LINE_PREFIX ++ "{s}",
+                .{rid},
+            ) catch null;
+            if (stamp) |line| writeLine(fd, line);
+        }
+    }
+
     // One write per read. An exit hook would be tidier, but Zig's test runner
     // gives no reliable per-binary teardown, and a lost flush is a false "not
     // opened" — the one failure mode this guard must not produce.
+    writeLine(fd, id);
+}
+
+/// One `write` of `bytes` plus a newline, retried on a short write.
+///
+/// O_APPEND plus a single `write` per line is what lets a dozen test binaries
+/// share one manifest without interleaving inside a line. A short write is
+/// retried rather than abandoned, but the retry is a second syscall and can in
+/// principle interleave — the lines are short enough that the kernel does not
+/// split them in practice, and a mangled line surfaces downstream as missing
+/// evidence, never as a false positive.
+fn writeLine(fd: linux.fd_t, bytes: []const u8) void {
     var line_buf: [4096]u8 = undefined;
-    if (id.len + 1 > line_buf.len) return;
-    @memcpy(line_buf[0..id.len], id);
-    line_buf[id.len] = '\n';
+    if (bytes.len + 1 > line_buf.len) return;
+    @memcpy(line_buf[0..bytes.len], bytes);
+    line_buf[bytes.len] = '\n';
     var written: usize = 0;
-    const total = id.len + 1;
+    const total = bytes.len + 1;
     while (written < total) {
         const rc = linux.write(fd, line_buf[written..].ptr, total - written);
         const signed: isize = @bitCast(rc);
@@ -666,6 +724,19 @@ fn append(id: []const u8) void {
 /// The manifest path comes from `LAZILY_CONFORMANCE_MANIFEST` and must be
 /// ABSOLUTE — the Makefile exports `$(CURDIR)/...` for that reason. Unset means
 /// the recorder is a no-op, so a bare `zig build test` is unaffected.
+/// The per-invocation nonce from `LAZILY_CONFORMANCE_RUN_ID`
+/// (`#lzstalemanifest`). Resolved once, like the manifest path and the corpus
+/// root: `readEnv` re-opens and re-scans `/proc/self/environ` on every call,
+/// and caching also means the id a run stamps cannot change halfway through it.
+///
+/// Null means the nonce is unset, which is NOT an excuse — see `append`.
+fn resolveRunId() ?[:0]const u8 {
+    if (run_id_resolved) return run_id;
+    run_id_resolved = true;
+    run_id = readEnv(RUN_ID_ENV_NAME, &run_id_buf);
+    return run_id;
+}
+
 fn resolveManifestPath() ?[:0]const u8 {
     if (manifest_resolved) return manifest_path;
     manifest_resolved = true;

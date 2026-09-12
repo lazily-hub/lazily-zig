@@ -161,8 +161,16 @@ excuseScenario() {
 
 # ABSOLUTE by contract — test binaries may run from a working directory other
 # than the repo root, so the recorder cannot resolve a relative path the same way
-# this script would. The Makefile exports $(CURDIR)/...; the fallback here is for
-# running the script by hand right after `make test`.
+# this script would. The Makefile exports $(CURDIR)/...; the relative fallback
+# here is for reading an existing manifest from the repo root.
+#
+# Running this script by hand is no longer enough on its own: the run-id gate
+# below needs the nonce of the invocation that produced the evidence, and that
+# nonce is minted per `make` invocation. The by-hand path is `make
+# conformance-coverage`, which re-runs the suite and the guard under one id.
+# There is deliberately NO opt-out flag: every caller in this repo (the
+# Makefile target and the CI step) sets the nonce, so an unstamped path would be
+# a hole with an extra step rather than a legitimate use.
 MANIFEST="${LAZILY_CONFORMANCE_MANIFEST:-build/conformance-fixtures-loaded.txt}"
 
 if [ ! -s "$MANIFEST" ]; then
@@ -172,13 +180,104 @@ if [ ! -s "$MANIFEST" ]; then
   echo "      manifest is missing evidence, not evidence of absence." >&2
   exit 1
 fi
-# THREE evidence channels share one file. A corpus-relative fixture id can never
-# begin with `@`, so the split is a single grep and needs no second manifest,
-# no second environment variable, and no second build.zig wiring.
+# ---------------------------------------------------------------------------
+# EVIDENCE FRESHNESS: the manifest must be THIS invocation's (#lzstalemanifest)
+# ---------------------------------------------------------------------------
+#
+# Every rung below says "the runtime manifest — these bytes were really read".
+# Nothing in it said WHEN. This script reads a file off disk and asserts what a
+# run did; with no id to date the file, "really read" meant "read by some run,
+# ever", and the entire evidence channel was conditional on a build state
+# nobody checked. Proved, not assumed: before this gate landed, pointing
+# LAZILY_CONFORMANCE_MANIFEST at a copy of a six-week-old manifest printed all
+# four OK rungs at exit 0.
+#
+# This binding's `make`/CI path is the NARROW case. `make test` truncates the
+# manifest before the suite and the recorder only appends, so a run that
+# produced nothing leaves an empty file and the `-s` check above already fails
+# it. And a zig test Run step cannot be a cache hit in the first place: every
+# `zig build` invocation mints a random `--seed=0x...`, the build runner passes
+# it in each test Run step's argv (std.Build.Step.Run line ~249), and argv bytes
+# are hashed into that step's cache manifest — so `has_side_effects` is belt on
+# top of braces, not the only thing running the binaries. Verified by removing
+# the flag: a second `zig build test` with nothing changed still reported
+# `546 pass` for every run step while every `compile test` reported `cached`.
+#
+# What was open, and what this closes, is the other half: a guard that trusts a
+# file it did not watch being written. Truncation is a property of one recipe
+# line; delete it, add a second guard invocation that does not re-run the suite,
+# or run the script against a stale path, and the rungs go green on last week's
+# run. A positive id is the assertion the truncation was only ever implying.
+#
+# The stamp is written by the test BINARY, never by the Makefile. A
+# Makefile-written stamp would date evidence the suite never produced and would
+# turn the empty-manifest failure into a pass, which is strictly worse than no
+# gate.
+RUN_ID="${LAZILY_CONFORMANCE_RUN_ID:-}"
+if [ -z "$RUN_ID" ]; then
+  echo "FAIL: LAZILY_CONFORMANCE_RUN_ID is unset, so this run has no identity to" >&2
+  echo "      check the evidence in $MANIFEST against." >&2
+  echo "      REFUSING rather than skipping: a guard that accepts unstamped" >&2
+  echo "      evidence when the nonce is absent is the stale-evidence hole with" >&2
+  echo "      an extra step. Run \`make conformance-coverage\`, which mints one" >&2
+  echo "      nonce per invocation and passes it to both the suite and this" >&2
+  echo "      script (#lzstalemanifest)." >&2
+  exit 1
+fi
+RUN_ID_PREFIX="# lazily-run-id "
+STAMPS="$({ grep "^$RUN_ID_PREFIX" "$MANIFEST" || true; } | sed "s|^$RUN_ID_PREFIX||")"
+if [ -z "$STAMPS" ]; then
+  echo "FAIL: $MANIFEST carries no '$RUN_ID_PREFIX<id>' line." >&2
+  echo "      Wanted id: $RUN_ID" >&2
+  echo "      The recorder stamps one as the first line it writes, so a manifest" >&2
+  echo "      without it was written by a suite that had no nonce — or predates" >&2
+  echo "      this gate entirely. Either way it is evidence about some other run" >&2
+  echo "      and cannot be read as evidence about this one (#lzstalemanifest)." >&2
+  exit 1
+fi
+# EVERY stamp, not just the first: a dozen test binaries append to one manifest,
+# so one of them running under a different id is exactly the partial-staleness
+# case a first-line-only check would wave through.
+while IFS= read -r stamp; do
+  [ -n "$stamp" ] || continue
+  if [ "$stamp" != "$RUN_ID" ]; then
+    echo "FAIL: $MANIFEST is evidence from a DIFFERENT run." >&2
+    echo "      found id:  $stamp" >&2
+    echo "      wanted id: $RUN_ID" >&2
+    echo "      Every rung below reports what 'the run' did, so reading a" >&2
+    echo "      manifest another invocation wrote would report that run's" >&2
+    echo "      coverage as this one's. Re-run the suite and the guard under one" >&2
+    echo "      invocation: \`make conformance-coverage\` (#lzstalemanifest)." >&2
+    exit 1
+  fi
+done <<< "$STAMPS"
+# The FIRST line too, not only the set. The recorder emits its stamp before its
+# first evidence line, so the first line of a well-formed manifest is always a
+# stamp; anything else means evidence landed ahead of any id — a writer with no
+# nonce, which the set check alone cannot see once a later writer supplies one.
+FIRST_LINE="$(head -n 1 "$MANIFEST")"
+case "$FIRST_LINE" in
+"$RUN_ID_PREFIX"*) ;;
+*)
+  echo "FAIL: the first line of $MANIFEST is not a run-id stamp." >&2
+  echo "      first line: $FIRST_LINE" >&2
+  echo "      wanted id:  $RUN_ID" >&2
+  echo "      Evidence ahead of any stamp means some writer had no nonce, so" >&2
+  echo "      part of this manifest is unattributable (#lzstalemanifest)." >&2
+  exit 1
+  ;;
+esac
+
+# THREE evidence channels share one file, plus the run-id stamp. A
+# corpus-relative fixture id can begin with neither `@` nor `#`, so every split
+# is a plain grep and needs no second manifest, no second environment variable,
+# and no second build.zig wiring.
 TAB=$'\t'
 SCENARIO_MARK="@scenario$TAB"
 PROSE_MARK="@prose$TAB"
-OPENED="$({ grep -v "^@" "$MANIFEST" || true; } | sort -u)"
+# `-e '^#'` as well as `-e '^@'`: a stamp line is not a fixture id, and leaving
+# it in OPENED would invent a fixture named after the nonce.
+OPENED="$({ grep -v -e "^@" -e "^#" "$MANIFEST" || true; } | sort -u)"
 # `fixture<TAB>scenario-id`, one line per scenario the suite actually replayed.
 SCENARIO_LEDGER="$({ grep "^$SCENARIO_MARK" "$MANIFEST" || true; } \
   | sed "s|^$SCENARIO_MARK||" | sort -u)"
