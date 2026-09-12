@@ -173,11 +173,25 @@ excuseScenario() {
 # a hole with an extra step rather than a legitimate use.
 MANIFEST="${LAZILY_CONFORMANCE_MANIFEST:-build/conformance-fixtures-loaded.txt}"
 
-if [ ! -s "$MANIFEST" ]; then
+if [ ! -e "$MANIFEST" ]; then
   echo "FAIL: no conformance manifest at $MANIFEST." >&2
   echo "      Run the suite with LAZILY_CONFORMANCE_MANIFEST set to an ABSOLUTE" >&2
   echo "      path (\`make test\` does) so the recorder attaches. An absent" >&2
   echo "      manifest is missing evidence, not evidence of absence." >&2
+  exit 1
+fi
+# Zero bytes and absent are different faults and used to share one message.
+# Splitting them is not cosmetic: the records check further down needs a file it
+# can read, and "the file is there and the suite wrote nothing into it" is the
+# state `make test`'s truncation manufactures, which is worth saying out loud.
+#
+# This is now a check on BYTES only, and bytes are no longer the same question as
+# evidence — see the records rung below (#lzstampsatisfiesnonempty).
+if [ ! -s "$MANIFEST" ]; then
+  echo "FAIL: the conformance manifest at $MANIFEST is EMPTY." >&2
+  echo "      \`make test\` truncates it before the suite and the recorder only" >&2
+  echo "      appends, so zero bytes means the suite ran with no recorder" >&2
+  echo "      attached. That is missing evidence, not evidence of absence." >&2
   exit 1
 fi
 # ---------------------------------------------------------------------------
@@ -193,9 +207,14 @@ fi
 # four OK rungs at exit 0.
 #
 # This binding's `make`/CI path is the NARROW case. `make test` truncates the
-# manifest before the suite and the recorder only appends, so a run that
-# produced nothing leaves an empty file and the `-s` check above already fails
-# it. And a zig test Run step cannot be a cache hit in the first place: every
+# manifest before the suite and the recorder only appends, so a run that wrote
+# NOTHING leaves a zero-byte file and the `-s` check above fails it. That was the
+# whole argument, and stamping cost it half its reach: a file carrying stamps and
+# no evidence is not zero bytes, so `-s` waves it through. The records rung below
+# is the other half, and it is the check that now carries the claim
+# (#lzstampsatisfiesnonempty).
+#
+# And a zig test Run step cannot be a cache hit in the first place: every
 # `zig build` invocation mints a random `--seed=0x...`, the build runner passes
 # it in each test Run step's argv (std.Build.Step.Run line ~249), and argv bytes
 # are hashed into that step's cache manifest — so `has_side_effects` is belt on
@@ -267,6 +286,53 @@ case "$FIRST_LINE" in
   exit 1
   ;;
 esac
+
+# ---------------------------------------------------------------------------
+# RECORDS, not BYTES: a stamp is not evidence (#lzstampsatisfiesnonempty)
+# ---------------------------------------------------------------------------
+#
+# The `-s` check above WAS the whole "the recorder produced evidence" claim: the
+# manifest is truncated before the suite and only appended to, so zero bytes
+# meant zero records. Stamping the file broke that implication in the same commit
+# that made the evidence datable. A manifest holding nothing but stamps is 42
+# bytes for one stamp, and 42 bytes satisfy `-s`.
+#
+# MEASURED, not reasoned about. A stamp-only file under the matching nonce
+# cleared `-s`, cleared both stamp gates, and reached the fixture rung, which
+# printed 138 "canonical fixture X was NOT opened" errors — each of them saying
+# "a runner may still name it in source while no longer reading it". So nothing
+# went green: the guard refused, and the positive-evidence floors would have
+# refused again. What was lost is the DIAGNOSIS. A run that recorded nothing at
+# all was reported as 138 separate replay regressions, which is the wrong
+# investigation to send someone on, and the comment above claimed the `-s` check
+# had already handled this case.
+#
+# So measure the thing the rungs below actually consume: lines that are not
+# stamps. Every evidence channel — bare fixture ids, `@scenario`, `@prose`,
+# `@block` — is one such line, so this is a floor under all of them at once and
+# not a fourth channel-specific count.
+#
+# `awk` with `index($0, pre) != 1` rather than a grep pipeline: `grep -c` exits 1
+# on a zero count, which under `set -o pipefail` aborts this script with no
+# message at all — the failure mode reports as a crash rather than as this
+# refusal. `index` is a literal search, so the prefix needs no regex quoting, and
+# `NF` drops blank lines without a second pass.
+RECORD_LINES="$(awk -v pre="$RUN_ID_PREFIX" \
+  'index($0, pre) != 1 && NF { n++ } END { print n + 0 }' "$MANIFEST")"
+STAMP_LINES="$(awk -v pre="$RUN_ID_PREFIX" \
+  'index($0, pre) == 1 { n++ } END { print n + 0 }' "$MANIFEST")"
+if [ "$RECORD_LINES" -eq 0 ]; then
+  echo "FAIL: $MANIFEST carries $STAMP_LINES run-id stamp(s) and NO evidence lines." >&2
+  echo "      wanted id: $RUN_ID" >&2
+  echo "      A stamp dates evidence; it is not evidence. Every rung below reads" >&2
+  echo "      this file for fixtures OPENED, scenarios REPLAYED, prose VERIFIED" >&2
+  echo "      and assertion blocks BOUND, and a stamped file with no records" >&2
+  echo "      makes all four populations empty while still satisfying the" >&2
+  echo "      byte-size check above. The suite attached the recorder and then" >&2
+  echo "      read nothing, or this file is not the one the suite wrote" >&2
+  echo "      (#lzstampsatisfiesnonempty)." >&2
+  exit 1
+fi
 
 # THREE evidence channels share one file, plus the run-id stamp. A
 # corpus-relative fixture id can begin with neither `@` nor `#`, so every split

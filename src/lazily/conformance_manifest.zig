@@ -676,6 +676,18 @@ fn append(id: []const u8) void {
     // status quo, because an empty-but-stamped manifest passes the `-s` check
     // that an empty one fails.
     //
+    // That last sentence is a hazard this stamp CREATED and not only a reason to
+    // keep the writer here (`#lzstampsatisfiesnonempty`). The guard's byte-size
+    // check on the manifest was carrying the "the recorder produced evidence"
+    // claim, and a stamp satisfies it. The guard now counts non-stamp lines as
+    // well, so that claim is asserted rather than implied by the truncation.
+    //
+    // This writer cannot produce such a file: the stamp is emitted lazily, from
+    // inside `append`, immediately before the evidence line that occasioned it,
+    // so every stamp it writes is followed by at least one record in the same
+    // call. A stamp-only manifest therefore means a stale copy, a hand-made file,
+    // or some other writer — which is what the guard's records rung now names.
+    //
     // Unset run id writes no stamp. That is not a silent pass: the guard
     // refuses a manifest carrying no stamp, so a suite run without the nonce
     // reports missing evidence rather than green.
@@ -1008,4 +1020,128 @@ test "conformance manifest: reads outside the corpus are not recorded" {
     var buf: [4096]u8 = undefined;
     const abs = toAbsolute("src/lazily/test/statechart/flat_cycle.json", &buf).?;
     try std.testing.expect(std.mem.indexOf(u8, abs, MARKER) == null);
+}
+
+/// The coverage guard, relative to the repo root (`#lzstampprefixdrift`).
+///
+/// Relative on purpose, and this is not the manifest's situation: the manifest
+/// path has to survive a WRITER started from anywhere, while this is a READ from
+/// a test binary, and every conformance replay in this repo already resolves the
+/// corpus through a relative `../lazily-spec/conformance`. If cwd were not the
+/// repo root, 138 fixtures would not open and nothing here would be green.
+const COVERAGE_GUARD_PATH = "scripts/check-conformance-coverage.sh";
+
+/// The guard's own spelling of the stamp prefix, taken from the guard source.
+///
+/// PARSED, not restated. Restating the literal here would make this test pass
+/// against a third copy of the string — one more place to drift rather than a fix
+/// for the two that already exist.
+///
+/// Exactly one assignment is required. Two would let the guard set the prefix
+/// twice and let this test agree with whichever it found first, which is the same
+/// defect one level down.
+/// Hand-rolled because the stdlib spelling is not stable across the three pinned
+/// toolchains: `std.mem.trimLeft`/`trimRight` exist on 0.15.2 and are gone on
+/// 0.16.0+ in favour of `trimStart`/`trimEnd`. A gate that only compiles on one
+/// of the pinned releases is not a gate (`#lzzigfmttoolchains`).
+fn trimBlankStart(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    return s[i..];
+}
+
+fn trimEndByte(s: []const u8, ch: u8) []const u8 {
+    var end = s.len;
+    while (end > 0 and s[end - 1] == ch) end -= 1;
+    return s[0..end];
+}
+
+fn guardRunIdPrefix(source: []const u8) ![]const u8 {
+    const assign = "RUN_ID_PREFIX=\"";
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw| {
+        const line = trimBlankStart(raw);
+        if (!std.mem.startsWith(u8, line, assign)) continue;
+        const rest = line[assign.len..];
+        const close = std.mem.indexOfScalar(u8, rest, '"') orelse
+            return error.GuardPrefixAssignmentUnterminated;
+        if (found != null) return error.GuardPrefixAssignedTwice;
+        found = rest[0..close];
+    }
+    return found orelse error.GuardPrefixAssignmentMissing;
+}
+
+test "conformance manifest: the guard and the recorder agree on the stamp prefix" {
+    // Two definitions of one string held together by a comment is the shape that
+    // drifts (`#lzstampprefixdrift`). This recorder WRITES the prefix; the
+    // coverage guard RECOGNISES it from its own `RUN_ID_PREFIX`. A drift between
+    // them fails closed — the guard finds no stamp and reports missing evidence —
+    // so nothing goes green, but the failure then reads as a stale-evidence bug in
+    // a protocol nobody touched instead of as the one-character typo it is. This
+    // test is what turns that into a named mismatch.
+    //
+    // NOT skippable. The guard is in THIS repo, so an unreadable one is a broken
+    // test, not an absent sibling checkout.
+    const source = (if (comptime builtin.zig_version.minor >= 16)
+        std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            COVERAGE_GUARD_PATH,
+            std.testing.allocator,
+            .limited(1024 * 1024),
+        )
+    else
+        std.fs.cwd().readFileAlloc(
+            std.testing.allocator,
+            COVERAGE_GUARD_PATH,
+            1024 * 1024,
+        )) catch |err| {
+        std.debug.print(
+            "could not read {s} from the test cwd ({s}); the stamp-prefix" ++
+                " coupling is then unverifiable, which is a failure and not a skip\n",
+            .{ COVERAGE_GUARD_PATH, @errorName(err) },
+        );
+        return err;
+    };
+    defer std.testing.allocator.free(source);
+
+    const guard_prefix = try guardRunIdPrefix(source);
+    std.testing.expectEqualStrings(RUN_ID_LINE_PREFIX, guard_prefix) catch |err| {
+        std.debug.print(
+            "the stamp prefix has DRIFTED.\n" ++
+                "  recorder RUN_ID_LINE_PREFIX: `{s}`\n" ++
+                "  guard    RUN_ID_PREFIX:      `{s}` ({s})\n" ++
+                "A manifest stamped with one and read with the other carries no stamp\n" ++
+                "the guard can see, so the guard reports missing evidence and the real\n" ++
+                "fault — these two strings — is never named (#lzstampprefixdrift).\n",
+            .{ RUN_ID_LINE_PREFIX, guard_prefix, COVERAGE_GUARD_PATH },
+        );
+        return err;
+    };
+
+    // The guard's python rung splits the manifest by matching `@block`
+    // POSITIVELY, so it never needs to know how a stamp is spelled and holds no
+    // copy of the prefix. That is a property to PIN, not a fact to recheck by
+    // hand: hand-write the literal into that heredoc — or anywhere else in the
+    // guard — and it becomes a third definition this test would not otherwise
+    // see. So the prefix's bytes may appear in the guard exactly ONCE, in the
+    // assignment compared above. Trailing space trimmed off the needle so the
+    // check does not turn on a detail of the guard's quoting.
+    const needle = trimEndByte(RUN_ID_LINE_PREFIX, ' ');
+    var occurrences: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, source, at, needle)) |hit| {
+        occurrences += 1;
+        at = hit + 1;
+    }
+    std.testing.expectEqual(@as(usize, 1), occurrences) catch |err| {
+        std.debug.print(
+            "`{s}` appears {d} time(s) in {s}; expected exactly 1, the" ++
+                " RUN_ID_PREFIX assignment. Every other use has to go through" ++
+                " the variable, or it is a fresh copy free to drift" ++
+                " (#lzstampprefixdrift).\n",
+            .{ needle, occurrences, COVERAGE_GUARD_PATH },
+        );
+        return err;
+    };
 }
