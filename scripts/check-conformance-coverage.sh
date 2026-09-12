@@ -861,6 +861,7 @@ for fixture in opened:
         expected_digests.add(hash_value(FNV_OFFSET, block))
 
 expected = len(expected_digests)
+declared_site_count = sum(len(sites) for sites in declared.values())
 
 if len(canonical) == 0:
     sys.stderr.write(
@@ -869,7 +870,7 @@ if len(canonical) == 0:
         % corpus
     )
     sys.exit(1)
-if expected == 0:
+if expected == 0 or expected_sites == 0:
     sys.stderr.write(
         "ERROR: %d opened fixtures in %s carry ZERO assertion blocks under the walk\n"
         "       in recordDeclaredBlocks(). An expectation of 0 is a green badge over\n"
@@ -877,8 +878,30 @@ if expected == 0:
     )
     sys.exit(1)
 
-# EQUALITY, not `>=`. A `>=` floor cannot see a shrink that stays above it, and
-# a shrink is exactly what a detached inventory looks like.
+# TWO dimensions, because a distinct-DIGEST count alone is one short
+# (#lzblocksitepin). The digest set is content-keyed, so a block whose content
+# recurs elsewhere in the corpus can be deleted outright and the digest count
+# does not move: deleting `stdlib/timer.json` scenarios[0].steps[0].expect —
+# `{"outcome": "pending", "deadline": 10}`, a shape several stdlib steps share —
+# left this rung GREEN when only digests were compared. Only a block with a
+# UNIQUE digest was visible. SITES are one per occurrence, so they see it.
+#
+# Both are derived from the corpus and both are EQUALITIES. A `>=` floor cannot
+# see a shrink that stays above it, and a shrink is exactly what a detached
+# inventory looks like.
+if declared_site_count != expected_sites:
+    direction = "FEWER than" if declared_site_count < expected_sites else "MORE than"
+    sys.stderr.write(
+        "ERROR: the runtime inventory declared %d assertion-block SITES, %s the %d\n"
+        "       derived from the corpus (%d of %d canonical fixtures opened). The\n"
+        "       distinct-digest count below can agree while this does not: a block\n"
+        "       whose content recurs elsewhere leaves the digest set unchanged when\n"
+        "       it is deleted, so sites are the dimension that sees it\n"
+        "       (#lzblocksitepin).\n"
+        % (declared_site_count, direction, expected_sites, len(opened), len(canonical))
+    )
+    sys.exit(1)
+
 if len(declared) != expected:
     direction = "FEWER than" if len(declared) < expected else "MORE than"
     sys.stderr.write(
@@ -907,18 +930,18 @@ if len(declared) != expected:
 
 print(
     "assertion-block bind OK: %d/%d assertion blocks carried by opened fixtures were"
-    " BOUND to a tracker (%d declared unbindable; %d expected, DERIVED from %d opened"
-    " of %d canonical fixtures — %d sites, every block name at every depth;"
-    " content-keyed, so a runner's"
-    " block NAME cannot satisfy it)"
+    " BOUND to a tracker (%d declared unbindable; %d distinct digests AND %d sites,"
+    " both DERIVED from %d opened of %d canonical fixtures and both asserted EQUAL,"
+    " every block name at every depth; content-keyed, so a runner's block NAME"
+    " cannot satisfy it)"
     % (
         len(declared),
         len(declared),
         len(excuses),
         expected,
+        expected_sites,
         len(opened),
         len(canonical),
-        expected_sites,
     )
 )
 PY_BLOCKS
