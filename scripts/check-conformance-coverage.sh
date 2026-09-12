@@ -677,6 +677,65 @@ if unbound:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
+# A CEILING on the ledger, because set equality alone has a hole (#lzledgerceiling)
+# ---------------------------------------------------------------------------
+#
+# Both directions above are EQUALITIES against the run: a declared block that no
+# runner bound and that nothing excuses fails, and an excuse whose site a runner
+# DOES bind fails as stale. That pair is strictly stronger than a count — and it
+# is still satisfied by ANY CONSISTENT PAIR. A commit that detaches N binds and
+# writes the N matching KNOWN_UNBOUND_BLOCKS entries agrees with itself in both
+# directions and passes. lazily-rs proved exactly that by dropping one `bound`
+# line and adding its matching entry (962923a).
+#
+# The magnitude rung below cannot see it either, and for a reason worth stating:
+# it compares the DECLARED inventory against the corpus, and a detached bind
+# leaves the block declared. `declared` does not move; only `bound` does. Every
+# derived equality in this file stays green.
+#
+# The fix is not a count of what IS excused — that would mirror the ledger, be
+# equal to it by construction, and add a second edit site that drifts: the
+# `MIN_BLOCKS = 31` defect in a new costume, and that constant is already retired
+# in the section below. No such mirroring count survives in this guard, and
+# MIN_FIXTURES / MIN_SCENARIOS are not one: they floor the OPENED and REPLAYED
+# populations, which is a corpus SHRINK no set equality in this file can see,
+# rather than pinning the size of a pending set. It is a CEILING on how much MAY
+# be. A ceiling is POLICY rather than measurement: it does not move
+# when the corpus moves, and it never needs re-pinning except deliberately, and
+# upward, in review. What it buys is that a regression and its excuse can no
+# longer land in the same commit unnoticed — raising this line is the explicit
+# act.
+#
+# It starts at this binding's CURRENT ledger size, so landing the ceiling is a
+# no-op and any GROWTH fails. It may only ever shrink. Every one of the 25
+# entries is a step past an EXPECTED_SKIPS stop in reactive_graph_conformance —
+# unreachable rather than unbindable — so the work is landing the merge-feed node
+# kind and the `drain_exhausted` key, after which this number goes to 0 and needs
+# no maintenance at all.
+#
+# Do NOT raise it to park a block a runner could bind today. That is the
+# laundering this guard exists to refuse.
+MAX_LEDGERED_BLOCKS = int(os.environ.get("MAX_LEDGERED_BLOCKS", "25"))
+if len(excuses) > MAX_LEDGERED_BLOCKS:
+    sys.stderr.write(
+        "ERROR: %d assertion-block site(s) are ledgered as unbound in\n"
+        "       KNOWN_UNBOUND_BLOCKS; the ceiling is %d. This ledger may only SHRINK.\n"
+        "       The set equality above only checks that the ledger and the run AGREE,\n"
+        "       which any consistent pair satisfies — a commit that detaches binds and\n"
+        "       writes the matching entries passes it in both directions, and the\n"
+        "       magnitude rung below cannot see it because a detached bind leaves the\n"
+        "       block DECLARED. This ceiling is what makes enlarging the excused set\n"
+        "       an explicit act instead of a side effect.\n"
+        "       Bind the block with `cj.AssertionKeys.init(where, block)`. Raise this\n"
+        "       line only for a block that CANNOT be bound, with a reason, and expect\n"
+        "       to be asked why the capability cannot exist:\n"
+        % (len(excuses), MAX_LEDGERED_BLOCKS)
+    )
+    for site, reason in sorted(excuses.items()):
+        sys.stderr.write("         %s: %s\n" % (site, reason))
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
 # Positive-evidence floor, DERIVED from the corpus (#lzvacuousrun, #lzblockfloorpin).
 # ---------------------------------------------------------------------------
 #
@@ -930,7 +989,9 @@ if len(declared) != expected:
 
 print(
     "assertion-block bind OK: %d/%d assertion blocks carried by opened fixtures were"
-    " BOUND to a tracker (%d declared unbindable; %d distinct digests AND %d sites,"
+    " BOUND to a tracker (%d ledgered unbound of at most %d — an EQUALITY against the"
+    " run in BOTH directions, under a CEILING that makes enlarging the ledger an"
+    " explicit act rather than a side effect; %d distinct digests AND %d sites,"
     " both DERIVED from %d opened of %d canonical fixtures and both asserted EQUAL,"
     " every block name at every depth; content-keyed, so a runner's block NAME"
     " cannot satisfy it)"
@@ -938,6 +999,7 @@ print(
         len(declared),
         len(declared),
         len(excuses),
+        MAX_LEDGERED_BLOCKS,
         expected,
         expected_sites,
         len(opened),
