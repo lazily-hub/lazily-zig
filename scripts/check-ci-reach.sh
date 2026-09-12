@@ -99,6 +99,31 @@
 #   note above records as having already cost lazily-cpp. It also bounds the
 #   honest claim here: a pin turns an invisible drop into a reviewable edit, and
 #   that swap is an equally reviewable edit that stays equally undetected.
+#
+#   TWO MORE THINGS A SET PIN STRUCTURALLY CANNOT SEE. Measured here rather than
+#   left implied, because an unstated limit reads as a covered case:
+#
+#     ORDER. A set has no order. Reordering `check:`'s prerequisite list keeps
+#     every count and the exit status identical; only the order of this guard's
+#     own `reached` lines changes, which gates nothing. In this binding list
+#     position is not what carries the ordering anyway: `conformance-coverage:
+#     test` is a real prerequisite edge, and MEASURED with `check:`'s list fully
+#     REVERSED, make still ran the suite — and its manifest truncation — before
+#     check-conformance-coverage.sh.
+#
+#     EDGES. The closure is a set of NODES, so dropping an edge BETWEEN two
+#     members is invisible whenever another member already pulls the dependency
+#     into the root's run. MEASURED: turning `conformance-coverage: test` into
+#     `conformance-coverage:` left this guard's output BYTE-IDENTICAL to healthy
+#     at exit 0. The node set is unchanged, because `test` is also a direct
+#     prerequisite of `check`; the oracle stays green, because `zig build test` is
+#     still among the commands make runs for the root. `make check` then keeps
+#     working by list position alone while `make conformance-coverage` on its own
+#     no longer runs the suite at all. What catches that is the evidence nonce
+#     rather than anything here, and it fails CLOSED: given an empty manifest, or
+#     none, check-conformance-coverage.sh exits 1 naming missing evidence —
+#     measured both ways. Reach and dependency correctness are different
+#     properties, and this guard only ever claimed the first.
 set -euo pipefail
 
 MAKE_BIN="${MAKE:-make}"
