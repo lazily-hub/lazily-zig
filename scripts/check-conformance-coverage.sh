@@ -732,19 +732,35 @@ if unbound:
 # is landing the merge-feed node kind and the `drain_exhausted` key, after which
 # this number goes to 0 and needs no maintenance at all.
 _ledger_pin = os.environ.get("EXPECTED_LEDGERED_BLOCKS", "25")
-try:
-    EXPECTED_LEDGERED_BLOCKS = int(_ledger_pin.strip())
-    if EXPECTED_LEDGERED_BLOCKS < 0:
-        raise ValueError(_ledger_pin)
-except ValueError:
+# ONE parse for the whole family (#lzpinparsestrict): a NON-EMPTY run of bare
+# ASCII digits `0`-`9`, and nothing else. Validated BEFORE any parse runs, and
+# deliberately stricter than both `int()` and `str.isdigit()`, because each of
+# those silently accepts a number nobody wrote: `int("1_0")` is 10 (PEP 515
+# separators), `int(" 7 ")` is 7, and `"\u0663".isdigit()` is true for the
+# Arabic-Indic three. This reader used to be `int(_ledger_pin.strip())`, so all
+# three got through. Refused now: whitespace around or inside, a leading `+` or
+# `-`, separators, a radix prefix, a float or an exponent, and any non-ASCII
+# digit. A negative falls out of the same check — no ledger size can equal it, so
+# it would make this rung unsatisfiable rather than exact. Leading zeros are fine
+# and `0` stays valid; this number goes to 0 when the merge-feed node kind and
+# `drain_exhausted` land.
+#
+# An UNSET variable takes the committed literal above. An EXPLICITLY EMPTY one is
+# a REJECTION, not a fall-through to it: `os.environ.get(NAME, DEFAULT)`
+# distinguishes the two, and whoever exported the wrong thing is the one person
+# who cannot see that it was ignored.
+if not _ledger_pin or _ledger_pin.strip("0123456789"):
     sys.stderr.write(
-        "ERROR: EXPECTED_LEDGERED_BLOCKS is %r, which is not a count of sites.\n"
-        "       This fails CLOSED rather than falling back to the committed default:\n"
-        "       an override that quietly reverted to the built-in would report OK\n"
-        "       against a pin nobody chose, which is the unexaminable green every\n"
-        "       rung here refuses (#lzvacuousrun).\n" % _ledger_pin
+        "ERROR: EXPECTED_LEDGERED_BLOCKS is %r, which is not a count of sites in bare\n"
+        "       ASCII digits (#lzpinparsestrict).\n"
+        "       This fails CLOSED rather than falling back to the committed default —\n"
+        "       not even for an empty value: an override that quietly reverted to the\n"
+        "       built-in would report OK against a pin nobody chose, which is the\n"
+        "       unexaminable green every rung here refuses (#lzvacuousrun).\n"
+        % _ledger_pin
     )
     sys.exit(1)
+EXPECTED_LEDGERED_BLOCKS = int(_ledger_pin)
 
 if len(excuses) != EXPECTED_LEDGERED_BLOCKS:
     if len(excuses) > EXPECTED_LEDGERED_BLOCKS:
