@@ -1302,7 +1302,27 @@ while IFS= read -r f; do
   case "$f" in */conformance_manifest.zig) continue ;; esac
   # Comments may legitimately quote the old form while explaining it; only code
   # that could BUILD a path counts, so skip `///` and `//!` doc lines.
-  if grep -v '^\s*//' "$f" | grep -qF "$needle"; then
+  #
+  # ONE awk, not `grep -v ... | grep -qF ...`. In that pipeline `grep -qF` exits
+  # on its first hit, the upstream `grep -v` is killed by SIGPIPE writing the
+  # rest, and `set -o pipefail` surfaces that SIGPIPE (141) as the PIPELINE's
+  # status — so a file whose non-comment text exceeds the 64KiB pipe buffer
+  # reports NO MATCH for a root it does spell. MEASURED: a 134KiB source with
+  # `const SPEC_DIR = "../lazily-spec/conformance/collections"` on line 2 gave
+  # PIPESTATUS=(141 0) and this rung printed OK and exited 0, deterministically,
+  # 40 runs out of 40. EIGHT sources under src/ are over that buffer today and
+  # the conformance runners are among them — the files most likely to spell a
+  # root. That is a false GREEN in the guard whose whole job is finding these:
+  # the same pipefail trap the fixture rung documents above, inverted, and the
+  # reason `grep -c` was rejected there too (#lzgrepcpipefail).
+  #
+  # One process has no pipe to break. `index` is a literal search, so the needle
+  # needs no regex quoting, and awk exits 0 only on a hit.
+  if awk -v needle="$needle" '
+      /^[[:space:]]*\/\// { next }
+      index($0, needle) { found = 1; exit }
+      END { exit found ? 0 : 1 }
+    ' "$f"; then
     offenders+=("$f")
   fi
 done < <(find src -name '*.zig' | sort)

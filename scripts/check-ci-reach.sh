@@ -485,6 +485,31 @@ excused_ok=0
 while IFS= read -r target; do
 	[ -n "$target" ] || continue
 
+	# `make -n` FAILING and a recipe with no checkable command produce the SAME
+	# empty output, and the "no gate" verdict below reads both as "carries no
+	# gate" — which exempts the target from CI reach entirely, on the header's
+	# reasoning that a recipe running nothing cannot hide a gate. That reasoning
+	# does not hold when the emptiness came from make refusing to describe the
+	# recipe. MEASURED: giving `test` a prerequisite no rule builds made
+	# `make -n test` exit 2, dropped BOTH `test` and `conformance-coverage` to
+	# "no gate" — the two targets carrying the whole conformance suite — and this
+	# guard still printed OK, over 5 reached targets instead of 7
+	# (#lzgrepcpipefail).
+	#
+	# dry_run's `|| true` is RIGHT for its grep: zero lines surviving the
+	# `make[`/`make:` filter is a legitimate measurement. It is WRONG for make,
+	# whose nonzero exit is the real signal, and one `|| true` covers both.
+	# dry_run cannot refuse there either — it only ever runs inside a command
+	# substitution, where `exit` leaves the subshell and the script carries on.
+	# So make's status is asserted HERE, in the main shell, where refusing works.
+	if ! "$MAKE_BIN" -n "$target" >/dev/null 2>&1; then
+		echo "check-ci-reach: \`$MAKE_BIN -n $target\` failed, so this target's recipe could not be read." >&2
+		echo "                An unreadable recipe yields zero commands, which reports as 'carrying no" >&2
+		echo "                gate' and exempts the target from CI reach — a gate hidden by a make error" >&2
+		echo "                rather than by an empty recipe." >&2
+		exit 1
+	fi
+
 	target_anchors="$(own_commands "$target" | anchors | sort -u || true)"
 
 	if [ -z "$target_anchors" ]; then
