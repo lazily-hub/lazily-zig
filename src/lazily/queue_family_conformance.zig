@@ -992,6 +992,43 @@ fn assertTopicState(model: anytype, expected: *cj.AssertionKeys, where: Str) !vo
     _ = try expected.assertObjectWithOpt("reads", ctx, C.reads);
 }
 
+/// What a TopicCell step's op actually produced, kept as three optionals so
+/// "produced nothing" stays distinguishable from "produced a zero value".
+const TopicReturn = struct {
+    /// `advance` moved no cursor: the one op in this family that can
+    /// legitimately report "no value".
+    is_null: bool,
+    string: ?Str,
+    count: ?usize,
+};
+
+/// Assert a step's `returns` against what the op produced.
+///
+/// Every arm requires the SHAPE the fixture spelled to have actually been
+/// produced. This used to supply a zero value for an absent one —
+/// `returned_string orelse ""`, `returned_usize orelse 0`, and a `.null` arm
+/// that accepted `returned_string == null` — so an op that returned NOTHING was
+/// read as a measurement (#lzflagcoercion). Measured on the corpus: with
+/// `returns` on the `advance` at `topiccell_offline_tail_bounds.json` rewritten
+/// from `"a"` to `0`, and the `gc`'s `1` rewritten to `""` or to `null`, all
+/// three replays stayed green while the fixture read as pinning a return this
+/// runner never even sampled. `replayWorkQueue` below always had this shape;
+/// this is the same refusal, spelled the same way.
+fn expectTopicReturn(want: Value, got: TopicReturn) !void {
+    switch (want) {
+        .null => if (!got.is_null) return error.ExpectedNullReturn,
+        .string => |s| try testing.expectEqualStrings(
+            s,
+            got.string orelse return error.ExpectedStringReturn,
+        ),
+        .integer, .number_string => try testing.expectEqual(
+            try cj.asUsize(want),
+            got.count orelse return error.ExpectedIntegerReturn,
+        ),
+        else => return error.UnsupportedReturnShape,
+    }
+}
+
 fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
     const allocator = testing.allocator;
     var parsed = (try cj.load(rel_path)) orelse return error.SkipZigTest;
@@ -1112,12 +1149,20 @@ fn replayTopic(comptime Model: type, rel_path: Str) !ReplayCount {
         try assertTopicState(model, &expected, where);
 
         if (cj.field(step, "returns")) |want| {
-            errdefer std.debug.print("returns mismatch at {s}\n", .{where});
-            switch (want) {
-                .null => try testing.expect(returned_is_null or returned_string == null),
-                .string => |s| try testing.expectEqualStrings(s, returned_string orelse ""),
-                else => try testing.expectEqual(try cj.asUsize(want), returned_usize orelse 0),
-            }
+            // The error NAME as well as the location. An early return here runs
+            // the `defer expected.finish()` above, whose panic over the
+            // now-unconsumed keys would otherwise be the only thing in the log.
+            expectTopicReturn(want, .{
+                .is_null = returned_is_null,
+                .string = returned_string,
+                .count = returned_usize,
+            }) catch |err| {
+                std.debug.print(
+                    "returns mismatch at {s}: {s}\n",
+                    .{ where, @errorName(err) },
+                );
+                return err;
+            };
         }
 
         // The reader-kind claim, both directions, per subscriber.

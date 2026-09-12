@@ -684,12 +684,18 @@ const FamilyCtx = struct {
 };
 
 fn familyKeySet(args: FamilyCtx, want_json: json.Value) anyerror!void {
-    const want_keys = want_json.array.items;
+    // `.array` / `.string` as bare union-field accesses, for the same reason
+    // `familyValueMember` below no longer spells `.bool` that way: a fixture of
+    // the wrong shape must be a named refusal in EVERY build mode, not
+    // safety-checked illegal behaviour that is unchecked under
+    // ReleaseFast/ReleaseSmall (#lzflagcoercion).
+    const want_keys = try cj.asArray(want_json);
     try std.testing.expectEqual(want_keys.len, args.keys.len);
     for (want_keys) |wk| {
+        const want_key = try cj.asStr(wk);
         var found = false;
         for (args.keys) |gk| {
-            if (std.mem.eql(u8, wk.string, suffixOf(gk))) {
+            if (std.mem.eql(u8, want_key, suffixOf(gk))) {
                 found = true;
                 break;
             }
@@ -714,6 +720,28 @@ fn familyValueMembers(args: FamilyCtx, members: *cj.AssertionKeys) anyerror!void
 }
 
 fn familyValueMember(args: FamilyCtx, want_json: json.Value) anyerror!void {
-    const got = stateBool(args.runtime.familyValueLww(args.namespace, args.key).?);
-    try std.testing.expectEqual(want_json.bool, got);
+    // Two refusals, both of which used to be a bare panic (#lzflagcoercion).
+    //
+    // `want_json.bool` is an access of the wrong union field for any fixture
+    // that does not spell a JSON boolean: safety-checked in Debug, and UNCHECKED
+    // undefined behaviour in ReleaseFast/ReleaseSmall — the same objection
+    // `#lzscenariobodyskip` raised against `unreachable` in a runner. `cj.asBool`
+    // requires the type in every build mode. Measured: `"2": "true"` in
+    // `target_values` panicked with `access of union field 'bool' while field
+    // 'string' is active`, naming neither the fixture nor the key.
+    //
+    // `.?` on `familyValueLww` read the ABSENCE of a family entry as a value to
+    // compare. A `target_values` key the target replica does not carry is the
+    // thing this scenario exists to detect, so it is named here rather than left
+    // to a null unwrap: `"ghost_key": false` panicked with `attempt to use null
+    // value`.
+    const state = args.runtime.familyValueLww(args.namespace, args.key) orelse {
+        std.debug.print(
+            "{s}: `target_values` names `{s}`, which the target replica does not " ++
+                "carry at all — an absent entry is not a value to compare\n",
+            .{ FAMILY_FIXTURE_REL, args.key },
+        );
+        return error.MissingFamilyEntry;
+    };
+    try std.testing.expectEqual(try cj.asBool(want_json), stateBool(state));
 }

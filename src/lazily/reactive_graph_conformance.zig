@@ -1321,7 +1321,7 @@ fn Engine(comptime Model: type) type {
         fn node(self: *Self, id: []const u8) !usize {
             return self.nodes.indexOf(id) catch {
                 std.debug.print(
-                    "  {s}/{s}{s}: op names unknown node `{s}`\n",
+                    "  {s}/{s}{s}: names unknown node `{s}`\n",
                     .{ Model.NAME, self.fixture, self.label, id },
                 );
                 return error.UnknownNodeId;
@@ -1552,9 +1552,16 @@ fn Engine(comptime Model: type) type {
             }
         }
 
-        fn readable(self: *Self, id: []const u8) bool {
-            const idx = self.nodes.indexOf(id) catch return false;
-            return self.model.readable(idx);
+        /// A node id the scenario never declared is an UNKNOWN, not an
+        /// unreadable node. `catch return false` conflated the two, so a
+        /// `readable` block naming a node this graph does not carry was
+        /// satisfied by its NON-EXISTENCE for every `false` expectation
+        /// (#lzflagcoercion) — measured by renaming `mid` to a nonexistent id in
+        /// `dispose_detaches_edges_both_directions.json`, which stayed green and
+        /// silently dropped the real assertion with it. `node()` is the same
+        /// refusal every op already takes, diagnostic included.
+        fn readable(self: *Self, id: []const u8) !bool {
+            return self.model.readable(try self.node(id));
         }
 
         /// Compare an effect-id list against the log slice, by node index.
@@ -1565,7 +1572,14 @@ fn Engine(comptime Model: type) type {
             var want_len: usize = 0;
             for (want) |w| {
                 const name = try asString(w);
-                const idx = self.nodes.indexOf(name) catch continue;
+                // `catch continue` here dropped an id naming a node the scenario
+                // never declared, and the comparison then ran against the
+                // SHORTENED expectation — so `"observed_by": ["<ghost>"]`
+                // against an empty log compared 0 against 0 and passed
+                // (#lzflagcoercion). The effects-only projection below is a
+                // deliberate filter over nodes that DO exist; an unknown id is
+                // not that, and `node()` names it.
+                const idx = try self.node(name);
                 if (effects_only and defs[idx].kind != .effect) continue;
                 want_buf[want_len] = idx;
                 want_len += 1;
@@ -1699,7 +1713,7 @@ fn Engine(comptime Model: type) type {
             };
             var k: [96]u8 = undefined;
             const sub = std.fmt.bufPrint(&k, "readable.{s}", .{m.id}) catch "readable";
-            m.engine.check(sub, m.engine.readable(m.id), want);
+            m.engine.check(sub, try m.engine.readable(m.id), want);
         }
 
         fn expectDegree(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
@@ -1958,7 +1972,7 @@ fn Engine(comptime Model: type) type {
                 fn check(engine: *Self, members: *cj.AssertionKeys) !void {
                     const map = try asObject(members.object);
                     for (try sortedKeys(map)) |id| {
-                        const got = engine.readable(id);
+                        const got = try engine.readable(id);
                         var k: [96]u8 = undefined;
                         engine.check(
                             std.fmt.bufPrint(&k, "final.readable.{s}", .{id}) catch "final.readable",

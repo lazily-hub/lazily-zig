@@ -339,6 +339,25 @@ fn Engine(comptime Model: type) type {
                     const key = e.key_ptr.*;
                     const after = self.model.handleStamp(key);
                     const before = self.stamps_before.get(key);
+                    // A key with no stamp on EITHER side never existed, and
+                    // "never existed" satisfied every `false` expectation for
+                    // free — the absence of the entry, not its handle's
+                    // instability, is what made the comparison pass
+                    // (#lzflagcoercion). Measured: renaming `b` to a key this
+                    // corpus does not carry and flipping the expectation to
+                    // `false` in `cellmap_atomic_move.json` stayed green, and
+                    // took the real `b` assertion away with it. Only `before ==
+                    // null` (added by this op) and `after == null` (removed by
+                    // it) are genuine instability.
+                    if (after == null and before == null) {
+                        std.debug.print(
+                            "{s} step {d}: `handle_stable` names `{s}`, which this map " ++
+                                "holds neither before nor after the op — absence is not " ++
+                                "a handle state to compare\n",
+                            .{ Model.FLAVOR, self.step, key },
+                        );
+                        return error.UnknownHandleKey;
+                    }
                     const stable = after != null and before != null and after.? == before.?;
                     try hs.assertKey(key, stable);
                 }
