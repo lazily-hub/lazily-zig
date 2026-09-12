@@ -458,6 +458,18 @@ pub fn build(b: *std.Build) void {
     // cached run skips the binary entirely and would leave the freshly
     // truncated manifest empty — reported downstream as missing evidence, which
     // is correct but useless. Collecting evidence requires actually running.
+    //
+    // NEVER set a secret-bearing variable here. `setEnvironmentVariable` clones
+    // this step's map from zig's own environment, and `failed command:` renders
+    // the child map DIFFED against the parent
+    // (std.Build.Step.allocPrintCmd) -- so an ambient variable is identical on
+    // both sides and stays hidden, while a variable this block introduces is
+    // printed in full. Those lines are not failures and appear on green runs,
+    // so anything set here is disclosed to every build log. A path is safe; a
+    // token is not. Corollary, because it is the opposite of the intuition: a
+    // caller-side `env -u TOKEN make check` MANUFACTURES the diff, because the
+    // scrub removes the variable from the parent while anything that
+    // re-injects it into the child makes it child-only (#lzzigenvsecretleak).
     if (conformance_manifest) |manifest_path| {
         for (run_test.dependencies.items) |dep| {
             // `Step` spells its kind `id` on 0.16.0 and `tag` on nightly. Both
