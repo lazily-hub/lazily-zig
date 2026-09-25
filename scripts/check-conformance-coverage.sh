@@ -58,6 +58,11 @@ fi
 # someone looked; shrinking this list is the work. Adding to it silently is how the
 # guard rots, so keep a reason with any new entry.
 KNOWN_UNCOVERED=(
+  # Phase 0 durable-owner contracts are not implemented in this binding.
+  "durable-owner/atomic_crash_boundary.json"
+  "durable-owner/inbox_outbox_deduplication.json"
+  "durable-owner/ordered_replay.json"
+  "durable-owner/projection_fingerprint.json"
   # Register CRDTs (LWW / MV / PnCounter + the CellCrdt projection bit) are
   # implemented here, but this binding has no canonical replay for the new
   # registers corpus yet; the Registers coverage row is `~` until it does.
