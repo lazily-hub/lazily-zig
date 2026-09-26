@@ -628,10 +628,9 @@ fi
 # These floors track WHAT CI ACTUALLY REPLAYS, exactly — no margin, no slack.
 # Re-pinned 2026-09-11 against lazily-spec `f89d865`, which carries the
 # `conformance/replay/` area this binding now replays (#lzreplayzig):
-# 138/156 fixtures OPENED, 151/151 scenarios REPLAYED. All three pinned
+# 139/157 fixtures OPENED after adding the durable-client replay. All three pinned
 # toolchains (0.15.2 / 0.16.0 / master) report the same two numbers locally —
-# 0.15.2 skips four tests and opens the same fixtures. Each is EXACT — 139 and
-# 152 both fail.
+# 0.15.2 skips four tests and opens the same fixtures.
 #
 # Re-verified 2026-09-11 against lazily-spec `4010d99` (#lzreplayframing): that
 # commit added three STEPS to `replay/canonical_encoding_equality.json` and no
@@ -659,7 +658,7 @@ fi
 # An upstream fixture that lands without a zig runner raises `total` and leaves
 # `covered` alone, so it does not trip MIN_FIXTURES; only a replay that STOPS
 # running does.
-MIN_FIXTURES="${MIN_FIXTURES:-138}"
+MIN_FIXTURES="${MIN_FIXTURES:-139}"
 MIN_SCENARIOS="${MIN_SCENARIOS:-151}"
 
 if [ "$total" -eq 0 ]; then
