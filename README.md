@@ -396,3 +396,8 @@ language and held to the same behaviour by a shared conformance corpus.
 | **lazily-zig** | Zig — you are here |
 | [lazily-dart](https://github.com/lazily-hub/lazily-dart) | Dart / Flutter |
 | [lazily-react](https://github.com/lazily-hub/lazily-react) | React / Preact bindings layered over [lazily-js](https://github.com/lazily-hub/lazily-js) — not a separate language binding |
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).
