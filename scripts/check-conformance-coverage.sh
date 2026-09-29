@@ -658,8 +658,8 @@ fi
 # An upstream fixture that lands without a zig runner raises `total` and leaves
 # `covered` alone, so it does not trip MIN_FIXTURES; only a replay that STOPS
 # running does.
-MIN_FIXTURES="${MIN_FIXTURES:-139}"
-MIN_SCENARIOS="${MIN_SCENARIOS:-151}"
+MIN_FIXTURES="${MIN_FIXTURES:-140}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-156}"
 
 if [ "$total" -eq 0 ]; then
   echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2

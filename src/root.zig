@@ -170,6 +170,16 @@ pub const ReplayObservation = replay.Observation;
 pub const canonicalReplayBytes = replay.canonicalBytes;
 pub const canonicalReplayDigest = replay.canonicalDigest;
 pub const replay_conformance = @import("./lazily/replay_conformance.zig");
+// Cross-adapter consumer simulation conformance testkit. The public world seam
+// is evidence-only (identity, steps, trace), not a scheduler port.
+pub const sim_consumer_testkit = @import("./lazily/sim_consumer_testkit.zig");
+pub const SimConsumerTestkit = sim_consumer_testkit.Testkit;
+pub const SimConsumerTestkitSpec = sim_consumer_testkit.Spec;
+pub const SimConsumerAdapter = sim_consumer_testkit.Adapter;
+pub const SimConsumerAdapterKind = sim_consumer_testkit.AdapterKind;
+pub const SimConsumerAction = sim_consumer_testkit.Action;
+pub const SimGeneratedConsumerScenario = sim_consumer_testkit.GeneratedScenario;
+pub const sim_consumer_conformance = @import("./lazily/sim_consumer_conformance.zig");
 pub const reactive_map = @import("./lazily/reactive_map.zig");
 pub const dependency_map = @import("./lazily/dependency_map.zig");
 pub const ReactiveMap = reactive_map.ReactiveMap;
