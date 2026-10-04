@@ -746,3 +746,36 @@ test "lazily/msgpack: array and map headers survive their width boundaries" {
         try testing.expect(up.eof());
     }
 }
+
+test "lazily/msgpack: QueuePush/QueuePop/QueueClose round-trip with named fields (#lzdeltaqueueops)" {
+    const ops = [_]ipc.DeltaOp{
+        ipc.DeltaOp.queuePush(6, ipc.IpcValue.fromInline(&.{97})),
+        ipc.DeltaOp.queuePop(6),
+        ipc.DeltaOp.queueClose(6),
+    };
+    const message = ipc.IpcMessage{ .Delta = ipc.Delta.init(4, 5, &ops) };
+
+    const Check = struct {
+        fn run(_: void, decoded: ipc.IpcMessage, view: Value) !void {
+            const out = decoded.Delta.ops;
+            try testing.expectEqual(@as(usize, 3), out.len);
+            try testing.expectEqual(@as(ipc.NodeId, 6), out[0].QueuePush.node);
+            try testing.expectEqualSlices(u8, &.{97}, out[0].QueuePush.payload.Inline);
+            try testing.expectEqual(@as(ipc.NodeId, 6), out[1].QueuePop.node);
+            try testing.expectEqual(@as(ipc.NodeId, 6), out[2].QueueClose.node);
+
+            const body = try envelopeBody(view);
+            const encoded_ops = (try requiredField(body, "ops")).array.items;
+            const names = [_][]const u8{ "QueuePush", "QueuePop", "QueueClose" };
+            for (encoded_ops, names) |encoded, name| {
+                try testing.expectEqualStrings(name, try envelopeKey(encoded));
+                const op_body = try envelopeBody(encoded);
+                try testing.expect(hasField(op_body, "node"));
+            }
+            try testing.expect(hasField(try envelopeBody(encoded_ops[0]), "payload"));
+            try testing.expectEqual(@as(usize, 1), (try envelopeBody(encoded_ops[1])).object.count());
+            try testing.expectEqual(@as(usize, 1), (try envelopeBody(encoded_ops[2])).object.count());
+        }
+    };
+    try expectRoundTrip(message, {}, Check.run);
+}

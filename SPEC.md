@@ -150,7 +150,12 @@ the canonical `lazily-spec` JSON representation:
 - `NodeState` is `Payload`, `SharedBlob`, or `Opaque`
 - `Delta` carries `base_epoch`, `epoch`, and ordered `DeltaOp` values
 - `DeltaOp` includes `CellSet`, `SlotValue`, `Invalidate`, `NodeAdd`,
-  `NodeRemove`, `EdgeAdd`, and `EdgeRemove`
+  `NodeRemove`, `EdgeAdd`, and `EdgeRemove`, plus the QueueCell op-log shell
+  ops `QueuePush` (`node`, `payload`), `QueuePop` (`node`), and `QueueClose`
+  (`node`). Queue ops are read-filtered and blob-spilled like `CellSet`;
+  `StateGraphMirror` refuses a delta carrying one
+  (`error.QueueOpRequiresQueueProjection`) because applying it needs a queue
+  projection adapter
 
 `Delta.isNextAfter(last_epoch)` and `Delta.applyStatus(last_epoch)` enforce the
 spec epoch rule: a delta applies only when `base_epoch == last_epoch` and

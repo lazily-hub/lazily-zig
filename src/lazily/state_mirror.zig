@@ -100,7 +100,16 @@ pub const StateGraphMirror = struct {
     /// advances to `delta.epoch`. `Invalidate` is a no-op on the mirror — the
     /// derived recompute is consumer-side; the mirror keeps the stale payload
     /// until a fresh `CellSet`/`SlotValue` arrives.
+    ///
+    /// QueueCell op-log ops (`QueuePush`/`QueuePop`/`QueueClose`,
+    /// `#lzdeltaqueueops`) require a queue projection adapter; this
+    /// graph-state projection cannot apply them, so a delta carrying one is
+    /// REFUSED with `error.QueueOpRequiresQueueProjection` before any op is
+    /// applied (the mirror is left unchanged), never silently dropped.
     pub fn applyDelta(self: *StateGraphMirror, delta: ipc.Delta) !void {
+        for (delta.ops) |op| {
+            if (op.isQueueOp()) return error.QueueOpRequiresQueueProjection;
+        }
         for (delta.ops) |op| {
             switch (op) {
                 .NodeAdd => |na| {
@@ -166,6 +175,8 @@ pub const StateGraphMirror = struct {
                         }
                     }
                 },
+                // Refused by the pre-scan above; unreachable here.
+                .QueuePush, .QueuePop, .QueueClose => unreachable,
             }
         }
         if (delta.epoch > self.epoch) self.epoch = delta.epoch;
@@ -273,4 +284,39 @@ test "lazily/state_mirror: invalidate is a no-op (payload kept stale)" {
     }));
     // Invalidate did not clear the payload — consumer recompute is plugin-side.
     try std.testing.expectEqualSlices(u8, &.{42}, mirror.payloadOf(1).?);
+}
+
+test "lazily/state_mirror: queue op-log ops are refused, mirror unchanged (#lzdeltaqueueops)" {
+    const allocator = std.testing.allocator;
+    var mirror = StateGraphMirror.init(allocator);
+    defer mirror.deinit();
+
+    try mirror.applySnapshot(ipc.Snapshot.init(
+        1,
+        &.{.{ .node = 1, .type_tag = "t", .state = ipc.NodeState.fromPayload(&.{42}) }},
+        &.{},
+        &.{1},
+    ));
+    const queue_ops = [_]ipc.DeltaOp{
+        ipc.DeltaOp.queuePush(1, ipc.IpcValue.fromInline(&.{97})),
+        ipc.DeltaOp.queuePop(1),
+        ipc.DeltaOp.queueClose(1),
+    };
+    for (queue_ops) |qop| {
+        // A graph op ahead of the queue op must NOT be applied either: the
+        // refusal is for the whole delta.
+        try std.testing.expectError(
+            error.QueueOpRequiresQueueProjection,
+            mirror.applyDelta(ipc.Delta.init(1, 2, &.{
+                .{ .CellSet = .{ .node = 1, .payload = ipc.IpcValue.fromInline(&.{7}) } },
+                qop,
+            })),
+        );
+        try std.testing.expectEqual(@as(u64, 1), mirror.epoch);
+        try std.testing.expectEqualSlices(u8, &.{42}, mirror.payloadOf(1).?);
+    }
+    try std.testing.expectError(
+        error.QueueOpRequiresQueueProjection,
+        mirror.apply(.{ .Delta = ipc.Delta.init(1, 2, &queue_ops) }),
+    );
 }

@@ -727,6 +727,14 @@ pub const DeltaOp = union(enum) {
     NodeRemove: NodeOnlyOp,
     EdgeAdd: EdgeSnapshot,
     EdgeRemove: EdgeSnapshot,
+    /// QueueCell op-log shell ops (`#queue-oplog`, `#lzdeltaqueueops`): append
+    /// to a queue's tail. Same body shape as `CellSet`.
+    QueuePush: NodeValueOp,
+    /// Remove a queue's head. No value: the popped item is determined by
+    /// replay. Same body shape as `Invalidate`.
+    QueuePop: NodeOnlyOp,
+    /// Close a queue (idempotent, terminal). Same body shape as `Invalidate`.
+    QueueClose: NodeOnlyOp,
 
     pub const NodeValueOp = struct {
         node: NodeId,
@@ -760,6 +768,27 @@ pub const DeltaOp = union(enum) {
         return .{ .NodeRemove = .{ .node = node } };
     }
 
+    pub fn queuePush(node: NodeId, payload: IpcValue) DeltaOp {
+        return .{ .QueuePush = .{ .node = node, .payload = payload } };
+    }
+
+    pub fn queuePop(node: NodeId) DeltaOp {
+        return .{ .QueuePop = .{ .node = node } };
+    }
+
+    pub fn queueClose(node: NodeId) DeltaOp {
+        return .{ .QueueClose = .{ .node = node } };
+    }
+
+    /// True for the QueueCell op-log shell ops. A graph-state projection
+    /// cannot apply these; it needs a queue projection adapter.
+    pub fn isQueueOp(self: DeltaOp) bool {
+        return switch (self) {
+            .QueuePush, .QueuePop, .QueueClose => true,
+            .CellSet, .SlotValue, .Invalidate, .NodeAdd, .NodeRemove, .EdgeAdd, .EdgeRemove => false,
+        };
+    }
+
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) !DeltaOp {
         const tagged = try singleField(value);
         if (std.mem.eql(u8, tagged.name, "CellSet")) {
@@ -790,6 +819,15 @@ pub const DeltaOp = union(enum) {
         }
         if (std.mem.eql(u8, tagged.name, "EdgeRemove")) {
             return .{ .EdgeRemove = try EdgeSnapshot.fromJson(tagged.value) };
+        }
+        if (std.mem.eql(u8, tagged.name, "QueuePush")) {
+            return .{ .QueuePush = try parseNodeValueOp(allocator, tagged.value) };
+        }
+        if (std.mem.eql(u8, tagged.name, "QueuePop")) {
+            return .{ .QueuePop = try parseNodeOnlyOp(tagged.value) };
+        }
+        if (std.mem.eql(u8, tagged.name, "QueueClose")) {
+            return .{ .QueueClose = try parseNodeOnlyOp(tagged.value) };
         }
         return error.UnknownDeltaOp;
     }
@@ -849,6 +887,18 @@ pub const DeltaOp = union(enum) {
             .EdgeRemove => |edge| {
                 try jw.objectField("EdgeRemove");
                 try jw.write(edge);
+            },
+            .QueuePush => |op| {
+                try jw.objectField("QueuePush");
+                try jw.write(op);
+            },
+            .QueuePop => |op| {
+                try jw.objectField("QueuePop");
+                try jw.write(op);
+            },
+            .QueueClose => |op| {
+                try jw.objectField("QueueClose");
+                try jw.write(op);
             },
         }
         try jw.endObject();
@@ -1554,11 +1604,23 @@ fn assertDecodedClaims(keys: *cj.AssertionKeys, message: IpcMessage) !void {
                 tag_info.field_names.len
             else
                 tag_info.fields.len;
+            //
+            // The claim is over the seven GRAPH-STATE variants: the fixture
+            // carrying it (`delta_sequential.json`) says "all 7 DeltaOp
+            // variants" and predates the QueueCell op-log shell ops
+            // (`#lzdeltaqueueops`), which a queue projection adapter applies
+            // and the codec round-trip fixtures cover. Counting the queue tags
+            // here would flip a true claim false without the fixture changing.
             var seen: [variant_count]bool = @splat(false);
             for (delta.ops) |op| seen[@intFromEnum(std.meta.activeTag(op))] = true;
             var all_variants = true;
-            for (seen) |present| {
-                if (!present) all_variants = false;
+            for (seen, 0..) |present, tag_index| {
+                const tag: std.meta.Tag(DeltaOp) = @enumFromInt(tag_index);
+                const is_queue_tag = switch (tag) {
+                    .QueuePush, .QueuePop, .QueueClose => true,
+                    .CellSet, .SlotValue, .Invalidate, .NodeAdd, .NodeRemove, .EdgeAdd, .EdgeRemove => false,
+                };
+                if (!is_queue_tag and !present) all_variants = false;
             }
             _ = try keys.assertKeyOpt("has_all_op_variants", all_variants);
             // `resync_after_epoch_10`: applied on top of epoch 10, this delta
@@ -2190,4 +2252,58 @@ test "lazily/ipc: CrdtSync filter_readable drops non-readable ops" {
     defer allocator.free(filtered.ops);
     try std.testing.expectEqual(@as(usize, 1), filtered.ops.len);
     try std.testing.expectEqual(@as(NodeId, 10), filtered.ops[0].node);
+}
+
+test "lazily/ipc: QueuePush/QueuePop/QueueClose round-trip through the json codec (#lzdeltaqueueops)" {
+    const allocator = std.testing.allocator;
+    const wire =
+        \\{"Delta":{"base_epoch":4,"epoch":5,"ops":[{"QueuePush":{"node":6,"payload":{"Inline":[97]}}},{"QueuePop":{"node":6}},{"QueueClose":{"node":6}}]}}
+    ;
+    var parsed = try IpcMessage.decodeJson(allocator, wire);
+    defer parsed.deinit();
+    const ops = parsed.message.Delta.ops;
+    try std.testing.expectEqual(@as(usize, 3), ops.len);
+    try std.testing.expectEqual(@as(NodeId, 6), ops[0].QueuePush.node);
+    try std.testing.expectEqualSlices(u8, &.{97}, ops[0].QueuePush.payload.Inline);
+    try std.testing.expectEqual(@as(NodeId, 6), ops[1].QueuePop.node);
+    try std.testing.expectEqual(@as(NodeId, 6), ops[2].QueueClose.node);
+    for (ops) |op| try std.testing.expect(op.isQueueOp());
+
+    // Re-encode is byte-identical to the canonical wire, then decodes again.
+    const encoded = try parsed.message.encodeJsonAlloc(allocator);
+    defer allocator.free(encoded);
+    try std.testing.expectEqualStrings(wire, encoded);
+    var again = try IpcMessage.decodeJson(allocator, encoded);
+    defer again.deinit();
+    try std.testing.expectEqual(@as(NodeId, 6), again.message.Delta.ops[2].QueueClose.node);
+
+    // Constructors build the same frame.
+    const built = IpcMessage{ .Delta = Delta.init(4, 5, &.{
+        DeltaOp.queuePush(6, IpcValue.fromInline(&.{97})),
+        DeltaOp.queuePop(6),
+        DeltaOp.queueClose(6),
+    }) };
+    const built_json = try built.encodeJsonAlloc(allocator);
+    defer allocator.free(built_json);
+    try std.testing.expectEqualStrings(wire, built_json);
+}
+
+test "lazily/ipc: graph ops are not queue ops (#lzdeltaqueueops)" {
+    try std.testing.expect(!DeltaOp.cellSet(1, IpcValue.fromInline(&.{1})).isQueueOp());
+    try std.testing.expect(!DeltaOp.invalidate(1).isQueueOp());
+    try std.testing.expect(!DeltaOp.nodeRemove(1).isQueueOp());
+}
+
+test "lazily/ipc: malformed queue op bodies are rejected (#lzdeltaqueueops)" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { wire: []const u8, err: anyerror }{
+        .{ .wire = "{\"Delta\":{\"base_epoch\":0,\"epoch\":1,\"ops\":[{\"QueuePush\":{\"payload\":{\"Inline\":[1]}}}]}}", .err = error.MissingField },
+        .{ .wire = "{\"Delta\":{\"base_epoch\":0,\"epoch\":1,\"ops\":[{\"QueuePush\":{\"node\":6}}]}}", .err = error.MissingField },
+        .{ .wire = "{\"Delta\":{\"base_epoch\":0,\"epoch\":1,\"ops\":[{\"QueuePop\":{}}]}}", .err = error.MissingField },
+        .{ .wire = "{\"Delta\":{\"base_epoch\":0,\"epoch\":1,\"ops\":[{\"QueueClose\":{\"nod\":6}}]}}", .err = error.MissingField },
+        .{ .wire = "{\"Delta\":{\"base_epoch\":0,\"epoch\":1,\"ops\":[{\"QueuePeek\":{\"node\":6}}]}}", .err = error.UnknownDeltaOp },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.err, IpcMessage.decodeJson(allocator, case.wire));
+    }
 }

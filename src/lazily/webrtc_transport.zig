@@ -172,6 +172,12 @@ fn opNode(op: ipc.DeltaOp) ?ipc.NodeId {
         .Invalidate => |e| e.node,
         .NodeAdd => |e| e.node,
         .NodeRemove => |e| e.node,
+        // QueueCell op-log shell ops are node-scoped exactly like
+        // `CellSet`/`Invalidate`: a peer that cannot read the queue node never
+        // sees its pushes, pops, or close (`#lzdeltaqueueops`).
+        .QueuePush => |e| e.node,
+        .QueuePop => |e| e.node,
+        .QueueClose => |e| e.node,
         .EdgeAdd, .EdgeRemove => null,
     };
 }
@@ -352,4 +358,35 @@ test "lazily/webrtc_transport: WebRtcSource recv returns null when idle" {
     defer p.a.deinitPair();
     var src = WebRtcSource.init(p.b.channel());
     try std.testing.expect((try src.recv(allocator)) == null);
+}
+
+test "lazily/webrtc_transport: WebRtcSink filters queue op-log ops by read permission (#lzdeltaqueueops)" {
+    const allocator = std.testing.allocator;
+    var perms = permission.PeerPermissions.init(allocator);
+    defer perms.deinit();
+    try perms.grant(2, 10, .read); // peer 2 can read queue node 10 only
+
+    var p = try InMemoryDataChannel.pair(allocator);
+    defer p.a.deinitPair();
+    var sink = WebRtcSink.init(p.a.channel(), &perms, 2);
+
+    const msg = ipc.IpcMessage{ .Delta = ipc.Delta.init(0, 1, &.{
+        ipc.DeltaOp.queuePush(10, ipc.IpcValue.fromInline(&.{1})),
+        ipc.DeltaOp.queuePush(20, ipc.IpcValue.fromInline(&.{2})),
+        ipc.DeltaOp.queuePop(20),
+        ipc.DeltaOp.queuePop(10),
+        ipc.DeltaOp.queueClose(20),
+        ipc.DeltaOp.queueClose(10),
+    }) };
+    try sink.send(allocator, msg);
+
+    var src = WebRtcSource.init(p.b.channel());
+    var parsed = (try src.recv(allocator)).?;
+    defer parsed.deinit();
+    const ops = parsed.message.Delta.ops;
+    try std.testing.expectEqual(@as(usize, 3), ops.len);
+    try std.testing.expectEqual(@as(ipc.NodeId, 10), ops[0].QueuePush.node);
+    try std.testing.expectEqualSlices(u8, &.{1}, ops[0].QueuePush.payload.Inline);
+    try std.testing.expectEqual(@as(ipc.NodeId, 10), ops[1].QueuePop.node);
+    try std.testing.expectEqual(@as(ipc.NodeId, 10), ops[2].QueueClose.node);
 }

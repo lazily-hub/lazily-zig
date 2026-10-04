@@ -1324,7 +1324,10 @@ const GraphModel = struct {
         for (d.ops) |op| switch (op) {
             .CellSet => |o| try self.setNode(o.node, o.payload.Inline),
             .SlotValue => |o| try self.setNode(o.node, o.payload.Inline),
-            else => {},
+            .Invalidate, .NodeAdd, .NodeRemove, .EdgeAdd, .EdgeRemove => {},
+            // A graph-value model cannot apply queue op-log ops; refuse rather
+            // than drop them (`#lzdeltaqueueops`).
+            .QueuePush, .QueuePop, .QueueClose => return error.QueueOpRequiresQueueProjection,
         };
     }
     fn applySnapshot(self: *GraphModel, s: Snapshot) !void {

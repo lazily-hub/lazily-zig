@@ -524,7 +524,7 @@ pub const SpilledMessage = struct {
 };
 
 /// Spill large payloads across an `IpcMessage`'s value/state sites — `Snapshot`
-/// node states, `Delta` `CellSet`/`SlotValue` payloads + `NodeAdd` states, and
+/// node states, `Delta` `CellSet`/`SlotValue`/`QueuePush` payloads + `NodeAdd` states, and
 /// `CrdtSync` op states. The message stays small on the wire; sites already
 /// carrying a descriptor are left untouched. The input is not mutated; the
 /// returned message shares unspilled substructure and owns one fresh array (free
@@ -566,12 +566,20 @@ pub fn spillMessage(
                         v.payload = r.value;
                         total += r.spilled;
                     },
+                    // A queue push carries an `IpcValue` exactly like `CellSet`
+                    // and spills exactly like it (`#lzdeltaqueueops`).
+                    .QueuePush => |*v| {
+                        const r = spillValue(v.payload, backend, threshold);
+                        v.payload = r.value;
+                        total += r.spilled;
+                    },
                     .NodeAdd => |*v| {
                         const r = spillState(v.state, backend, threshold);
                         v.state = r.value;
                         total += r.spilled;
                     },
-                    else => {},
+                    // No value/state site: nothing to spill.
+                    .Invalidate, .NodeRemove, .EdgeAdd, .EdgeRemove, .QueuePop, .QueueClose => {},
                 }
             }
             var out = delta;
@@ -824,4 +832,43 @@ test "transport: ShmBackend cross-mapping resolves descriptors zero-copy" {
     var opener = try ShmBackend.open(testing.allocator, name);
     defer opener.deinit();
     try testing.expect(viewEql(opener.backend().readView(desc), payload));
+}
+
+test "transport: spillMessage spills and resolves a QueuePush payload like CellSet (#lzdeltaqueueops)" {
+    var b = try InProcessBackend.initCapacity(testing.allocator, 1 << 16);
+    defer b.deinit();
+    const backend = b.backend();
+
+    const big: [1024]u8 = @splat('q');
+    const ops = [_]DeltaOp{
+        DeltaOp.queuePush(6, IpcValue.fromInline(&big)),
+        DeltaOp.queuePush(6, IpcValue.fromInline("small")),
+        DeltaOp.queuePop(6),
+        DeltaOp.queueClose(6),
+    };
+    const message = IpcMessage{ .Delta = ipc.Delta.init(0, 1, &ops) };
+
+    var spilled = try spillMessage(testing.allocator, message, backend, 512);
+    defer spilled.deinit();
+
+    try testing.expectEqual(@as(usize, big.len), spilled.spilled);
+    const out = spilled.message.Delta;
+    try testing.expect(out.ops[0].QueuePush.payload == .SharedBlob); // big → spilled
+    try testing.expect(out.ops[1].QueuePush.payload == .Inline); // small → inline
+    try testing.expectEqual(@as(ipc.NodeId, 6), out.ops[2].QueuePop.node);
+    try testing.expectEqual(@as(ipc.NodeId, 6), out.ops[3].QueueClose.node);
+    try testing.expect(viewEql(resolveValue(out.ops[0].QueuePush.payload, backend), &big));
+    var router = BlobRouter.init();
+    _ = router.register(backend);
+    try testing.expect(viewEql(router.resolve(out.ops[0].QueuePush.payload), &big));
+    try testing.expect(message.Delta.ops[0].QueuePush.payload == .Inline);
+
+    // The spilled descriptor survives the wire codec.
+    const frame = try spilled.message.encodeJsonAlloc(testing.allocator);
+    defer testing.allocator.free(frame);
+    var parsed = try IpcMessage.decodeJson(testing.allocator, frame);
+    defer parsed.deinit();
+    const wire_payload = parsed.message.Delta.ops[0].QueuePush.payload;
+    try testing.expect(wire_payload == .SharedBlob);
+    try testing.expect(viewEql(resolveValue(wire_payload, backend), &big));
 }
