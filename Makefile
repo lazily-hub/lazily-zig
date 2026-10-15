@@ -32,7 +32,8 @@ test \
 test-interop-peer \
 test-lean-formal \
 assertion-ordering-check \
-ci-reach
+	ci-reach \
+	core-conformance-report
 
 check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach
 
@@ -114,3 +115,8 @@ conformance-coverage: test
 # run it too or this target reports itself missing.
 ci-reach:
 	./scripts/check-ci-reach.sh
+
+# Emits an observed Core report at LAZILY_CORE_REPORT_PATH and fresh assertion
+# evidence beneath LAZILY_CORE_REPORTS_ROOT/zig.
+core-conformance-report:
+	python3 scripts/generate-core-conformance-report.py

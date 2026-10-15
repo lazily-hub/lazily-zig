@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "profile_id": "core-v1",
+  "binding_id": "zig",
+  "report_command": [
+    "python3",
+    "scripts/generate-core-conformance-report.py"
+  ],
+  "runtime_skips": [
+    {
+      "fixture": "reactive-graph/feedback_drain_bound_reports_exhaustion.json",
+      "scenario": "*",
+      "reason": "The reactive scheduler has no bounded-drain exhaustion result; replaying this divergent fixture would not terminate."
+    },
+    {
+      "fixture": "reactive-graph/failed_compute_is_never_cached.json",
+      "scenario": "*",
+      "execution_flavor": "thread_safe",
+      "reason": "ThreadSafeContext.ComputeFn returns a plain value and cannot express a failing computation."
+    },
+    {
+      "fixture": "reactive-graph/failed_compute_is_never_cached.json",
+      "scenario": "*",
+      "execution_flavor": "async",
+      "reason": "AsyncContext has no lazy derived-slot mode, so the armed failure is consumed by the invalidating write instead of the fixture's read."
+    },
+    {
+      "fixture": "reactive-graph/dispose_signal_reverts_to_lazy.json",
+      "scenario": "*",
+      "execution_flavor": "async",
+      "reason": "AsyncContext currently recomputes the reverted signal once eagerly after publish; the runner records the computes_of divergence."
+    }
+  ],
+  "fixtureless_claims": [
+    {
+      "id": "c_abi_ffi_boundary",
+      "proof_classes": [
+        "native_artifact_consumer"
+      ],
+      "command": [
+        "python3",
+        "scripts/prove-core-c-abi.py"
+      ]
+    }
+  ]
+}

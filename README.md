@@ -68,6 +68,14 @@ mark is backed by deterministic in-source replay of the corresponding
 `../lazily-spec/conformance` fixture; the queue family additionally enforces
 its full 3×3 structure and replay coverage through the flavor ledger.
 
+`scripts/core-conformance.json` declares the `core-v1` report command. It
+replays the 16 Core fixtures across the synchronous, thread-safe, and async
+contexts, records declared skips explicitly, and writes fresh assertion
+evidence beneath `$LAZILY_CORE_REPORTS_ROOT/zig`. The native-artifact claim is
+proved separately: `scripts/prove-core-c-abi.py` builds the shipped dynamic
+library, loads it as an external consumer, and invokes the exported
+`lazily_core_abi_version` symbol before writing its proof artifact.
+
 | Module | Surface |
 |--------|---------|
 | `src/lazily/ipc.zig` | Shared lazily IPC wire types (`IpcMessage`, `Snapshot`, `Delta`, `DeltaOp`, `NodeSnapshot`, `NodeState`, `ShmBlobArena`, `ShmBlobRef` with the optional `backend` discriminator, `CapabilityHandshake`, `CrdtSync`). Round-trips the canonical fixtures using the same externally-tagged JSON shape as lazily-rs. |

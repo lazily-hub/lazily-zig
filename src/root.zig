@@ -1,5 +1,12 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+
+/// Stable C-ABI probe for native consumers. The return value is the Core API
+/// generation implemented by this artifact; keeping it as a real exported
+/// symbol makes qualification build and invoke the shipped dynamic library.
+export fn lazily_core_abi_version() callconv(.c) u32 {
+    return 1;
+}
 // Cell kernel (`#lzcellkernel`) — the two concrete handles `Source(T[, M])` /
 // `Computed(T)` (no `Cell(T, K)` genus), and the `source` / `computed` /
 // `.eager()` constructor surface. See tasks/software/lazily-cell-kernel-design.md.

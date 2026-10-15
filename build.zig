@@ -125,6 +125,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(lazily_lib);
+    const install_core_abi_artifact = b.addInstallArtifact(lazily_lib, .{});
+    const core_abi_artifact_step = b.step(
+        "core-c-abi-artifact",
+        "Build and install only the shared library used by the Core C-ABI proof",
+    );
+    core_abi_artifact_step.dependOn(&install_core_abi_artifact.step);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -453,6 +459,11 @@ pub fn build(b: *std.Build) void {
     const run_reactive_graph_conformance_tests =
         b.addRunArtifact(reactive_graph_conformance_tests);
     run_test.dependOn(&run_reactive_graph_conformance_tests.step);
+    const core_conformance_step = b.step(
+        "core-conformance",
+        "Replay the Core reactive-graph profile across all execution flavors",
+    );
+    core_conformance_step.dependOn(&run_reactive_graph_conformance_tests.step);
 
     // --- runtime conformance manifest (`#lazilyupgradeconformance`) ---
     // `scripts/check-conformance-coverage.sh` no longer greps the sources for
