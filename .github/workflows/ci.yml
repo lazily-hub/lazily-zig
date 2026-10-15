@@ -109,6 +109,11 @@ jobs:
         with:
           version: ${{ matrix.zig }}
 
+      # Zig 0.16.0 is both the minimum and current supported Core toolchain.
+      - name: Clean packaged Core consumer (minimum/current)
+        if: matrix.zig == '0.16.0'
+        run: make core-artifact-consumer-check
+
       # lazily-spec is the canonical cross-language source for the conformance
       # fixtures. Clone it as a sibling BEFORE the test step so the replay
       # tests read the canonical files rather than skipping (#lzspecconf).

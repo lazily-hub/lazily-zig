@@ -1,0 +1,10 @@
+.{
+    .name = .lazily_core_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xd90825eae5fdb7e5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lazily = .{ .path = "__ARTIFACT__" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

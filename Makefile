@@ -35,9 +35,10 @@ test-interop-peer \
 test-lean-formal \
 assertion-ordering-check \
 	ci-reach \
-	core-conformance-report
+	core-conformance-report \
+	core-artifact-consumer-check
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach core-package-check core-api-check
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach core-package-check core-api-check core-artifact-consumer-check
 
 core-api-check:
 	$(ZIG) build core-test
@@ -45,6 +46,9 @@ core-api-check:
 
 core-package-check:
 	./scripts/check-core-package.sh
+
+core-artifact-consumer-check:
+	./scripts/core-artifact-consumer-check.sh
 
 assertion-ordering-check:
 	python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .

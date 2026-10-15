@@ -200,6 +200,7 @@ EXPECTED_CLOSURE_TARGETS=(
 	ci-reach
 	conformance-coverage
 	core-api-check
+	core-artifact-consumer-check
 	core-package-check
 	fmt
 	test
@@ -286,6 +287,7 @@ EXPECTED_STEP_FOR_TARGET=(
 	"ci-reach|ci-reach|CI-reachability guard (#lzcheckcireachguard)"
 	"conformance-coverage|test|Conformance coverage guard"
 	"core-api-check|test|Core API compatibility gate"
+	"core-artifact-consumer-check|test|Clean packaged Core consumer (minimum/current)"
 	"core-package-check|test|Core package-content gate"
 	"test|test|Test"
 	"test-interop-peer|test|Interop peer self-check (#lzinteroppeerci)"
