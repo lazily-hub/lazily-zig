@@ -202,6 +202,7 @@ EXPECTED_CLOSURE_TARGETS=(
 	core-api-check
 	core-artifact-consumer-check
 	core-package-check
+	core-report-self-test
 	fmt
 	test
 	test-interop-peer
@@ -289,6 +290,7 @@ EXPECTED_STEP_FOR_TARGET=(
 	"core-api-check|test|Core API compatibility gate"
 	"core-artifact-consumer-check|core-artifact-consumer|Clean packaged Core consumer (minimum/current)"
 	"core-package-check|test|Core facade package contract"
+	"core-report-self-test|test|Core report negative-control self-test"
 	"test|test|Test"
 	"test-interop-peer|test|Interop peer self-check (#lzinteroppeerci)"
 	"test-lean-formal|lean-formal|Build the formal model"

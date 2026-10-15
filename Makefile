@@ -36,9 +36,10 @@ test-lean-formal \
 assertion-ordering-check \
 	ci-reach \
 	core-conformance-report \
+	core-report-self-test \
 	core-artifact-consumer-check
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check core-package-check core-api-check core-artifact-consumer-check ci-reach
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check core-package-check core-api-check core-report-self-test core-artifact-consumer-check ci-reach
 
 core-api-check:
 	$(ZIG) build core-test
@@ -133,3 +134,9 @@ ci-reach:
 # evidence beneath LAZILY_CORE_REPORTS_ROOT/zig.
 core-conformance-report:
 	python3 scripts/generate-core-conformance-report.py
+
+# The Core report credits a fixture mutant as "mutation-killed" only for a new
+# library-divergence line from the runner; a runner-bookkeeping abort (a renamed
+# node-id key or scenario label) is recorded as non-discriminating instead.
+core-report-self-test:
+	python3 scripts/generate-core-conformance-report.py --self-test

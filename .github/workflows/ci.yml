@@ -203,6 +203,12 @@ jobs:
           zig build core-test
           python3 scripts/check-core-api.py
 
+      # The Core report credits a fixture mutant only for a library divergence,
+      # never for a runner-bookkeeping abort; the self-test replays real runner
+      # lines through a fake runner and needs no zig.
+      - name: Core report negative-control self-test
+        run: python3 scripts/generate-core-conformance-report.py --self-test
+
       # A fixture that lands upstream and is replayed by nobody here must fail
       # the build, not wait to be noticed. Runs on every toolchain in the matrix
       # because the manifest is per-run evidence, not a cached artifact — and
