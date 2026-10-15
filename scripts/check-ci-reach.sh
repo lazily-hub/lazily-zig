@@ -287,8 +287,8 @@ EXPECTED_STEP_FOR_TARGET=(
 	"ci-reach|ci-reach|CI-reachability guard (#lzcheckcireachguard)"
 	"conformance-coverage|test|Conformance coverage guard"
 	"core-api-check|test|Core API compatibility gate"
-	"core-artifact-consumer-check|test|Clean packaged Core consumer (minimum/current)"
-	"core-package-check|test|Core package-content gate"
+	"core-artifact-consumer-check|core-artifact-consumer|Clean packaged Core consumer (minimum/current)"
+	"core-package-check|test|Core facade package contract"
 	"test|test|Test"
 	"test-interop-peer|test|Interop peer self-check (#lzinteroppeerci)"
 	"test-lean-formal|lean-formal|Build the formal model"
@@ -404,6 +404,7 @@ EXPECTED_TRIGGER_FILTERS=(
 # list is what covers the one it cannot.
 EXPECTED_GATE_JOBS=(
 	ci-reach
+	core-artifact-consumer
 	fmt
 	lean-formal
 	test
@@ -420,6 +421,7 @@ EXPECTED_GATE_JOBS=(
 # still absent. Fails-when-introduced.
 EXPECTED_JOB_ACTIVATION=(
 	"ci-reach|continue-on-error=;if=;needs="
+	"core-artifact-consumer|continue-on-error=;if=;needs="
 	"fmt|continue-on-error=;if=;needs="
 	"lean-formal|continue-on-error=;if=;needs="
 	"test|continue-on-error=\${{ matrix.zig == 'master' }};if=;needs="
@@ -462,10 +464,31 @@ EXPECTED_JOB_ACTIVATION=(
 # refuses a merge when it fails.
 EXPECTED_JOB_MATRIX=(
 	"ci-reach|"
+	"core-artifact-consumer|"
 	"fmt|"
 	"lean-formal|"
 	"test|zig=0.15.2,0.16.0,master"
 )
+
+# Per gate STEP, the exact step-level activation, as
+# `job|step name|continue-on-error=<v>;if=<v>` (#lzcoreciactivationfixes).
+#
+# Everything above pins whether a gate's JOB runs and whether its failure counts.
+# None of it reads the step's own keys, and a step is where the last two
+# switches live. MEASURED on this tree before this pin, each mutation alone,
+# exit status and verdict line read separately:
+#
+#   mutation                                                      verdict
+#   step-level `if: false` on each of the three Core gate steps   OK, exit 0
+#   step-level `continue-on-error: true` on each of the same      OK, exit 0
+#
+# and the Core consumer itself was gated by `if: matrix.zig == '0.16.0'` inside
+# `test`, so retargeting that string skipped it on every leg, guard green. The
+# consumer now has its own job (pinned above) and every gate step — step-pinned
+# or reached through `make <target>` — must carry NO step-level `if:` or
+# `continue-on-error:` unless its exact values are listed here. An entry naming
+# no gate step is stale and refused. Empty: no gate step here is conditional.
+EXPECTED_STEP_ACTIVATION=()
 
 # Pin lookups. `|` is the field separator, so a step name containing one is
 # refused further down rather than silently splitting.
@@ -1419,6 +1442,9 @@ stepmap_off_count=0
 mi_found=""
 mi_found_set=" "
 gatejob_found_set=" "
+# Every gate step the pins resolve to, as `job|step name`, newline-separated:
+# the step-level activation pin after the loop is checked against exactly these.
+gate_step_keys=""
 
 while IFS= read -r target; do
 	[ -n "$target" ] || continue
@@ -1529,6 +1555,8 @@ while IFS= read -r target; do
 			_i=$((_i + 1))
 			if step_invokes_make "$_i" "$target"; then
 				_j="$(awk -F'\t' -v i="$_i" '$1 == i { print $2; exit }' "$step_index")"
+				_s="$(awk -F'\t' -v i="$_i" '$1 == i { print $3; exit }' "$step_index")"
+				gate_step_keys="$gate_step_keys$_j|$_s"$'\n'
 				case "$gatejob_found_set" in
 				*" $_j "*) ;;
 				*) gatejob_found_set="$gatejob_found_set$_j " ;;
@@ -1549,6 +1577,7 @@ while IFS= read -r target; do
 		else
 			pin_idx="$(awk -F'\t' -v j="$pin_job" -v s="$pin_step" \
 				'$2 == j && $3 == s { print $1; exit }' "$step_index")"
+			gate_step_keys="$gate_step_keys$pin_job|$pin_step"$'\n'
 			case "$gatejob_found_set" in
 			*" $pin_job "*) ;;
 			*) gatejob_found_set="$gatejob_found_set$pin_job " ;;
@@ -2242,7 +2271,93 @@ if [ "$unreached_count" -gt 0 ]; then
 	status=1
 fi
 
+# ------------------------------------------------- step-level activation pin
+#
+# One `job<TAB>step name<TAB>continue-on-error=<v>;if=<v>` row per step under a
+# job's `steps:`. A step key repeated inside one step is reported as `!DUP`,
+# which no pin can equal.
+step_act="$(mktemp)"
+awk '
+	function flush() {
+		if (have) printf "%s\t%s\tcontinue-on-error=%s;if=%s\n", job, name, coe, cond
+		have = 0; name = ""; coe = ""; cond = ""; seen_if = 0; seen_coe = 0
+	}
+	function take(kv,   k, v) {
+		k = kv; sub(/:.*$/, "", k)
+		v = kv; sub(/^[^:]*:[[:space:]]*/, "", v)
+		if (k == "name") { gsub(/^["\047]|["\047]$/, "", v); name = v }
+		else if (k == "if") { cond = (seen_if++ ? "!DUP" : v) }
+		else if (k == "continue-on-error") { coe = (seen_coe++ ? "!DUP" : v) }
+	}
+	FNR == 1 { flush(); injobs = 0; job = ""; insteps = 0 }
+	{
+		line = $0
+		sub(/[[:space:]]+$/, "", line)
+		if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+		indent = match(line, /[^ ]/) - 1
+		if (indent == 0) { flush(); injobs = (line ~ /^jobs:/); job = ""; insteps = 0; next }
+		if (!injobs) next
+		if (indent == 2) { flush(); job = line; sub(/^  /, "", job); sub(/:.*$/, "", job); insteps = 0; next }
+		if (indent == 4) { flush(); insteps = (line ~ /^    steps:$/); next }
+		if (!insteps) next
+		if (indent == 6 && line ~ /^      -[[:space:]]/) {
+			flush(); have = 1
+			kv = line; sub(/^      -[[:space:]]+/, "", kv); take(kv)
+			next
+		}
+		if (indent == 8) { kv = line; sub(/^        /, "", kv); take(kv) }
+	}
+	END { flush() }
+' "${workflows[@]}" >"$step_act"
+
+stepact_bad=""
+stepact_bad_count=0
+stepact_checked=0
+while IFS= read -r _k; do
+	[ -n "$_k" ] || continue
+	_j="${_k%%|*}"
+	_s="${_k#*|}"
+	stepact_checked=$((stepact_checked + 1))
+	_found="$(awk -F'\t' -v j="$_j" -v s="$_s" '$1 == j && $2 == s { print $3 }' "$step_act")"
+	_want="continue-on-error=;if="
+	for _e in ${EXPECTED_STEP_ACTIVATION[@]+"${EXPECTED_STEP_ACTIVATION[@]}"}; do
+		_ej="${_e%%|*}"
+		_er="${_e#*|}"
+		_es="${_er%%|*}"
+		if [ "$_ej" = "$_j" ] && [ "$_es" = "$_s" ]; then
+			_want="${_er#*|}"
+		fi
+	done
+	if [ "$_found" != "$_want" ]; then
+		stepact_bad="$stepact_bad  - $_j / $_s: found '$_found', pinned '$_want'"$'\n'
+		stepact_bad_count=$((stepact_bad_count + 1))
+	fi
+done < <(printf '%s' "$gate_step_keys" | sort -u)
+for _e in ${EXPECTED_STEP_ACTIVATION[@]+"${EXPECTED_STEP_ACTIVATION[@]}"}; do
+	_ej="${_e%%|*}"
+	_er="${_e#*|}"
+	_es="${_er%%|*}"
+	if ! printf '%s' "$gate_step_keys" | grep -qxF -- "$_ej|$_es"; then
+		stepact_bad="$stepact_bad  - EXPECTED_STEP_ACTIVATION entry names no gate step: $_ej / $_es"$'\n'
+		stepact_bad_count=$((stepact_bad_count + 1))
+	fi
+done
+rm -f "$step_act"
+if [ "$stepact_checked" -eq 0 ]; then
+	echo "check-ci-reach: no gate step resolved for the step-level activation pin — it would pass vacuously" >&2
+	status=1
+fi
+if [ "$stepact_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $stepact_bad_count gate step(s) differ from their pinned step-level activation" >&2
+	echo "                (a step-level \`if:\` or \`continue-on-error:\` switches a gate off with every job pin green):" >&2
+	printf '%s' "$stepact_bad" >&2
+	status=1
+fi
+
 if [ "$status" -eq 0 ]; then
+	printf 'pinned   %s gate step(s) carry exactly their EXPECTED_STEP_ACTIVATION step-level `if:`/`continue-on-error:` (%s conditional)\n' \
+		"$stepact_checked" "${#EXPECTED_STEP_ACTIVATION[@]}"
 	printf 'pinned   %s no-gate target(s) match EXPECTED_NO_GATE_TARGETS; %s gate(s) confirmed run by `%s -n %s`\n' \
 		"$nogate_count" "$gate_targets" "$MAKE_BIN" "$ROOT_TARGET"
 	printf 'pinned   %s gate(s) reached INSIDE their pinned CI step, %s through `make <target>` and unpinnable, over %s named run: step(s)\n' \

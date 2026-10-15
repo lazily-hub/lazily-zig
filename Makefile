@@ -38,7 +38,7 @@ assertion-ordering-check \
 	core-conformance-report \
 	core-artifact-consumer-check
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach core-package-check core-api-check core-artifact-consumer-check
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check core-package-check core-api-check core-artifact-consumer-check ci-reach
 
 core-api-check:
 	$(ZIG) build core-test

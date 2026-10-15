@@ -109,10 +109,8 @@ jobs:
         with:
           version: ${{ matrix.zig }}
 
-      # Zig 0.16.0 is both the minimum and current supported Core toolchain.
-      - name: Clean packaged Core consumer (minimum/current)
-        if: matrix.zig == '0.16.0'
-        run: make core-artifact-consumer-check
+      - name: Core facade package contract
+        run: ./scripts/check-core-package.sh
 
       # lazily-spec is the canonical cross-language source for the conformance
       # fixtures. Clone it as a sibling BEFORE the test step so the replay
@@ -199,9 +197,6 @@ jobs:
 
       - name: Assertion observation ordering (#lzassertordering)
         run: python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .
-
-      - name: Core package-content gate
-        run: ./scripts/check-core-package.sh
 
       - name: Core API compatibility gate
         run: |
@@ -293,3 +288,26 @@ jobs:
             echo "::error::the CI-reachability guard exited 0 without reaching its verdict"
             exit 1
           }
+
+  # ---------------------------------------------------------------------------
+  # Zig 0.16.0 is both the minimum and current supported Core toolchain, so the
+  # packaged-artifact consumer runs on exactly that leg. It is its own job rather
+  # than a `matrix.zig == '0.16.0'` step inside `test`: a step-level condition is
+  # invisible to the job activation/matrix pins, so retargeting its version
+  # string would have skipped the consumer on every leg with the guard green.
+  core-artifact-consumer:
+    name: Core artifact consumer / Zig 0.16.0 minimum-current
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Clean packaged Core consumer (minimum/current)
+        run: ./scripts/core-artifact-consumer-check.sh
