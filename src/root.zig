@@ -7,6 +7,22 @@ const std = @import("std");
 export fn lazily_core_abi_version() callconv(.c) u32 {
     return 1;
 }
+
+/// Focused additive Core facade. Existing root imports remain supported and
+/// resolve to the same declarations re-exported by this module.
+pub const core = @import("core.zig");
+
+test "focused Core facade preserves root public type identities" {
+    comptime {
+        if (core.Context != Context) @compileError("core.Context must alias root Context");
+        if (core.Source(u8) != Source(u8)) @compileError("core.Source must alias root Source");
+        if (core.Computed(u8) != Computed(u8)) @compileError("core.Computed must alias root Computed");
+        if (core.Effect(void) != Effect(void)) @compileError("core.Effect must alias root Effect");
+        if (core.TeardownScope != TeardownScope) {
+            @compileError("core.TeardownScope must alias root TeardownScope");
+        }
+    }
+}
 // Cell kernel (`#lzcellkernel`) — the two concrete handles `Source(T[, M])` /
 // `Computed(T)` (no `Cell(T, K)` genus), and the `source` / `computed` /
 // `.eager()` constructor surface. See tasks/software/lazily-cell-kernel-design.md.

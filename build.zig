@@ -114,6 +114,16 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", build_options);
 
+    // Focused additive Core entry point. The root module remains the canonical
+    // compatibility import; consumers that only need the reactive kernel can
+    // depend on `lazily_core` without importing the broader surface.
+    const core_mod = b.addModule("lazily_core", .{
+        .root_source_file = b.path("src/core.zig"),
+        .target = target,
+        .link_libc = link_libc,
+    });
+    core_mod.addOptions("build_options", build_options);
+
     const lazily_lib = b.addLibrary(.{
         .name = "lazily",
         .linkage = .dynamic,
@@ -278,6 +288,12 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    const core_mod_tests = b.addTest(.{
+        .root_module = core_mod,
+        .filters = filters,
+    });
+    const run_core_mod_tests = b.addRunArtifact(core_mod_tests);
+
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
@@ -383,6 +399,7 @@ pub fn build(b: *std.Build) void {
     // make the two of them run in parallel.
     const run_test = b.step("test", "Run tests");
     run_test.dependOn(&run_mod_tests.step);
+    run_test.dependOn(&run_core_mod_tests.step);
     run_test.dependOn(&run_exe_tests.step);
     run_test.dependOn(&run_ipc_mod_tests.step);
     run_test.dependOn(&run_lossless_tree_mod_tests.step);

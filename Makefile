@@ -26,6 +26,7 @@ CONFORMANCE_RUN_ID := $(shell printf '%s-%s' "$$(date +%s%N)" "$$$$")
 
 .PHONY: \
 	check \
+core-package-check \
 fmt \
 fmt-fix \
 test \
@@ -35,7 +36,10 @@ assertion-ordering-check \
 	ci-reach \
 	core-conformance-report
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach core-package-check
+
+core-package-check:
+	./scripts/check-core-package.sh
 
 assertion-ordering-check:
 	python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .
