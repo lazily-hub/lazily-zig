@@ -294,6 +294,13 @@ pub fn build(b: *std.Build) void {
     });
     const run_core_mod_tests = b.addRunArtifact(core_mod_tests);
 
+    // A focused native compatibility compile/run gate for the additive Core
+    // module. Keeping this separate lets API verification avoid unrelated
+    // conformance fixtures while still asking Zig to type-check the real public
+    // package surface with the same build options consumers receive.
+    const core_test_step = b.step("core-test", "Compile and test the focused Core module");
+    core_test_step.dependOn(&run_core_mod_tests.step);
+
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.

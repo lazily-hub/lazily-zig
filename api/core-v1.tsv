@@ -1,0 +1,13 @@
+# lazily-core-api-v1
+generation	1
+deprecation_window_generations	2
+symbol	source	type	lazily_core.Source	@import("lazily/cell.zig").Source	1	-	-	-
+symbol	computed	type	lazily_core.Computed	@import("lazily/cell.zig").Computed	1	-	-	-
+symbol	source	operation	lazily_core.source	@import("lazily/cell.zig").source	1	-	-	-
+symbol	computed	operation	lazily_core.computed	@import("lazily/cell.zig").computed	1	-	-	-
+symbol	computed	operation	lazily_core.computedRippleWhen	@import("lazily/cell.zig").computedRippleWhen	1	-	-	-
+symbol	typed_context	type	lazily_core.Compute	@import("lazily/context.zig").Compute	1	-	-	-
+symbol	context	type	lazily_core.Context	@import("lazily/context.zig").Context	1	-	-	-
+symbol	scope	type	lazily_core.TeardownScope	Context.TeardownScope	1	-	-	-
+symbol	effect	type	lazily_core.Effect	@import("lazily/effect.zig").Effect	1	-	-	-
+symbol	effect	operation	lazily_core.effect	@import("lazily/effect.zig").effect	1	-	-	-

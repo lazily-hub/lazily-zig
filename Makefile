@@ -26,6 +26,7 @@ CONFORMANCE_RUN_ID := $(shell printf '%s-%s' "$$(date +%s%N)" "$$$$")
 
 .PHONY: \
 	check \
+	core-api-check \
 core-package-check \
 fmt \
 fmt-fix \
@@ -36,7 +37,11 @@ assertion-ordering-check \
 	ci-reach \
 	core-conformance-report
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach core-package-check
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check ci-reach core-package-check core-api-check
+
+core-api-check:
+	$(ZIG) build core-test
+	python3 scripts/check-core-api.py
 
 core-package-check:
 	./scripts/check-core-package.sh

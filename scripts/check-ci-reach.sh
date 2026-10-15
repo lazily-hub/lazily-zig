@@ -199,6 +199,8 @@ EXPECTED_CLOSURE_TARGETS=(
 	check
 	ci-reach
 	conformance-coverage
+	core-api-check
+	core-package-check
 	fmt
 	test
 	test-interop-peer
@@ -283,6 +285,8 @@ EXPECTED_STEP_FOR_TARGET=(
 	"assertion-ordering-check|test|Assertion observation ordering (#lzassertordering)"
 	"ci-reach|ci-reach|CI-reachability guard (#lzcheckcireachguard)"
 	"conformance-coverage|test|Conformance coverage guard"
+	"core-api-check|test|Core API compatibility gate"
+	"core-package-check|test|Core package-content gate"
 	"test|test|Test"
 	"test-interop-peer|test|Interop peer self-check (#lzinteroppeerci)"
 	"test-lean-formal|lean-formal|Build the formal model"
