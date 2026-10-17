@@ -126,24 +126,13 @@ Signals do not introduce a separate wire type. A producer-side eager Signal is
 observed as its backing slot node: snapshots carry a materialized `NodeState`,
 and value changes are emitted as `DeltaOp.SlotValue`.
 
-## Test Build
-
-This project uses mise.
-
-[Install mise](https://mise.jdx.dev/getting-started.html)
-
-```sh
-mise trust
-```
-
-```sh
-mise run test
-# mise run test_0_15_2
-# mise run test_master
-```
+## Build
 
 The default build does not link libc. Use `zig build -Dlink_libc=true` when an
 embedding artifact needs libc-backed allocator or C runtime symbols.
+
+Contributor setup and test-matrix commands are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Benchmarks
 
