@@ -6,9 +6,19 @@ zig_bin=${ZIG:-zig}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-(cd "$root" && tar -cf "$tmp/lazily-zig.tar" build.zig build.zig.zon src LICENSE NOTICE README.md)
 mkdir -p "$tmp/lazily"
-tar -xf "$tmp/lazily-zig.tar" -C "$tmp/lazily"
+if [ -n "${LAZILY_CORE_ARTIFACT_VERSION:-}" ]; then
+  : "${LAZILY_CORE_ARTIFACT_SHA256:?LAZILY_CORE_ARTIFACT_SHA256 is required for a published source archive}"
+  archive="$tmp/lazily-zig-v$LAZILY_CORE_ARTIFACT_VERSION.tar.gz"
+  curl --fail --location --silent --show-error \
+    "https://github.com/lazily-hub/lazily-zig/archive/refs/tags/v$LAZILY_CORE_ARTIFACT_VERSION.tar.gz" \
+    --output "$archive"
+  printf '%s  %s\n' "$LAZILY_CORE_ARTIFACT_SHA256" "$archive" | sha256sum --check --status
+  tar -xzf "$archive" --strip-components=1 -C "$tmp/lazily"
+else
+  (cd "$root" && tar -cf "$tmp/lazily-zig.tar" build.zig build.zig.zon src LICENSE NOTICE README.md)
+  tar -xf "$tmp/lazily-zig.tar" -C "$tmp/lazily"
+fi
 mkdir -p "$tmp/consumer/src"
 cp "$root/tests/core-artifact-consumer/build.zig" "$tmp/consumer/"
 cp "$root/tests/core-artifact-consumer/build.zig.zon" "$tmp/consumer/"
