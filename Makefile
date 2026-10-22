@@ -1,6 +1,8 @@
 LAKE ?= lake
 ZIG ?= zig
 LEAN_DIR ?= ../lazily-formal
+LAZILY_SPEC_CONFORMANCE_DIR ?= ../lazily-spec/conformance
+LAZILY_SPEC_ROOT := $(abspath $(LAZILY_SPEC_CONFORMANCE_DIR)/..)
 
 # Runtime conformance manifest (#lazilyupgradeconformance). ABSOLUTE on purpose:
 # `zig build test` runs a dozen separate test binaries and a build runner may
@@ -52,7 +54,7 @@ core-artifact-consumer-check:
 	./scripts/core-artifact-consumer-check.sh
 
 assertion-ordering-check:
-	python3 ../lazily-spec/scripts/check-assertion-ordering.py --binding zig --root .
+	python3 $(LAZILY_SPEC_ROOT)/scripts/check-assertion-ordering.py --binding zig --root .
 
 # The formatting GATE (#lazilydartzig, #lzzigfmttoolchains). This binding had no
 # formatting floor at all — nothing in `check`, nothing in CI — so drift was
@@ -95,6 +97,7 @@ fmt-fix:
 # `mise run test`) is unaffected by any of this.
 test:
 	@mkdir -p $(dir $(CONFORMANCE_MANIFEST)) && : > $(CONFORMANCE_MANIFEST)
+	LAZILY_SPEC_CONFORMANCE_DIR=$(LAZILY_SPEC_CONFORMANCE_DIR) \
 	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) \
 	LAZILY_CONFORMANCE_RUN_ID=$(CONFORMANCE_RUN_ID) $(ZIG) build test \
 		-Dconformance-manifest=$(CONFORMANCE_MANIFEST) \
@@ -119,6 +122,7 @@ test-lean-formal:
 # having just run with the recorder attached — a missing manifest is missing
 # evidence and fails.
 conformance-coverage: test
+	LAZILY_SPEC_CONFORMANCE_DIR=$(LAZILY_SPEC_CONFORMANCE_DIR) \
 	LAZILY_CONFORMANCE_MANIFEST=$(CONFORMANCE_MANIFEST) \
 	LAZILY_CONFORMANCE_RUN_ID=$(CONFORMANCE_RUN_ID) \
 		./scripts/check-conformance-coverage.sh

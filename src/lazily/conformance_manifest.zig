@@ -209,8 +209,7 @@ pub fn specReadFile(path: []const u8) ![]u8 {
 pub fn record(path: []const u8) void {
     var abs_buf: [4096]u8 = undefined;
     const abs = toAbsolute(path, &abs_buf) orelse return;
-    const idx = std.mem.indexOf(u8, abs, MARKER) orelse return;
-    append(abs[idx + MARKER.len ..]);
+    append(fixtureIdFromPath(abs) orelse return);
 }
 
 /// Marks a scenario-ledger line so the coverage guard can split the two
@@ -627,8 +626,31 @@ fn declareArrayElements(
 /// `path` reduced to its corpus-relative id, or returned unchanged when it is
 /// already one.
 fn canonicalFixtureId(path: []const u8) []const u8 {
+    return fixtureIdFromPath(path) orelse path;
+}
+
+/// Resolve a fixture path against either the configured runtime corpus root or
+/// the historical default-root marker. The configured-root arm is
+/// load-bearing for `LAZILY_SPEC_CONFORMANCE_DIR`: an absolute immutable-tag
+/// worktree such as `/work/lazily-spec-v0.43.0/conformance` does not contain
+/// the literal `lazily-spec/conformance/` marker, so marker-only recording
+/// inventories assertion blocks while silently omitting the fixture-open line.
+fn fixtureIdFromPath(path: []const u8) ?[]const u8 {
+    if (fixtureIdRelativeToRoot(path, conformanceRoot())) |id| return id;
     if (std.mem.indexOf(u8, path, MARKER)) |idx| return path[idx + MARKER.len ..];
-    return path;
+    return null;
+}
+
+fn fixtureIdRelativeToRoot(path: []const u8, root: []const u8) ?[]const u8 {
+    var end = root.len;
+    while (end > 0 and root[end - 1] == '/') end -= 1;
+    const configured = root[0..end];
+    if (std.mem.startsWith(u8, path, configured) and
+        path.len > configured.len and path[configured.len] == '/')
+    {
+        return path[configured.len + 1 ..];
+    }
+    return null;
 }
 
 /// `path` resolved against the process cwd. Test binaries can run from a working
@@ -1001,6 +1023,16 @@ test "conformance manifest: ids are relative to the conformance root" {
     try std.testing.expect(abs[0] == '/');
     const idx = std.mem.indexOf(u8, abs, MARKER).?;
     try std.testing.expectEqualStrings("collections/x.json", abs[idx + MARKER.len ..]);
+}
+
+test "conformance manifest: an immutable-tag override records fixture ids" {
+    try std.testing.expectEqualStrings(
+        "reactive-graph/stale_effect_handle_cannot_remove_recycled_source.json",
+        fixtureIdRelativeToRoot(
+            "/work/lazily-spec-v0.43.0/conformance/reactive-graph/stale_effect_handle_cannot_remove_recycled_source.json",
+            "/work/lazily-spec-v0.43.0/conformance",
+        ) orelse "",
+    );
 }
 
 test "conformance manifest: a scenario line is distinguishable from a fixture id" {
