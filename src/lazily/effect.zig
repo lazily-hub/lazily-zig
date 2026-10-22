@@ -57,7 +57,11 @@ pub fn Effect(comptime Cleanup: type) type {
         }
 
         pub fn handle(self: *const Self) Context.NodeHandle {
-            return .{ .key = self.slot.cache_key.? };
+            return .{
+                .key = self.slot.cache_key.?,
+                .generation = self.slot.generation,
+                .kind = self.slot.node_kind,
+            };
         }
 
         /// Tear this effect out of the *graph* (`#lzspecedgeindex`).
@@ -189,6 +193,7 @@ pub fn effectKeyed(
     // refuses to resurrect a tombstone, so reaching here means this is a fresh
     // node on a fresh key; the assignment is defensive and free.
     slot_ptr.disposed = false;
+    slot_ptr.node_kind = .effect;
 
     const self = try ctx.allocator.create(Effect(Cleanup));
     self.* = .{

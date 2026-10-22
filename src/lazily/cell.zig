@@ -171,7 +171,11 @@ fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type
         }
 
         pub fn handle(self: *const Self) Context.NodeHandle {
-            return .{ .key = self.slot.cache_key.? };
+            return .{
+                .key = self.slot.cache_key.?,
+                .generation = self.slot.generation,
+                .kind = if (is_source) .source else .computed,
+            };
         }
 
         /// Tear this node out of the graph. Kind-agnostic — a disposed eager
@@ -243,6 +247,7 @@ fn CellHandle(comptime T: type, comptime is_source: bool, comptime M: type) type
                     }
                 }.deinitValue),
             );
+            self.slot.node_kind = .source;
             return self;
         }
 

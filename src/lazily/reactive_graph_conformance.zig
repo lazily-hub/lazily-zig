@@ -56,6 +56,7 @@ const EffectMod = @import("effect.zig");
 const SignalMod = @import("signal.zig");
 const slotKeyed = @import("slot.zig").slotKeyed;
 const AsyncContext = @import("async_context.zig").AsyncContext;
+const AsyncNodeHandle = @import("async_context.zig").AsyncNodeHandle;
 const ThreadSafeContext = @import("thread_safe_context.zig").ThreadSafeContext;
 
 const conformance_manifest = @import("conformance_manifest.zig");
@@ -103,10 +104,9 @@ const MAX_NODES = 80;
 /// Upper bound on live teardown scopes in a single fixture.
 const MAX_SCOPES = 8;
 
-/// Cache-key generations per node index. A disposed key is never reused: the
-/// tombstone `slotKeyed` leaves behind is what makes a read of a disposed node
-/// an error, so a replacement subscriber in a churn cycle has to be a genuinely
-/// new node. `syncKey` folds the generation into the key.
+/// Initial cache-key spacing per node index. Ordinary churn uses distinct keys;
+/// the stale-handle fixture explicitly retires a tombstone and reuses its key so
+/// the production occupant-generation fence is exercised rather than simulated.
 const GEN_STRIDE = 1024;
 
 /// The canonical fixture set, asserted against the directory listing so a
@@ -127,6 +127,7 @@ const FIXTURES = [_][]const u8{
     "merge_per_settled_cone_not_per_write.json",
     "read_after_dispose_is_an_error.json",
     "recycled_id_inherits_nothing.json",
+    "stale_effect_handle_cannot_remove_recycled_source.json",
     "scope_teardown_equals_fold_of_disposals.json",
     "scoping_bounds_teardown_not_visibility.json",
     "signal_materializes_once_per_batch.json",
@@ -152,14 +153,15 @@ const SUPPORTED_OPS = [_][]const u8{
 /// fails loudly — silently ignoring an assertion is the anti-pattern this
 /// runner exists to kill.
 const SUPPORTED_ASSERTIONS = [_][]const u8{
-    "note",           "value",         "error",             "read",
-    "readable",       "dependents_of", "dependencies_of",   "observed_by",
-    "observed_count", "cleanup_order", "scope_owned_count",
+    "note",                  "value",         "error",             "read",
+    "readable",              "dependents_of", "dependencies_of",   "observed_by",
+    "observed_count",        "cleanup_order", "scope_owned_count",
     // Signal eagerness (`#lzsignaleager`). The *only* observable that
     // distinguishes an eager signal from the lazy memo it is built on, so it is
     // counted for real — one increment per actual invocation of the compute the
     // runner synthesizes — never derived from op shape.
     "computes_of",
+    "recycled_id_confirmed", "writable",      "cleanups_of",
 };
 
 /// Fixtures that cannot run against `lazily-zig` today, with the first
@@ -535,10 +537,12 @@ const Def = struct {
 
 var defs: [MAX_NODES]Def = @splat(.{});
 var gens: [MAX_NODES]usize = @splat(0);
+var sync_keys: [MAX_NODES]usize = @splat(0);
 
 fn resetDefs() void {
     defs = @splat(.{});
     gens = @splat(0);
+    sync_keys = @splat(0);
     compute_counts = @splat(0);
     armed_failures = @splat(0);
 }
@@ -556,7 +560,7 @@ fn resetDefs() void {
 // ---------------------------------------------------------------------------
 
 fn syncKey(idx: usize) usize {
-    return (idx + 1) * GEN_STRIDE + gens[idx];
+    return if (sync_keys[idx] != 0) sync_keys[idx] else (idx + 1) * GEN_STRIDE + gens[idx];
 }
 
 /// Cleanup payload for a synchronous effect. `Effect(Cleanup)` requires a
@@ -670,6 +674,10 @@ const SyncModel = struct {
     effects: [MAX_NODES]?*EffectMod.Effect(SyncCleanup) = @splat(null),
     /// Eager-signal handles (`#lzsignaleager`), also allocator-owned.
     signals: [MAX_NODES]?*CellMod.Computed(V) = @splat(null),
+    handles: [MAX_NODES]?Context.NodeHandle = @splat(null),
+    live: [MAX_NODES]bool = @splat(false),
+    free_handles: [MAX_NODES]Context.NodeHandle = undefined,
+    free_len: usize = 0,
 
     fn create(allocator: std.mem.Allocator) !SyncModel {
         return .{ .ctx = try Context.init(allocator) };
@@ -689,29 +697,49 @@ const SyncModel = struct {
         self.ctx.deinit();
     }
 
-    fn handle(_: *SyncModel, idx: usize) Context.NodeHandle {
-        return .{ .key = syncKey(idx) };
+    fn handle(self: *SyncModel, idx: usize) Context.NodeHandle {
+        return self.handles[idx].?;
+    }
+
+    fn prepareKey(self: *SyncModel, idx: usize) !void {
+        if (self.free_len > 0) {
+            self.free_len -= 1;
+            const old = self.free_handles[self.free_len];
+            try self.ctx.recycleDisposedNode(old);
+            sync_keys[idx] = old.key;
+        } else {
+            gens[idx] += 1;
+            sync_keys[idx] = (idx + 1) * GEN_STRIDE + gens[idx];
+        }
+    }
+
+    fn captureHandle(self: *SyncModel, idx: usize, kind: Context.NodeKind) !void {
+        self.handles[idx] = self.ctx.handleForKey(syncKey(idx)) orelse return error.MissingNodeHandle;
+        if (self.handles[idx].?.kind != kind) return error.UnexpectedNodeKind;
+        self.live[idx] = true;
     }
 
     fn addCell(self: *SyncModel, idx: usize, value: V) !void {
-        gens[idx] += 1;
+        try self.prepareKey(idx);
         defs[idx] = .{ .kind = .cell, .initial = value };
         _ = try sync_read_fns[idx](self.ctx);
+        try self.captureHandle(idx, .source);
     }
 
     fn addComputed(self: *SyncModel, idx: usize, deps: []const usize, offset: V) !void {
-        gens[idx] += 1;
+        try self.prepareKey(idx);
         defs[idx] = try Def.withDeps(.computed, deps, offset);
         // Materialize eagerly so the node exists as a graph member. Its
         // dependency edge registers on the first *read*, which is why the
         // corpus reads before asserting a degree.
         _ = sync_read_fns[idx](self.ctx) catch {};
+        try self.captureHandle(idx, .computed);
     }
 
     /// `Context`'s own eager construct. `signalKeyed` rather than `signal`
     /// because the latter keys the slot cache by the comptime `valueFn` pointer.
     fn addSignal(self: *SyncModel, idx: usize, deps: []const usize, offset: V) !void {
-        gens[idx] += 1;
+        try self.prepareKey(idx);
         defs[idx] = try Def.withDeps(.signal, deps, offset);
         // `signalKeyed` is now `computedKeyed(...).eager()`, and `.eager()`
         // reserves the eager-recompute queue entry itself (via
@@ -721,6 +749,7 @@ const SyncModel = struct {
         // staleness.
         try self.ctx.reserveEagerRecomputeSlot();
         self.signals[idx] = try SignalMod.signalKeyed(V, self.ctx, syncKey(idx), sync_compute_fns[idx], null);
+        try self.captureHandle(idx, .computed);
     }
 
     fn disposeSignal(self: *SyncModel, idx: usize) void {
@@ -739,13 +768,14 @@ const SyncModel = struct {
     }
 
     fn addEffect(self: *SyncModel, comptime_idx: usize, dep: ?usize) !void {
-        gens[comptime_idx] += 1;
+        try self.prepareKey(comptime_idx);
         defs[comptime_idx] = try Def.withDeps(.effect, if (dep) |d| &[_]usize{d} else &[_]usize{}, 0);
         if (self.effects[comptime_idx]) |old| {
             self.ctx.allocator.destroy(old);
             self.effects[comptime_idx] = null;
         }
         self.effects[comptime_idx] = try sync_effect_ctors[comptime_idx](self.ctx);
+        try self.captureHandle(comptime_idx, .effect);
     }
 
     fn read(self: *SyncModel, idx: usize) !V {
@@ -757,11 +787,24 @@ const SyncModel = struct {
     }
 
     fn dispose(self: *SyncModel, idx: usize) void {
-        if (self.effects[idx]) |e| {
-            e.disposeNode();
-            return;
-        }
+        if (!self.live[idx]) return;
+        const h = self.handle(idx);
+        self.ctx.disposeNode(h);
+        self.free_handles[self.free_len] = h;
+        self.free_len += 1;
+        self.live[idx] = false;
+    }
+
+    fn disposeStale(self: *SyncModel, idx: usize) void {
         self.ctx.disposeNode(self.handle(idx));
+    }
+
+    fn rawId(self: *SyncModel, idx: usize) u64 {
+        return @intCast(self.handle(idx).key);
+    }
+
+    fn writable(_: *SyncModel, idx: usize) bool {
+        return defs[idx].kind == .cell;
     }
 
     fn dependentCount(self: *SyncModel, idx: usize) usize {
@@ -839,6 +882,8 @@ const TsModel = struct {
 
     ctx: ThreadSafeContext,
     ids: [MAX_NODES]u64 = @splat(0),
+    handles: [MAX_NODES]?ThreadSafeContext.NodeHandle = @splat(null),
+    live: [MAX_NODES]bool = @splat(false),
     /// The eager puller effect backing a `signal`, by the signal's node index.
     puller_ids: [MAX_NODES]?u64 = @splat(null),
     descs: [MAX_NODES]TsDesc = @splat(.{}),
@@ -849,7 +894,10 @@ const TsModel = struct {
         compute_counts[d.idx] += 1;
         const def = defs[d.idx];
         var acc: V = def.offset;
-        for (def.depSlice()) |dep| acc += cc.readNode(V, .{ .id = d.model.ids[dep] });
+        for (def.depSlice()) |dep| {
+            const h = d.model.handles[dep].?;
+            acc += cc.readNode(V, .{ .id = h.id, .generation = h.generation, .kind = h.kind });
+        }
         return acc;
     }
 
@@ -858,14 +906,16 @@ const TsModel = struct {
     /// an `observed_by` subscriber, so it must stay out of `EffectLog`.
     fn signalPuller(ptr: *anyopaque, cc: *ThreadSafeContext.ComputeContext) V {
         const d: *TsDesc = @ptrCast(@alignCast(ptr));
-        return cc.readNode(V, .{ .id = d.model.ids[d.idx] });
+        const h = d.model.handles[d.idx].?;
+        return cc.readNode(V, .{ .id = h.id, .generation = h.generation, .kind = h.kind });
     }
 
     fn effectCompute(ptr: *anyopaque, cc: *ThreadSafeContext.ComputeContext) V {
         const d: *TsDesc = @ptrCast(@alignCast(ptr));
         EffectLog.recordRun(d.idx);
         if (defs[d.idx].dep()) |dep| {
-            _ = cc.readNode(V, .{ .id = d.model.ids[dep] });
+            const h = d.model.handles[dep].?;
+            _ = cc.readNode(V, .{ .id = h.id, .generation = h.generation, .kind = h.kind });
         }
         return 0;
     }
@@ -894,13 +944,18 @@ const TsModel = struct {
 
     fn addCell(self: *TsModel, idx: usize, value: V) !void {
         defs[idx] = .{ .kind = .cell, .initial = value };
-        self.ids[idx] = (try self.ctx.cell(V, value)).id;
+        const h = try self.ctx.cell(V, value);
+        self.ids[idx] = h.id;
+        self.handles[idx] = .{ .id = h.id, .generation = h.generation, .kind = h.kind };
+        self.live[idx] = true;
     }
 
     fn addComputed(self: *TsModel, idx: usize, deps: []const usize, offset: V) !void {
         defs[idx] = try Def.withDeps(.computed, deps, offset);
         const h = try self.ctx.computedClosure(V, @ptrCast(self.bindDesc(idx)), compute);
         self.ids[idx] = h.id;
+        self.handles[idx] = .{ .id = h.id, .generation = h.generation, .kind = h.kind };
+        self.live[idx] = true;
     }
 
     /// `ThreadSafeContext` has no `Signal` type, so the signal is built the way
@@ -946,20 +1001,38 @@ const TsModel = struct {
         const d = self.bindDesc(idx);
         const h = try self.ctx.effectClosure(V, @ptrCast(d), effectCompute, @ptrCast(d), effectCleanup);
         self.ids[idx] = h.id;
+        self.handles[idx] = .{ .id = h.id, .generation = h.generation, .kind = h.kind };
+        self.live[idx] = true;
     }
 
     fn read(self: *TsModel, idx: usize) !V {
         if (defs[idx].kind == .effect) return error.EffectHasNoValue;
-        return self.ctx.tryGet(V, .{ .id = self.ids[idx] });
+        const h = self.handles[idx].?;
+        return self.ctx.tryGet(V, .{ .id = h.id, .generation = h.generation, .kind = h.kind });
     }
 
     fn setCell(self: *TsModel, idx: usize, value: V) !void {
         defs[idx].initial = value;
-        self.ctx.setCell(V, .{ .id = self.ids[idx] }, value);
+        const h = self.handles[idx].?;
+        self.ctx.setCell(V, .{ .id = h.id, .generation = h.generation, .kind = h.kind }, value);
     }
 
     fn dispose(self: *TsModel, idx: usize) void {
-        self.ctx.disposeNode(self.ids[idx]);
+        if (!self.live[idx]) return;
+        self.ctx.disposeHandle(self.handles[idx].?);
+        self.live[idx] = false;
+    }
+
+    fn disposeStale(self: *TsModel, idx: usize) void {
+        self.ctx.disposeHandle(self.handles[idx].?);
+    }
+
+    fn rawId(self: *TsModel, idx: usize) u64 {
+        return self.handles[idx].?.id;
+    }
+
+    fn writable(_: *TsModel, idx: usize) bool {
+        return defs[idx].kind == .cell;
     }
 
     fn dependentCount(self: *TsModel, idx: usize) usize {
@@ -983,7 +1056,7 @@ const TsModel = struct {
     }
 
     fn ownInScope(self: *TsModel, si: usize, idx: usize) !void {
-        try self.scopes[si].?.own(self.ids[idx]);
+        try self.scopes[si].?.ownHandle(self.handles[idx].?);
     }
 
     fn scopeLen(self: *TsModel, si: usize) usize {
@@ -1019,6 +1092,8 @@ const AsyncModel = struct {
 
     ctx: ACtx,
     ids: [MAX_NODES]u64 = @splat(0),
+    handles: [MAX_NODES]?AsyncNodeHandle = @splat(null),
+    live: [MAX_NODES]bool = @splat(false),
     puller_ids: [MAX_NODES]?u64 = @splat(null),
     descs: [MAX_NODES]AsyncDesc = @splat(.{}),
     scopes: [MAX_SCOPES]?ACtx.TeardownScope = @splat(null),
@@ -1082,12 +1157,18 @@ const AsyncModel = struct {
 
     fn addCell(self: *AsyncModel, idx: usize, value: V) !void {
         defs[idx] = .{ .kind = .cell, .initial = value };
-        self.ids[idx] = try self.ctx.cell(value);
+        const h = try self.ctx.source(value);
+        self.ids[idx] = h.id;
+        self.handles[idx] = .{ .id = h.id, .generation = h.generation, .kind = .source };
+        self.live[idx] = true;
     }
 
     fn addComputed(self: *AsyncModel, idx: usize, deps: []const usize, offset: V) !void {
         defs[idx] = try Def.withDeps(.computed, deps, offset);
-        self.ids[idx] = try self.ctx.computedAsyncClosure(@ptrCast(self.bindDesc(idx)), compute);
+        const h = try self.ctx.computedClosure(@ptrCast(self.bindDesc(idx)), compute);
+        self.ids[idx] = h.id;
+        self.handles[idx] = .{ .id = h.id, .generation = h.generation, .kind = .computed };
+        self.live[idx] = true;
         // Drain so the dependency edge this slot registers exists before the
         // next level is declared against it.
         _ = try self.ctx.settle();
@@ -1126,6 +1207,8 @@ const AsyncModel = struct {
         defs[idx] = try Def.withDeps(.effect, if (dep) |dd| &[_]usize{dd} else &[_]usize{}, 0);
         const d = self.bindDesc(idx);
         self.ids[idx] = try self.ctx.effectAsyncClosure(@ptrCast(d), effectCompute, @ptrCast(d), effectCleanup);
+        self.handles[idx] = self.ctx.handleFor(self.ids[idx]) orelse return error.MissingNodeHandle;
+        self.live[idx] = true;
         _ = try self.ctx.settle();
     }
 
@@ -1143,7 +1226,21 @@ const AsyncModel = struct {
     }
 
     fn dispose(self: *AsyncModel, idx: usize) void {
-        self.ctx.disposeNode(self.ids[idx]);
+        if (!self.live[idx]) return;
+        self.ctx.disposeHandle(self.handles[idx].?);
+        self.live[idx] = false;
+    }
+
+    fn disposeStale(self: *AsyncModel, idx: usize) void {
+        self.ctx.disposeHandle(self.handles[idx].?);
+    }
+
+    fn rawId(self: *AsyncModel, idx: usize) u64 {
+        return self.handles[idx].?.id;
+    }
+
+    fn writable(_: *AsyncModel, idx: usize) bool {
+        return defs[idx].kind == .cell;
     }
 
     fn dependentCount(self: *AsyncModel, idx: usize) usize {
@@ -1169,7 +1266,7 @@ const AsyncModel = struct {
     }
 
     fn ownInScope(self: *AsyncModel, si: usize, idx: usize) !void {
-        try self.scopes[si].?.own(self.ids[idx]);
+        try self.scopes[si].?.ownHandle(self.handles[idx].?);
     }
 
     fn scopeLen(self: *AsyncModel, si: usize) usize {
@@ -1315,6 +1412,7 @@ fn Engine(comptime Model: type) type {
         step: usize = 0,
         rep: Report = .{},
         allocator: std.mem.Allocator,
+        last_recycled_id_confirmed: bool = false,
 
         const Self = @This();
 
@@ -1461,16 +1559,12 @@ fn Engine(comptime Model: type) type {
                 // than errors.
                 self.model.disarmScope(try self.scope(try asString(field(op, "scope") orelse return error.MissingScope)));
             } else if (std.mem.eql(u8, op_type, "dispose_stale_handle")) {
-                // In this binding a handle is a cache key (sync) or a monotonic
-                // id (async / thread-safe), and neither is ever recycled — a
-                // disposed key keeps its tombstone for the life of the context.
-                // So a stale handle can only ever name the node it was minted
-                // for, and the "must not tear down whatever now owns that id"
-                // hazard is unreachable by construction rather than guarded
-                // against. What remains testable is the idempotence case, which
-                // is what this drives.
                 const target = try asString(field(op, "handle_of") orelse return error.MissingHandleOf);
-                self.model.dispose(try self.node(target));
+                const successor = try asString(field(op, "successor") orelse return error.MissingSuccessor);
+                const stale_idx = try self.node(target);
+                const successor_idx = try self.node(successor);
+                self.last_recycled_id_confirmed = self.model.rawId(stale_idx) == self.model.rawId(successor_idx);
+                self.model.disposeStale(stale_idx);
             } else {
                 // Unreachable: `firstUnsupported` gates the whole fixture.
                 std.debug.print("  unsupported op `{s}`\n", .{op_type});
@@ -1706,6 +1800,57 @@ fn Engine(comptime Model: type) type {
             }
         }
 
+        fn expectWritable(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |id| {
+                try members.assertKeyWith(
+                    id,
+                    MemberCtx{ .engine = ctx.engine, .key = "writable", .id = id },
+                    writableMember,
+                );
+            }
+        }
+
+        fn writableMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const want = switch (raw) {
+                .bool => |b| b,
+                else => return error.MalformedWritableAssertion,
+            };
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "writable.{s}", .{m.id}) catch "writable";
+            m.engine.check(sub, m.engine.model.writable(try m.engine.node(m.id)), want);
+        }
+
+        fn expectCleanupsOf(ctx: ExpectCtx, members: *cj.AssertionKeys) anyerror!void {
+            const map = try asObject(members.object);
+            for (try sortedKeys(map)) |id| {
+                try members.assertKeyWith(
+                    id,
+                    MemberCtx{ .engine = ctx.engine, .key = "cleanups_of", .id = id },
+                    cleanupsOfMember,
+                );
+            }
+        }
+
+        fn cleanupsOfMember(m: MemberCtx, raw: json.Value) anyerror!void {
+            const idx = try m.engine.node(m.id);
+            var got: usize = 0;
+            for (EffectLog.cleanups.items) |cleanup_idx| {
+                if (cleanup_idx == idx) got += 1;
+            }
+            var k: [96]u8 = undefined;
+            const sub = std.fmt.bufPrint(&k, "cleanups_of.{s}", .{m.id}) catch "cleanups_of";
+            m.engine.check(sub, got, try asUsize(raw));
+        }
+
+        fn expectRecycledIdConfirmed(ctx: ExpectCtx, raw: json.Value) anyerror!void {
+            const want = switch (raw) {
+                .bool => |b| b,
+                else => return error.MalformedRecycledIdAssertion,
+            };
+            ctx.engine.check("recycled_id_confirmed", ctx.engine.last_recycled_id_confirmed, want);
+        }
+
         fn readableMember(m: MemberCtx, raw: json.Value) anyerror!void {
             const want = switch (raw) {
                 .bool => |b| b,
@@ -1875,6 +2020,8 @@ fn Engine(comptime Model: type) type {
                     try block.assertObjectWith("read", ctx, expectRead);
                 } else if (std.mem.eql(u8, key, "readable")) {
                     try block.assertObjectWith("readable", ctx, expectReadable);
+                } else if (std.mem.eql(u8, key, "writable")) {
+                    try block.assertObjectWith("writable", ctx, expectWritable);
                 } else if (std.mem.eql(u8, key, "dependents_of")) {
                     try block.assertObjectWith("dependents_of", ctx, expectDegree);
                 } else if (std.mem.eql(u8, key, "dependencies_of")) {
@@ -1889,6 +2036,10 @@ fn Engine(comptime Model: type) type {
                     try block.assertKeyWith("cleanup_order", ctx, expectCleanupOrder);
                 } else if (std.mem.eql(u8, key, "scope_owned_count")) {
                     try block.assertObjectWith("scope_owned_count", ctx, expectScopeOwnedCount);
+                } else if (std.mem.eql(u8, key, "cleanups_of")) {
+                    try block.assertObjectWith("cleanups_of", ctx, expectCleanupsOf);
+                } else if (std.mem.eql(u8, key, "recycled_id_confirmed")) {
+                    try block.assertKeyWith("recycled_id_confirmed", ctx, expectRecycledIdConfirmed);
                 } else {
                     std.debug.print("  UNKNOWN assertion key `{s}`\n", .{key});
                     return error.UnknownAssertionKey;
@@ -2158,8 +2309,8 @@ fn replayFixture(comptime Model: type, fixture_name: []const u8, fx: json.Value,
     const ledger_fixture = try std.fmt.bufPrint(&ledger_id_buf, "reactive-graph/{s}", .{fixture_name});
     var ledger = try cj.scenarios(ledger_fixture, fx);
 
-    var obs_bufs: [8]Observation = @splat(.{});
-    var obs_names: [8][]const u8 = undefined;
+    var obs_bufs: [16]Observation = @splat(.{});
+    var obs_names: [16][]const u8 = undefined;
     var obs_len: usize = 0;
     defer for (obs_bufs[0..obs_len]) |*o| {
         var m = o.*;

@@ -28,20 +28,30 @@
 const std = @import("std");
 const ParkingMutex = @import("parking_mutex.zig").ParkingMutex;
 
+pub const TsNodeKind = enum { unknown, source, computed, effect };
+
 /// A handle to a `ThreadSafeContext` node (cell or slot). Copy + lightweight.
 pub fn TsHandle(comptime T: type) type {
     _ = T; // phantom: tags handles by value type at the API surface.
     return struct {
         id: u64,
+        generation: u64 = 0,
+        kind: TsNodeKind = .unknown,
         const Self = @This();
         pub fn eq(a: Self, b: Self) bool {
-            return a.id == b.id;
+            return a.id == b.id and a.generation == b.generation and a.kind == b.kind;
         }
     };
 }
 
 pub const ThreadSafeContext = struct {
     const Self = @This();
+
+    pub const NodeHandle = struct {
+        id: u64,
+        generation: u64,
+        kind: TsNodeKind,
+    };
 
     /// A slot compute expressed as userdata pointer + call fn (Zig closure
     /// emulation): `ptr` is captured state (e.g. a family + key). Typed by the
@@ -83,6 +93,8 @@ pub const ThreadSafeContext = struct {
     };
 
     const Node = struct {
+        generation: u64,
+        kind: TsNodeKind,
         /// Heap-boxed value (`*T`). Read/written only through the per-`T` thunks.
         box: *anyopaque,
         free_fn: *const fn (std.mem.Allocator, *anyopaque) void,
@@ -132,6 +144,7 @@ pub const ThreadSafeContext = struct {
     allocator: std.mem.Allocator,
     mutex: ParkingMutex,
     next_id: u64,
+    free_ids: std.ArrayList(u64),
     nodes: std.AutoHashMap(u64, Node),
     batch_depth: usize,
     /// Count of dependency-edge registrations dropped for lack of memory. Each
@@ -166,6 +179,7 @@ pub const ThreadSafeContext = struct {
             .allocator = allocator,
             .mutex = ParkingMutex.init(),
             .next_id = 1,
+            .free_ids = .empty,
             .nodes = std.AutoHashMap(u64, Node).init(allocator),
             .batch_depth = 0,
         };
@@ -179,6 +193,7 @@ pub const ThreadSafeContext = struct {
             node.dependents.deinit(self.allocator);
         }
         self.nodes.deinit();
+        self.free_ids.deinit(self.allocator);
         self.effects.deinit(self.allocator);
         self.pending_effects.deinit(self.allocator);
         self.teardown_scratch.deinit(self.allocator);
@@ -191,6 +206,30 @@ pub const ThreadSafeContext = struct {
     fn reserveTeardown(self: *Self) !void {
         try self.teardown_scratch.ensureTotalCapacity(self.allocator, self.nodes.count());
         try self.pending_effects.ensureTotalCapacity(self.allocator, self.nodes.count());
+        try self.free_ids.ensureTotalCapacity(self.allocator, self.nodes.count());
+    }
+
+    fn takeNodeId(self: *Self, kind: TsNodeKind) struct { id: u64, generation: u64 } {
+        if (self.free_ids.pop()) |id| {
+            var keep: usize = 0;
+            for (self.pending_effects.items) |pending_id| {
+                if (pending_id == id) continue;
+                self.pending_effects.items[keep] = pending_id;
+                keep += 1;
+            }
+            self.pending_effects.items.len = keep;
+            const removed = self.nodes.fetchRemove(id).?;
+            var old = removed.value;
+            const generation = old.generation +% 1;
+            old.free_fn(self.allocator, old.box);
+            old.deps.deinit(self.allocator);
+            old.dependents.deinit(self.allocator);
+            return .{ .id = id, .generation = if (generation == 0) 1 else generation };
+        }
+        const id = self.next_id;
+        self.next_id += 1;
+        _ = kind;
+        return .{ .id = id, .generation = 1 };
     }
 
     // --- type-erased box helpers (monomorphic per T) ---
@@ -222,16 +261,17 @@ pub const ThreadSafeContext = struct {
     pub fn cell(self: *Self, comptime T: type, value: T) !TsHandle(T) {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const id = self.next_id;
-        self.next_id += 1;
-        try self.nodes.put(id, .{
+        const identity = self.takeNodeId(.source);
+        try self.nodes.put(identity.id, .{
+            .generation = identity.generation,
+            .kind = .source,
             .box = try self.boxValue(T, value),
             .free_fn = Free(T).run,
             .deps = .empty,
             .dependents = .empty,
         });
         try self.reserveTeardown();
-        return .{ .id = id };
+        return .{ .id = identity.id, .generation = identity.generation, .kind = .source };
     }
 
     /// Read a cell or (recomputing if dirty) a slot — by copy.
@@ -289,10 +329,12 @@ pub const ThreadSafeContext = struct {
     ) !TsHandle(T) {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const id = self.next_id;
-        self.next_id += 1;
+        const identity = self.takeNodeId(.computed);
+        const id = identity.id;
         // Seed with a first compute so the box holds a real value.
         try self.nodes.put(id, .{
+            .generation = identity.generation,
+            .kind = .computed,
             .box = try self.boxValue(T, undefined),
             .free_fn = Free(T).run,
             .compute_ptr = ptr,
@@ -304,7 +346,7 @@ pub const ThreadSafeContext = struct {
         });
         try self.reserveTeardown();
         Recompute(T).run(self, id);
-        return .{ .id = id };
+        return .{ .id = id, .generation = identity.generation, .kind = .computed };
     }
 
     /// A side effect rather than a value: a computed slot flagged so the
@@ -323,11 +365,12 @@ pub const ThreadSafeContext = struct {
         defer self.mutex.unlock();
         const n = self.nodes.getPtr(handle.id).?;
         n.is_effect = true;
+        n.kind = .effect;
         n.effect_ran = true;
         n.cleanup_ptr = cleanup_ptr;
         n.cleanup_fn = cleanup_fn;
         try self.effects.append(self.allocator, handle.id);
-        return handle;
+        return .{ .id = handle.id, .generation = handle.generation, .kind = .effect };
     }
 
     /// Run every dirty effect. Called after a publish, because this context has
@@ -559,11 +602,30 @@ pub const ThreadSafeContext = struct {
         }
     }
 
-    /// Tear one node out of the graph. Idempotent, allocation-free, infallible.
+    /// Tear one node out of the graph by raw id. Deprecated for retained
+    /// identities: use `disposeHandle`, which generation- and kind-checks.
+    /// Idempotent, allocation-free, infallible.
     pub fn disposeNode(self: *Self, id: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.disposeNodeUnlocked(id);
+    }
+
+    /// Generation- and kind-fenced disposal for copyable public handles.
+    /// A stale or cross-kind handle is an idempotent no-op.
+    pub fn disposeHandle(self: *Self, handle: NodeHandle) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const node = self.nodes.getPtr(handle.id) orelse return;
+        if (node.generation != handle.generation or node.kind != handle.kind) return;
+        self.disposeNodeUnlocked(handle.id);
+    }
+
+    pub fn handleFor(self: *Self, id: u64) ?NodeHandle {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const node = self.nodes.getPtr(id) orelse return null;
+        return .{ .id = id, .generation = node.generation, .kind = node.kind };
     }
 
     fn disposeNodeUnlocked(self: *Self, id: u64) void {
@@ -597,6 +659,8 @@ pub const ThreadSafeContext = struct {
         final.cleanup_fn = null;
         final.recompute_fn = null;
         final.dirty = false;
+        std.debug.assert(self.free_ids.capacity > self.free_ids.items.len);
+        self.free_ids.appendAssumeCapacity(id);
     }
 
     pub fn scope(self: *Self) TeardownScope {
@@ -606,12 +670,18 @@ pub const ThreadSafeContext = struct {
     /// See `Context.TeardownScope`. `own` allocates; `deinit` cannot fail.
     pub const TeardownScope = struct {
         ctx: *Self,
-        owned: std.ArrayList(u64),
+        owned: std.ArrayList(NodeHandle),
         armed: bool = true,
 
         pub fn own(self: *TeardownScope, id: u64) !void {
             if (!self.armed) return;
-            try self.owned.append(self.ctx.allocator, id);
+            const handle = self.ctx.handleFor(id) orelse return;
+            try self.owned.append(self.ctx.allocator, handle);
+        }
+
+        pub fn ownHandle(self: *TeardownScope, handle: NodeHandle) !void {
+            if (!self.armed) return;
+            try self.owned.append(self.ctx.allocator, handle);
         }
 
         pub fn len(self: *const TeardownScope) usize {
@@ -628,7 +698,7 @@ pub const ThreadSafeContext = struct {
                 var i = self.owned.items.len;
                 while (i > 0) {
                     i -= 1;
-                    self.ctx.disposeNode(self.owned.items[i]);
+                    self.ctx.disposeHandle(self.owned.items[i]);
                 }
             }
             self.owned.deinit(self.ctx.allocator);

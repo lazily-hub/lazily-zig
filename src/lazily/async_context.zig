@@ -31,6 +31,14 @@ pub const AsyncSlotState = AsyncComputedState;
 
 pub const AsyncContextId = u64;
 
+pub const AsyncNodeKind = enum { source, computed, effect };
+
+pub const AsyncNodeHandle = struct {
+    id: u64,
+    generation: u64,
+    kind: AsyncNodeKind,
+};
+
 /// A mutable input handle over the generation-checked source registry.
 pub fn AsyncSource(comptime T: type) type {
     _ = T;
@@ -172,6 +180,7 @@ pub fn AsyncContext(comptime V: type) type {
 
         allocator: std.mem.Allocator,
         next_id: u64 = 1,
+        free_ids: std.ArrayList(u64),
         generations: std.AutoHashMap(u64, u64),
         pending: std.ArrayList(u64),
         edges: std.AutoHashMap(u64, std.ArrayList(u64)), // slot_id -> [cell_id]
@@ -192,6 +201,7 @@ pub fn AsyncContext(comptime V: type) type {
             return .{
                 .allocator = allocator,
                 .generations = std.AutoHashMap(u64, u64).init(allocator),
+                .free_ids = .empty,
                 .pending = .empty,
                 .edges = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
                 .reverse_edges = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
@@ -204,6 +214,7 @@ pub fn AsyncContext(comptime V: type) type {
 
         pub fn deinit(self: *Self) void {
             self.generations.deinit();
+            self.free_ids.deinit(self.allocator);
             self.pending.deinit(self.allocator);
             self.disposed_cells.deinit();
             self.teardown_scratch.deinit(self.allocator);
@@ -232,9 +243,30 @@ pub fn AsyncContext(comptime V: type) type {
             if (current != generation) return error.StaleHandle;
         }
 
-        fn createSourceId(self: *Self, value: V) !u64 {
+        fn takeNodeId(self: *Self) u64 {
+            if (self.free_ids.pop()) |id| {
+                var keep: usize = 0;
+                for (self.pending.items) |pending_id| {
+                    if (pending_id == id) continue;
+                    self.pending.items[keep] = pending_id;
+                    keep += 1;
+                }
+                self.pending.items.len = keep;
+                _ = self.disposed_cells.remove(id);
+                if (self.slots.fetchRemove(id)) |removed| {
+                    var old = removed.value;
+                    old.deinit(self.allocator);
+                }
+                _ = self.cells.remove(id);
+                return id;
+            }
             const id = self.next_id;
             self.next_id += 1;
+            return id;
+        }
+
+        fn createSourceId(self: *Self, value: V) !u64 {
+            const id = self.takeNodeId();
             _ = try self.registerGeneration(id);
             errdefer _ = self.generations.remove(id);
             try self.cells.put(id, value);
@@ -298,6 +330,7 @@ pub fn AsyncContext(comptime V: type) type {
             try self.teardown_scratch.ensureTotalCapacity(self.allocator, n);
             try self.pending.ensureTotalCapacity(self.allocator, n);
             try self.disposed_cells.ensureTotalCapacity(@intCast(n));
+            try self.free_ids.ensureTotalCapacity(self.allocator, n);
         }
 
         /// Synchronous write. If not inside a settle, invalidates dependent slots
@@ -333,8 +366,7 @@ pub fn AsyncContext(comptime V: type) type {
         /// run. This is what lets a per-key family entry resolve a key-dependent
         /// value on a no-closure engine.
         fn createComputedId(self: *Self, ptr: *anyopaque, compute: ComputeFn) !u64 {
-            const id = self.next_id;
-            self.next_id += 1;
+            const id = self.takeNodeId();
             var node = SlotNode.init();
             node.compute_ptr = ptr;
             node.compute_fn = compute;
@@ -696,8 +728,10 @@ pub fn AsyncContext(comptime V: type) type {
             }
         }
 
-        /// Tear one node out of the graph. Idempotent, allocation-free,
-        /// infallible — see `reserveTeardown`.
+        /// Tear one node out of the graph by raw id. Deprecated for retained
+        /// identities: use `disposeSource`, `disposeComputed`, or
+        /// `disposeHandle`, which validate occupant identity first. Idempotent,
+        /// allocation-free, infallible — see `reserveTeardown`.
         pub fn disposeNode(self: *Self, id: u64) void {
             const is_slot = self.slots.contains(id);
             const is_cell = self.cells.contains(id);
@@ -741,6 +775,29 @@ pub fn AsyncContext(comptime V: type) type {
                 // Capacity reserved at `cell()`.
                 self.disposed_cells.putAssumeCapacity(id, {});
             }
+            std.debug.assert(self.free_ids.capacity > self.free_ids.items.len);
+            self.free_ids.appendAssumeCapacity(id);
+        }
+
+        pub fn handleFor(self: *Self, id: u64) ?AsyncNodeHandle {
+            const generation = self.generations.get(id) orelse return null;
+            if (self.cells.contains(id)) {
+                return .{ .id = id, .generation = generation, .kind = .source };
+            }
+            const node = self.slots.get(id) orelse return null;
+            return .{
+                .id = id,
+                .generation = generation,
+                .kind = if (node.is_effect) .effect else .computed,
+            };
+        }
+
+        /// Dispose only when all three identity components still name the
+        /// current occupant. Stale and cross-kind handles are no-ops.
+        pub fn disposeHandle(self: *Self, handle: AsyncNodeHandle) void {
+            const current = self.handleFor(handle.id) orelse return;
+            if (current.generation != handle.generation or current.kind != handle.kind) return;
+            self.disposeNode(handle.id);
         }
 
         /// Dispose a canonical source handle.
@@ -764,12 +821,18 @@ pub fn AsyncContext(comptime V: type) type {
         /// order. `own` is where the allocation happens; `deinit` cannot fail.
         pub const TeardownScope = struct {
             ctx: *Self,
-            owned: std.ArrayList(u64),
+            owned: std.ArrayList(AsyncNodeHandle),
             armed: bool = true,
 
             pub fn own(self: *TeardownScope, id: u64) !void {
                 if (!self.armed) return;
-                try self.owned.append(self.ctx.allocator, id);
+                const handle = self.ctx.handleFor(id) orelse return;
+                try self.owned.append(self.ctx.allocator, handle);
+            }
+
+            pub fn ownHandle(self: *TeardownScope, handle: AsyncNodeHandle) !void {
+                if (!self.armed) return;
+                try self.owned.append(self.ctx.allocator, handle);
             }
 
             pub fn len(self: *const TeardownScope) usize {
@@ -786,7 +849,7 @@ pub fn AsyncContext(comptime V: type) type {
                     var i = self.owned.items.len;
                     while (i > 0) {
                         i -= 1;
-                        self.ctx.disposeNode(self.owned.items[i]);
+                        self.ctx.disposeHandle(self.owned.items[i]);
                     }
                 }
                 self.owned.deinit(self.ctx.allocator);

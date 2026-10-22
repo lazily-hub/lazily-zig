@@ -143,6 +143,10 @@ pub const Context = struct {
     // from the top of usize; cacheLookup below still guards the sparse key
     // namespace against an explicitly-keyed node that is already present.
     next_dynamic_cache_key: usize = std.math.maxInt(usize),
+    // Monotonic occupant identity for cache-key reuse. A cache key is the
+    // recyclable slot id; the generation distinguishes successive occupants.
+    next_node_generation: u64 = 1,
+    node_generations: std.AutoHashMap(usize, u64),
     // Optional dense direct-indexed cache for the keyed (runtime-integer-key)
     // path. When non-null, `cacheLookup`/`cachePublish`/`cacheRemove` consult it
     // first, turning a hot keyed read into a single indexed load instead of a
@@ -271,6 +275,7 @@ pub const Context = struct {
                 usize,
                 *Slot,
             ).init(allocator),
+            .node_generations = std.AutoHashMap(usize, u64).init(allocator),
             .pending_recompute = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
             .orphaned_slots = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
             .cascade_scratch = if (builtin.zig_version.minor < 16) .{} else std.ArrayList(*Slot).empty,
@@ -355,6 +360,7 @@ pub const Context = struct {
             context_slot.destroyUnlocked(false);
         }
         self.cache.deinit();
+        self.node_generations.deinit();
 
         // Dense-cache entries are NOT duplicated in the hash map, so destroy any
         // slots held only by the dense array before freeing it.
@@ -499,15 +505,23 @@ pub const Context = struct {
 
     /// A copyable handle naming one node in this graph.
     ///
-    /// The sync `Context` identifies a node by its *cache key*, not by a `*Slot`:
+    /// The sync `Context` identifies a node by its cache key, occupant
+    /// generation, and node kind, not by a `*Slot`:
     /// invalidate-in-place (`#lzinplace`) orphans a stale slot and materializes a
     /// replacement, so a raw `*Slot` stops naming the node the moment anything it
-    /// reads changes. The cache key survives that, which is what makes it the
-    /// honest handle. Handles are ids, not owners — dropping every copy of one
+    /// reads changes. The generation survives ordinary rematerialization but
+    /// changes when a disposed key is explicitly recycled; the kind prevents a
+    /// cross-kind alias. Handles are ids, not owners — dropping every copy of one
     /// reclaims nothing; the reverse edge each dependency holds keeps the node
     /// and its edge sets alive for the life of the Context, which is precisely
     /// the leak `churn_returns_to_baseline.json` pins.
-    pub const NodeHandle = struct { key: usize };
+    pub const NodeKind = enum { source, computed, effect };
+
+    pub const NodeHandle = struct {
+        key: usize,
+        generation: u64,
+        kind: NodeKind,
+    };
 
     pub const DisposeError = error{NodeDisposed};
 
@@ -517,7 +531,7 @@ pub const Context = struct {
     pub fn dependentCount(self: *Context, h: NodeHandle) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const s = self.cacheLookup(h.key) orelse return 0;
+        const s = self.slotForHandle(h) orelse return 0;
         return s.change_subscribers.count();
     }
 
@@ -525,14 +539,14 @@ pub const Context = struct {
     pub fn dependencyCount(self: *Context, h: NodeHandle) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const s = self.cacheLookup(h.key) orelse return 0;
+        const s = self.slotForHandle(h) orelse return 0;
         return s.parents.count();
     }
 
     pub fn isDisposed(self: *Context, h: NodeHandle) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const s = self.cacheLookup(h.key) orelse return false;
+        const s = self.slotForHandle(h) orelse return false;
         return s.disposed;
     }
 
@@ -541,8 +555,37 @@ pub const Context = struct {
     pub fn disposeNode(self: *Context, h: NodeHandle) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const s = self.cacheLookup(h.key) orelse return;
+        const s = self.slotForHandle(h) orelse return;
         s.disposeUnlocked();
+    }
+
+    /// Retire a disposed occupant so the same cache key can name a new node.
+    /// The old slot remains alive until Context.deinit because callers may
+    /// still hold typed pointers into it. Its handle is generation-fenced and
+    /// can never act on the successor.
+    pub fn recycleDisposedNode(self: *Context, h: NodeHandle) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.slotForHandle(h) orelse return;
+        if (!s.disposed) return;
+        try self.orphaned_slots.append(self.allocator, s);
+        var next = s.generation +% 1;
+        if (next == 0) next = 1;
+        self.node_generations.getPtr(h.key).?.* = next;
+        self.cacheRemove(h.key);
+    }
+
+    fn slotForHandle(self: *Context, h: NodeHandle) ?*Slot {
+        const s = self.cacheLookup(h.key) orelse return null;
+        if (s.generation != h.generation or s.node_kind != h.kind) return null;
+        return s;
+    }
+
+    pub fn handleForKey(self: *Context, key: usize) ?NodeHandle {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.cacheLookup(key) orelse return null;
+        return .{ .key = key, .generation = s.generation, .kind = s.node_kind };
     }
 
     /// Open a teardown scope. Ends at `defer scope.deinit()` — the idiom that
@@ -1198,6 +1241,8 @@ pub const Slot = struct {
     value_fn_ptr: ?*anyopaque,
     cache_key: ?usize = null,
     id: SlotId = .{ .raw = 0 },
+    generation: u64 = 0,
+    node_kind: Context.NodeKind = .computed,
     deinitPayload: ?*const fn (*Slot) void,
     free: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
     // Eager-Signal hooks (default null = lazy/destroy-on-invalidate semantics).
@@ -1336,6 +1381,14 @@ pub const Slot = struct {
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
 
+        const generation_entry = try ctx.node_generations.getOrPut(cache_key);
+        if (!generation_entry.found_existing) {
+            generation_entry.value_ptr.* = ctx.next_node_generation;
+            ctx.next_node_generation +%= 1;
+            if (ctx.next_node_generation == 0) ctx.next_node_generation = 1;
+        }
+        const generation = generation_entry.value_ptr.*;
+
         const self = try ctx.arena.alloc();
         // `arena.alloc` stamps `self.id`; preserve it across the struct literal
         // below (the literal re-initializes every field and would zero `id`).
@@ -1346,6 +1399,7 @@ pub const Slot = struct {
             .value_fn_ptr = null,
             .cache_key = cache_key,
             .id = slot_id,
+            .generation = generation,
             .mode = mode,
             .storage = null,
             .ptr_size = ptr_size,

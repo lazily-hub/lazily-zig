@@ -125,7 +125,8 @@ test "disposal does not run an effect that survives in the disposed cone (Contex
 
     _ = try CellMod.cell(i64, ctx, Sem2.srcInit, null);
     _ = try CellMod.cell(i64, ctx, Sem2.otherInit, null);
-    _ = try slotKeyed(i64, ctx, ContextMod.valueFnCacheKey(&Sem2.mid), Sem2.mid, null);
+    const mid_key = ContextMod.valueFnCacheKey(&Sem2.mid);
+    _ = try slotKeyed(i64, ctx, mid_key, Sem2.mid, null);
 
     const watch = try EffectMod.effect(void, ctx, Sem2.watchBody);
     defer a.destroy(watch);
@@ -140,7 +141,7 @@ test "disposal does not run an effect that survives in the disposed cone (Contex
     // other dependent (marking it stale and letting `on_invalidate` enqueue),
     // combined with any drain — the flush-inside-dispose shape.
     const before_dispose = Log.runs_len;
-    ctx.disposeNode(.{ .key = ContextMod.valueFnCacheKey(&Sem2.mid) });
+    ctx.disposeNode(ctx.handleForKey(mid_key).?);
     try testing.expectEqualSlices(u8, "", Log.ranSince(before_dispose));
 
     // The survivor is still live: disposal marks, it does not deactivate.
@@ -475,13 +476,104 @@ test "disposal dirties the surviving dependent cone (Context)" {
     defer ctx.deinit();
     Sem2.src_v = 1;
 
-    _ = try CellMod.cell(i64, ctx, Sem2.srcInit, null);
+    const src = try CellMod.cell(i64, ctx, Sem2.srcInit, null);
     const mid_key = ContextMod.valueFnCacheKey(&Sem2.mid);
     try testing.expectEqual(@as(i64, 11), (try slotKeyed(i64, ctx, mid_key, Sem2.mid, null)).*);
 
     // A live reader frozen on its pre-disposal cache is the defect this pins
     // (lazily-rs 5db90d2, lazily-js 4d20670): after `src` is disposed, `mid`
     // must not keep serving 11.
-    ctx.disposeNode(.{ .key = ContextMod.valueFnCacheKey(&Sem2.srcInit) });
+    ctx.disposeNode(src.handle());
     try testing.expectError(error.NodeDisposed, slotKeyed(i64, ctx, mid_key, Sem2.mid, null));
+}
+
+// Mutation evidence for the two identity fences: deleting any context's
+// generation or node-kind comparison makes the corresponding test fail.
+test "stale-generation disposal handles are no-ops (all three contexts)" {
+    const a = testing.allocator;
+
+    {
+        const ctx = try Context.init(a);
+        defer ctx.deinit();
+        const key: usize = 0x5a1e;
+        Sem2.src_v = 1;
+        const first = try CellMod.cellKeyed(i64, ctx, key, Sem2.srcInit, null);
+        const stale = first.handle();
+        ctx.disposeNode(stale);
+        try ctx.recycleDisposedNode(stale);
+
+        Sem2.src_v = 2;
+        const successor = try CellMod.cellKeyed(i64, ctx, key, Sem2.srcInit, null);
+        const live = successor.handle();
+        try testing.expectEqual(stale.key, live.key);
+        try testing.expect(stale.generation != live.generation);
+        ctx.disposeNode(stale);
+        try testing.expect(!ctx.isDisposed(live));
+        try testing.expectEqual(@as(i64, 2), successor.tryGet());
+    }
+
+    {
+        var ctx = ThreadSafeContext.init(a);
+        defer ctx.deinit();
+        const first = try ctx.cell(i64, 1);
+        const stale = ThreadSafeContext.NodeHandle{ .id = first.id, .generation = first.generation, .kind = first.kind };
+        ctx.disposeHandle(stale);
+        const successor = try ctx.cell(i64, 2);
+        try testing.expectEqual(stale.id, successor.id);
+        try testing.expect(stale.generation != successor.generation);
+        ctx.disposeHandle(stale);
+        try testing.expect(!ctx.isDisposed(successor.id));
+        try testing.expectEqual(@as(i64, 2), ctx.getCell(i64, successor));
+    }
+
+    {
+        var ctx = ACtx.init(a);
+        defer ctx.deinit();
+        const first = try ctx.source(1);
+        const stale = @import("async_context.zig").AsyncNodeHandle{
+            .id = first.id,
+            .generation = first.generation,
+            .kind = .source,
+        };
+        ctx.disposeHandle(stale);
+        const successor = try ctx.source(2);
+        try testing.expectEqual(stale.id, successor.id);
+        try testing.expect(stale.generation != successor.generation);
+        ctx.disposeHandle(stale);
+        try testing.expect(!ctx.isDisposed(successor.id));
+        try testing.expectEqual(@as(i64, 2), try ctx.getSource(successor));
+    }
+}
+
+test "cross-kind disposal handles are no-ops (all three contexts)" {
+    const a = testing.allocator;
+
+    {
+        const ctx = try Context.init(a);
+        defer ctx.deinit();
+        Sem2.src_v = 1;
+        const source = try CellMod.cell(i64, ctx, Sem2.srcInit, null);
+        const h = source.handle();
+        ctx.disposeNode(.{ .key = h.key, .generation = h.generation, .kind = .effect });
+        try testing.expect(!ctx.isDisposed(h));
+        try testing.expectEqual(@as(i64, 1), source.tryGet());
+    }
+
+    {
+        var ctx = ThreadSafeContext.init(a);
+        defer ctx.deinit();
+        const h = try ctx.cell(i64, 1);
+        ctx.disposeHandle(.{ .id = h.id, .generation = h.generation, .kind = .effect });
+        try testing.expect(!ctx.isDisposed(h.id));
+        try testing.expectEqual(@as(i64, 1), ctx.getCell(i64, h));
+    }
+
+    {
+        var ctx = ACtx.init(a);
+        defer ctx.deinit();
+        const h = try ctx.source(1);
+        ctx.disposeHandle(.{ .id = h.id, .generation = h.generation, .kind = .effect });
+        try testing.expect(!ctx.isDisposed(h.id));
+        try testing.expectEqual(@as(i64, 1), try ctx.getSource(h));
+    }
 }

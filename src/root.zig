@@ -530,12 +530,15 @@ pub const SignalingRoom = signaling.SignalingRoom;
 pub const thread_safe_context = @import("./lazily/thread_safe_context.zig");
 pub const ThreadSafeContext = thread_safe_context.ThreadSafeContext;
 pub const TsHandle = thread_safe_context.TsHandle;
+pub const TsNodeKind = thread_safe_context.TsNodeKind;
 pub const async_context = @import("./lazily/async_context.zig");
 /// Generic async reactive context: `AsyncContext(V)` per value type. Nested
 /// `AsyncContext(V).ComputeContext` replaces the old top-level `AsyncComputeContext`.
 pub const AsyncContext = async_context.AsyncContext;
 pub const AsyncComputed = async_context.AsyncComputed;
 pub const AsyncComputedState = async_context.AsyncComputedState;
+pub const AsyncNodeHandle = async_context.AsyncNodeHandle;
+pub const AsyncNodeKind = async_context.AsyncNodeKind;
 pub const AsyncSource = async_context.AsyncSource;
 /// Deprecated: use `AsyncComputedState`.
 pub const AsyncSlotState = async_context.AsyncSlotState;
