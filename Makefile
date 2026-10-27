@@ -39,9 +39,10 @@ assertion-ordering-check \
 	ci-reach \
 	core-conformance-report \
 	core-report-self-test \
-	core-artifact-consumer-check
+	core-artifact-consumer-check \
+	core-evidence-check
 
-check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check core-package-check core-api-check core-report-self-test core-artifact-consumer-check ci-reach
+check: fmt test test-interop-peer test-lean-formal conformance-coverage assertion-ordering-check core-package-check core-api-check core-report-self-test core-artifact-consumer-check core-evidence-check ci-reach
 
 core-api-check:
 	$(ZIG) build core-test
@@ -52,6 +53,16 @@ core-package-check:
 
 core-artifact-consumer-check:
 	./scripts/core-artifact-consumer-check.sh
+
+# Per-binding Core evidence gate (#lzbindingevidenceci). Runs lazily-spec's
+# verifier for this binding alone: it regenerates the Core report through
+# scripts/core-conformance.json's report_command, then checks it against the
+# canonical profile, so stale evidence handles, unreported skips and a missing
+# report are red on push instead of only at cohort qualification.
+# --require-all turns an absent ../lazily-spec layout or declaration into a
+# failure, never a skip.
+core-evidence-check:
+	node ../lazily-spec/scripts/check-core-evidence.mjs --bindings-root .. --binding zig --reports build/core-evidence --generate-reports --require-all
 
 assertion-ordering-check:
 	python3 $(LAZILY_SPEC_ROOT)/scripts/check-assertion-ordering.py --binding zig --root .

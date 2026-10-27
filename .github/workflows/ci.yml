@@ -326,3 +326,40 @@ jobs:
 
       - name: Clean packaged Core consumer (minimum/current)
         run: ./scripts/core-artifact-consumer-check.sh
+
+  # ---------------------------------------------------------------------------
+  # Per-binding Core evidence gate (#lzbindingevidenceci). Regenerates this
+  # binding's Core report and verifies it with lazily-spec's checker on every
+  # push, so evidence drift (a stale handle, an unreported skip, a missing
+  # report) is caught here rather than at the next cohort qualification.
+  # --require-all fails closed on a missing declaration or report. Its own job
+  # on the Core toolchain (0.16.0) for the same reason as the consumer above:
+  # a `matrix.zig` step condition is invisible to the job pins, and the report
+  # replays the corpus with mutants, which does not fit the matrix's 5 minutes.
+  core-evidence:
+    name: Core evidence gate / Zig 0.16.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fetch canonical lazily-spec for the Core evidence gate
+        run: |
+          git clone --depth 1 --branch "$LAZILY_SPEC_TAG" \
+            https://github.com/lazily-hub/lazily-spec.git ../lazily-spec
+          test "$(git -C ../lazily-spec rev-parse HEAD)" = "$LAZILY_SPEC_COMMIT"
+
+      - name: Set up Node for the Core evidence gate
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Core evidence gate (#lzbindingevidenceci)
+        run: node ../lazily-spec/scripts/check-core-evidence.mjs --bindings-root .. --binding zig --reports build/core-evidence --generate-reports --require-all

@@ -201,6 +201,7 @@ EXPECTED_CLOSURE_TARGETS=(
 	conformance-coverage
 	core-api-check
 	core-artifact-consumer-check
+	core-evidence-check
 	core-package-check
 	core-report-self-test
 	fmt
@@ -289,6 +290,7 @@ EXPECTED_STEP_FOR_TARGET=(
 	"conformance-coverage|test|Conformance coverage guard"
 	"core-api-check|test|Core API compatibility gate"
 	"core-artifact-consumer-check|core-artifact-consumer|Clean packaged Core consumer (minimum/current)"
+	"core-evidence-check|core-evidence|Core evidence gate (#lzbindingevidenceci)"
 	"core-package-check|test|Core facade package contract"
 	"core-report-self-test|test|Core report negative-control self-test"
 	"test|test|Test"
@@ -407,6 +409,7 @@ EXPECTED_TRIGGER_FILTERS=(
 EXPECTED_GATE_JOBS=(
 	ci-reach
 	core-artifact-consumer
+	core-evidence
 	fmt
 	lean-formal
 	test
@@ -424,6 +427,7 @@ EXPECTED_GATE_JOBS=(
 EXPECTED_JOB_ACTIVATION=(
 	"ci-reach|continue-on-error=;if=;needs="
 	"core-artifact-consumer|continue-on-error=;if=;needs="
+	"core-evidence|continue-on-error=;if=;needs="
 	"fmt|continue-on-error=;if=;needs="
 	"lean-formal|continue-on-error=;if=;needs="
 	"test|continue-on-error=\${{ matrix.zig == 'master' }};if=;needs="
@@ -467,6 +471,7 @@ EXPECTED_JOB_ACTIVATION=(
 EXPECTED_JOB_MATRIX=(
 	"ci-reach|"
 	"core-artifact-consumer|"
+	"core-evidence|"
 	"fmt|"
 	"lean-formal|"
 	"test|zig=0.15.2,0.16.0,master"
