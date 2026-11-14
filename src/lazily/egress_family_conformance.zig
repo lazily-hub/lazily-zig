@@ -419,6 +419,7 @@ fn expectReturns(where: []const u8, op_type: []const u8, model: anytype, op: cj.
         switch (result) {
             .advanced => |through| try keys.assertKey("through", through),
             .unchanged => |through| try keys.assertKey("through", through),
+            .beyond_sent => |next_sequence| try keys.assertKey("next_sequence", next_sequence),
             .stale_generation => |current| try keys.assertKey("current", current),
         }
     } else if (std.mem.eql(u8, op_type, "fail")) {
@@ -566,6 +567,7 @@ const Corpus = struct {
 fn replayCorpus(comptime Model: type, corpus: *const Corpus) !usize {
     var executed: usize = 0;
     for (corpus.fixtures, FIXTURES) |f, name| executed += try replayFixture(Model, name, f.value);
+    std.debug.print("egress corpus [{s}]: executed {d} steps across {d} fixtures\n", .{ Model.label, executed, FIXTURES.len });
     return executed;
 }
 

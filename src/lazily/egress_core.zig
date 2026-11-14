@@ -57,6 +57,10 @@ pub fn EgressClaim(comptime T: type) type {
 pub const EgressAck = union(enum) {
     advanced: u64,
     unchanged: ?u64,
+    /// `through` names a sequence never assigned. Refused: accepting it would
+    /// lift the watermark over the next enqueue and strand that record (its
+    /// genuine ACK would then read `unchanged`). Carries `next_sequence`.
+    beyond_sent: u64,
     stale_generation: u64,
 };
 
@@ -214,6 +218,11 @@ pub fn EgressCore(comptime T: type) type {
             if (attachment_generation != self.current_generation) {
                 return .{ .change = .{}, .outcome = .{ .stale_generation = self.current_generation } };
             }
+            // After the fence, BEFORE the watermark: a refusal changes nothing
+            // and invalidates nothing.
+            if (through >= self.next_seq) {
+                return .{ .change = .{}, .outcome = .{ .beyond_sent = self.next_seq } };
+            }
             if (self.acked) |current| {
                 if (through <= current) return .{ .change = .{}, .outcome = .{ .unchanged = current } };
             }
@@ -301,8 +310,12 @@ pub fn EgressCore(comptime T: type) type {
             for (self.pending_list.items) |*record| record.generation = new_generation;
             const retry_changed = self.last_retry != null;
             self.last_retry = null;
+            // Every retained envelope's generation was rewritten above, so a
+            // cached `pending` is stale whenever ANY record is retained — not
+            // only when something was replayed out of the window.
+            const pending_changed = replayed > 0 or self.pending_list.items.len > 0;
             return .{
-                .change = .{ .pending = replayed > 0, .inflight = replayed > 0, .retry = retry_changed },
+                .change = .{ .pending = pending_changed, .inflight = replayed > 0, .retry = retry_changed },
                 .outcome = .{ .advanced = .{ .generation = new_generation, .replayed = replayed } },
             };
         }
@@ -380,6 +393,43 @@ test "lazily/egress_core: retry budget is bounded and backoff doubles to the cei
     try testing.expectEqual(@as(u64, 10), exhausted.exhausted.backoff);
     try testing.expectEqual(@as(usize, 0), core.pending().len);
     try testing.expect((try core.retryNow(1, second.sequence)).outcome == .unknown_sequence);
+}
+
+test "lazily/egress_core: an ack past the last assigned sequence is refused and changes nothing" {
+    var core = try EgressCore(u64).init(testing.allocator, 1, .{});
+    defer core.deinit();
+    // Nothing assigned yet: even `through = 0` is beyond what was sent.
+    const empty = core.ack(1, 0);
+    try testing.expectEqual(EgressAck{ .beyond_sent = 0 }, empty.outcome);
+    try testing.expect(empty.change.isEmpty());
+    _ = try core.enqueue(10);
+    _ = try core.claim(1);
+    const refused = core.ack(1, 1);
+    try testing.expectEqual(EgressAck{ .beyond_sent = 1 }, refused.outcome);
+    try testing.expect(refused.change.isEmpty());
+    try testing.expectEqual(@as(?u64, null), core.ackedThrough());
+    try testing.expectEqual(@as(usize, 1), core.inflight().len);
+    // The fence still wins over the refusal.
+    try testing.expectEqual(@as(u64, 1), core.ack(0, 5).outcome.stale_generation);
+    // The next record is not stranded: its genuine ack still advances.
+    _ = try core.enqueue(20);
+    try testing.expectEqual(EgressAck{ .advanced = 1 }, core.ack(1, 1).outcome);
+}
+
+test "lazily/egress_core: a replay-free reconnect still invalidates a non-empty pending" {
+    var core = try EgressCore(u64).init(testing.allocator, 3, .{});
+    defer core.deinit();
+    _ = try core.enqueue(10);
+    const t = try core.reconnect(4);
+    try testing.expectEqual(@as(usize, 0), t.outcome.advanced.replayed);
+    try testing.expect(t.change.pending);
+    try testing.expect(!t.change.inflight);
+    try testing.expectEqual(@as(u64, 4), core.pending()[0].generation);
+    // With nothing retained, a reconnect dirties no list reader.
+    var idle = try EgressCore(u64).init(testing.allocator, 1, .{});
+    defer idle.deinit();
+    const quiet = try idle.reconnect(2);
+    try testing.expect(!quiet.change.pending and !quiet.change.inflight);
 }
 
 test "lazily/egress_core: configuration is validated" {

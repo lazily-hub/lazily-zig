@@ -227,6 +227,7 @@ test "effect-CAS corpus: EffectCasCore executes every scenario and step" {
         try expectFinal(final_where, &core, try cj.required(scenario, "final"));
         executed_scenarios += 1;
     }
+    std.debug.print("{s}: executed {d} scenarios / {d} steps\n", .{ FIXTURE, executed_scenarios, executed_steps });
     try testing.expect(carried_scenarios > 0);
     try testing.expectEqual(carried_scenarios, executed_scenarios);
     try testing.expectEqual(carried_steps, executed_steps);

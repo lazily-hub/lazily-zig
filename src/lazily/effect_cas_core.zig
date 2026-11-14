@@ -281,6 +281,10 @@ pub fn EffectCasCore(comptime K: type, comptime A: type, comptime P: type, compt
             if (current) |epoch| {
                 if (desired.epoch < epoch) return .{ .change = .{}, .outcome = .{ .stale_epoch = epoch } };
                 if (desired.epoch == epoch) {
+                    // Against the ORIGINAL submitted intent (identity, epoch,
+                    // key, initial `expected`, plan). A partially applied plan
+                    // advances `Pending.expected`, never `intent.expected`, so a
+                    // re-send of the same desire stays `unchanged`.
                     const same = (if (entry.pending) |p| p.intent.eql(desired) else false) or
                         (if (entry.inflight) |f| f.retained.intent.eql(desired) else false) or
                         (if (entry.terminal_intent) |t| t.eql(desired) else false);
