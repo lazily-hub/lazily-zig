@@ -26,9 +26,10 @@ const cell = @import("cell.zig").source;
 // The state configuration is a plain source cell (`#lzcellkernel`).
 const Cell = @import("cell.zig").Source;
 
-/// Cross-version empty initializer for `ArrayListUnmanaged`. Zig <0.16
+/// Cross-version empty initializer for the unmanaged `std.ArrayList` (spelled
+/// `std.ArrayListUnmanaged` until zig master dropped that alias). Zig <0.16
 /// initializes with `.{}`; >=0.16 uses the declared `.empty` constant.
-inline fn emptyUnmanaged(comptime T: type) std.ArrayListUnmanaged(T) {
+inline fn emptyUnmanaged(comptime T: type) std.ArrayList(T) {
     return if (builtin.zig_version.minor < 16)
         .{}
     else
@@ -142,7 +143,7 @@ pub const ChartDef = struct {
         }
 
         // Derived structure: children (sorted by document order) and root.
-        const kids_lists = try a.alloc(std.ArrayListUnmanaged(Index), count);
+        const kids_lists = try a.alloc(std.ArrayList(Index), count);
         for (kids_lists) |*k| k.* = emptyUnmanaged(Index);
         var root: ?Index = null;
         {
@@ -193,7 +194,7 @@ pub const StateChart = struct {
     def: *ChartDef,
     config: *Cell(Config),
     history: std.AutoHashMapUnmanaged(Index, Recording),
-    last_actions: std.ArrayListUnmanaged([]const u8),
+    last_actions: std.ArrayList([]const u8),
     arena: std.heap.ArenaAllocator,
     alloc: std.mem.Allocator,
 
@@ -523,7 +524,7 @@ fn kidsOrderLess(order: []const u32, a: Index, b: Index) bool {
     return order[a] < order[b];
 }
 
-fn computeDepth(kids: []const std.ArrayListUnmanaged(Index), id: Index, d: u32, depth: []u32) void {
+fn computeDepth(kids: []const std.ArrayList(Index), id: Index, d: u32, depth: []u32) void {
     depth[id] = d;
     for (kids[id].items) |c| computeDepth(kids, c, d + 1, depth);
 }
@@ -553,7 +554,7 @@ fn configContains(c: Config, idx: Index) bool {
     return contains(c.items, idx);
 }
 
-fn addIfAbsent(list: *std.ArrayListUnmanaged(Index), a: std.mem.Allocator, x: Index) !void {
+fn addIfAbsent(list: *std.ArrayList(Index), a: std.mem.Allocator, x: Index) !void {
     if (!contains(list.items, x)) try list.append(a, x);
 }
 
@@ -644,8 +645,8 @@ fn enterSubtree(
     def: *const ChartDef,
     a: std.mem.Allocator,
     state: Index,
-    enter: *std.ArrayListUnmanaged(Index),
-    actions: *std.ArrayListUnmanaged([]const u8),
+    enter: *std.ArrayList(Index),
+    actions: *std.ArrayList([]const u8),
 ) !void {
     try addIfAbsent(enter, a, state);
     for (def.states[state].entry) |act| try actions.append(a, act);
@@ -689,7 +690,7 @@ fn restoreViaHistory(
     history: *const std.AutoHashMapUnmanaged(Index, Recording),
     hist: Index,
     region: Index,
-    enter: *std.ArrayListUnmanaged(Index),
+    enter: *std.ArrayList(Index),
 ) !void {
     if (history.get(hist)) |rec| {
         switch (rec) {
@@ -723,8 +724,8 @@ fn computeExitEnter(
     t: Transition,
     leaf: Index,
     config: Config,
-    exit_set: *std.ArrayListUnmanaged(Index),
-    enter_set: *std.ArrayListUnmanaged(Index),
+    exit_set: *std.ArrayList(Index),
+    enter_set: *std.ArrayList(Index),
 ) !void {
     const target = t.target;
     const internal = t.internal and (target == source or isProperDescendant(def, target, source));

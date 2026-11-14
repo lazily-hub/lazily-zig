@@ -84,7 +84,7 @@ const SentFrame = struct {
 
 const TransportState = struct {
     alloc: std.mem.Allocator,
-    sent: std.ArrayListUnmanaged(SentFrame) = .empty,
+    sent: std.ArrayList(SentFrame) = .empty,
 
     fn send(ctx: *anyopaque, msg: cp.CommandMessage) void {
         const self: *TransportState = @ptrCast(@alignCast(ctx));

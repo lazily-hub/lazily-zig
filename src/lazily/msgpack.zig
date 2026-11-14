@@ -344,6 +344,20 @@ fn objectMapPut(
     return map.put(allocator, key, value);
 }
 
+/// `std.json.Array` made the same managed-to-unmanaged move as `ObjectMap`,
+/// on a later toolchain: zig master (0.18.0-dev) drops `init`/the stored
+/// allocator. Probed by field for the same reason as `object_map_is_managed`.
+const array_is_managed = @hasField(std.json.Array, "allocator");
+
+fn arrayEmpty(allocator: std.mem.Allocator) std.json.Array {
+    return if (comptime array_is_managed) std.json.Array.init(allocator) else .empty;
+}
+
+fn arrayReserve(array: *std.json.Array, allocator: std.mem.Allocator, count: usize) !void {
+    if (comptime array_is_managed) return array.ensureTotalCapacity(count);
+    return array.ensureTotalCapacity(allocator, count);
+}
+
 /// Pack a `std.json.Value` tree. Object member order is preserved
 /// (`std.json.ObjectMap` is a `StringArrayHashMap`), which is why this encoder
 /// is deterministic — allowed, never guaranteed to a peer.
@@ -401,8 +415,8 @@ pub fn unpackValue(arena: std.mem.Allocator, up: *Unpacker) anyerror!Value {
         .bin => return Error.UnexpectedBinaryPayload,
         .array => {
             const count = try up.readArrayHeader();
-            var out = std.json.Array.init(arena);
-            try out.ensureTotalCapacity(count);
+            var out = arrayEmpty(arena);
+            try arrayReserve(&out, arena, count);
             var i: usize = 0;
             while (i < count) : (i += 1) out.appendAssumeCapacity(try unpackValue(arena, up));
             return .{ .array = out };

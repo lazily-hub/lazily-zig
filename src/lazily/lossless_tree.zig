@@ -420,8 +420,8 @@ pub const LosslessTreeCrdt = struct {
     counter: u64,
     nodes: std.HashMap(OpId, *Node, OpIdContext, std.hash_map.default_max_load_percentage),
     frontier: TreeVersionFrontier,
-    log: std.ArrayListUnmanaged(TreeOp) = .empty,
-    buffered: std.ArrayListUnmanaged(TreeOp) = .empty,
+    log: std.ArrayList(TreeOp) = .empty,
+    buffered: std.ArrayList(TreeOp) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, peer: u64) !LosslessTreeCrdt {
         var t = LosslessTreeCrdt{
@@ -852,7 +852,7 @@ pub const LosslessTreeCrdt = struct {
             var progressed = false;
             var pending = self.buffered;
             self.buffered = .empty;
-            var leftover = std.ArrayListUnmanaged(TreeOp).empty;
+            var leftover = std.ArrayList(TreeOp).empty;
             errdefer leftover.deinit(self.allocator);
             for (pending.items) |op| {
                 if (self.frontier.contains(op.id)) {

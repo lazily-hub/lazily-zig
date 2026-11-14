@@ -18,16 +18,24 @@ jobs:
   # Zig build + test, across the toolchains this repo claims to support.
   #
   # 0.15.2 and 0.16.0 are release gates. `master` remains a full matrix run,
-  # but is temporarily advisory: 0.17.0-dev.1978's internal test-runner protocol
-  # deadlocks before reporting results (reproduced locally with the same compiler)
-  # while both pinned compilers complete the identical command. A short timeout
-  # keeps that upstream regression from wedging the entire workflow.
+  # but advisory: it is a moving nightly, so CI's `master` reddens on upstream's
+  # schedule as well as ours.
   #
-  # This is a narrow exception for the compiler runner itself, not for a source
-  # incompatibility: the full job stays visible and must return to gating once
-  # upstream restores the protocol. Nightly compatibility previously caught
-  # `Type.Fn.param_types` vs `Type.Fn.params`; version-sensitive reflection still
-  # belongs behind a `@hasField` shim (see `normalizeCompute` in context.zig).
+  # The master "deadlock" this job used to blame on the upstream test-runner
+  # protocol was ours. Zig master narrowed `@hasDecl` to
+  # PUBLIC declarations, so collections_family_conformance's two-phase models —
+  # whose `wire` was private — skipped wiring; the first `set` then parked
+  # forever on an `undefined` (0xAA..) ParkingMutex, and `timeout` killed the
+  # step (exit 124). `wire` is pub now, and the full suite (1232 tests) passes on
+  # 0.18.0-dev.1005. Later nightlies also dropped `std.ArrayListUnmanaged` and
+  # made `std.json.Array` unmanaged; both are handled.
+  #
+  # The timeout stays, sized for a COLD compile: the setup-zig cache is keyed by
+  # the nightly's exact version, so the first run after a new nightly compiles
+  # from scratch (~70s on a hosted runner before any test runs; 90s left almost
+  # nothing for the suite). It bounds a real hang well inside the 5-minute job.
+  # Version-sensitive reflection belongs behind a `@hasField`/`@hasDecl` shim
+  # on a PUB declaration (see `normalizeCompute` in context.zig).
   #
   # 0.15.2 is gating again (#lzzig0152). It had been non-gating because the tree
   # did not compile there at all, and a job that cannot fail is indistinguishable
@@ -144,7 +152,7 @@ jobs:
       - name: Assert conformance fixtures are present
         run: |
           set -euo pipefail
-          for d in collections coordination distributed materialization membership \
+          for d in collections coordination distributed egress materialization membership \
                    presence rateshape reactive-graph replay resilience service \
                    signaling temporal windowing; do
             dir="../lazily-spec/conformance/$d"
@@ -185,7 +193,7 @@ jobs:
         run: |
           mkdir -p build && : > build/conformance-fixtures-loaded.txt
           if [ "${{ matrix.zig }}" = master ]; then
-            timeout 90 env LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
+            timeout 240 env LAZILY_CONFORMANCE_MANIFEST="$PWD/build/conformance-fixtures-loaded.txt" \
               zig build test --summary all \
               -Dconformance-manifest="$PWD/build/conformance-fixtures-loaded.txt" \
               -Dconformance-run-id="$LAZILY_CONFORMANCE_RUN_ID"

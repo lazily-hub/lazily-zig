@@ -184,7 +184,7 @@ const ThreadSafeModel = struct {
     }
     /// Two-phase because the map borrows `&self.tsctx`, whose address must be
     /// stable — `init` returns by value, so the map is wired after the move.
-    fn wire(self: *Self) void {
+    pub fn wire(self: *Self) void {
         self.map = thread_safe_reactive_map.ThreadSafeSourceMap([]const u8, V).init(&self.tsctx);
     }
     fn deinit(self: *Self) void {
@@ -250,7 +250,7 @@ const AsyncModel = struct {
     }
     /// Two-phase for the same reason as the thread-safe model: the map borrows
     /// `&self.actx`, whose address must outlive `init`'s by-value return.
-    fn wire(self: *Self) !void {
+    pub fn wire(self: *Self) !void {
         self.map = try async_reactive_map.AsyncSourceMap([]const u8, V).init(&self.actx);
     }
     fn deinit(self: *Self) void {
@@ -423,6 +423,13 @@ fn Engine(comptime Model: type) type {
             const fixture = parsed.value;
 
             var model = try Model.init(alloc);
+            // `wire` MUST stay `pub` on every model. Zig master (0.18.0-dev)
+            // narrowed `@hasDecl` to public declarations, so a private `wire`
+            // made this probe silently false there: the two-phase models ran
+            // with their map still `undefined`, and the first `set` parked
+            // forever on a garbage (0xAA..) ParkingMutex state. That was the
+            // "Zig master :: Test" CI timeout (exit 124) — not an upstream
+            // test-runner deadlock.
             if (comptime @hasDecl(Model, "wire")) {
                 const W = @typeInfo(@TypeOf(Model.wire)).@"fn".return_type.?;
                 if (comptime @typeInfo(W) == .error_union) try model.wire() else model.wire();

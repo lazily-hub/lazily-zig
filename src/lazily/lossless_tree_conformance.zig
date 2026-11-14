@@ -256,7 +256,7 @@ const DeliveryProbe = struct {
     /// One increment per `applyUpdate` call `deliver` makes.
     calls: usize = 0,
     /// Every op id handed over, concatenated in the order it was passed.
-    ids: std.ArrayListUnmanaged(OpId) = .empty,
+    ids: std.ArrayList(OpId) = .empty,
 
     fn deinit(self: *DeliveryProbe) void {
         self.ids.deinit(self.allocator);
