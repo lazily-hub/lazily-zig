@@ -3,8 +3,8 @@ name: CI
 env:
   # Immutable conformance input for this binding release. The tag is selected
   # for readability and the commit check makes a moved tag fail closed.
-  LAZILY_SPEC_TAG: v0.43.0
-  LAZILY_SPEC_COMMIT: 4b34879b26566a0616b97cf661ac4f1a23762af6
+  LAZILY_SPEC_TAG: v0.46.0
+  LAZILY_SPEC_COMMIT: ca676a1a7173525066e90bca48b2ead230a9cd88
 
 on:
   push:
