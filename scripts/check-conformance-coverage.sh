@@ -67,11 +67,6 @@ KNOWN_UNCOVERED=(
   # implemented here, but this binding has no canonical replay for the new
   # registers corpus yet; the Registers coverage row is `~` until it does.
   "collections/registers_convergence.json"
-  # Reactive egress is currently Rust-only; Zig has no egress replay runner.
-  "egress/egress_generation_fence.json"
-  "egress/egress_inflight_window.json"
-  "egress/egress_ordered_ack.json"
-  "egress/egress_retry_budget.json"
   # The experimental protobuf-v1 generator pilot is Rust/Kotlin/TypeScript;
   # this binding must negotiate the capability before replaying the typed trace.
   "protobuf/graph_boundary_traces.json"
@@ -632,6 +627,14 @@ fi
 # toolchains (0.15.2 / 0.16.0 / master) report the same two numbers locally —
 # 0.15.2 skips four tests and opens the same fixtures.
 #
+# Re-pinned 2026-11-13 against lazily-spec `7240cc3` (#lzegress, #lzeffectcas):
+# 146/164 fixtures OPENED and 174/174 scenarios REPLAYED. +5 fixtures: the four
+# `egress/egress_*.json` transport fixtures (now replayed by
+# egress_family_conformance.zig against all three flavors, and dropped from
+# KNOWN_UNCOVERED) plus `egress/effect_cas.json` (effect_cas_conformance.zig);
+# +9 scenarios, all effect_cas.json's (the egress fixtures carry steps, not
+# scenarios). Exactness proven by probing 147/174 and 146/175: each fails.
+#
 # Re-verified 2026-09-11 against lazily-spec `4010d99` (#lzreplayframing): that
 # commit added three STEPS to `replay/canonical_encoding_equality.json` and no
 # fixture and no scenario, so both numbers are unmoved and neither was touched.
@@ -658,8 +661,8 @@ fi
 # An upstream fixture that lands without a zig runner raises `total` and leaves
 # `covered` alone, so it does not trip MIN_FIXTURES; only a replay that STOPS
 # running does.
-MIN_FIXTURES="${MIN_FIXTURES:-141}"
-MIN_SCENARIOS="${MIN_SCENARIOS:-165}"
+MIN_FIXTURES="${MIN_FIXTURES:-146}"
+MIN_SCENARIOS="${MIN_SCENARIOS:-174}"
 
 if [ "$total" -eq 0 ]; then
   echo "ERROR: the corpus at $SPEC_DIR listed ZERO fixtures." >&2

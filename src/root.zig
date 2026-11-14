@@ -285,6 +285,42 @@ pub const async_latest_durable_projection = @import("./lazily/async_latest_durab
 pub const AsyncLatestDurableProjection = async_latest_durable_projection.AsyncLatestDurableProjection;
 pub const latest_durable_projection_family_conformance = @import("./lazily/latest_durable_projection_family_conformance.zig");
 
+// The transport-agnostic reactive egress family (`#lzegress`). `egress_core` is
+// the graph-agnostic delivery authority; the three shells own the graph and one
+// transport Effect per attachment. `effect_cas_core` is the generic keyed
+// effect compare-and-swap authority (`#lzeffectcas`).
+pub const egress_core = @import("./lazily/egress_core.zig");
+pub const EgressCore = egress_core.EgressCore;
+pub const EgressPolicy = egress_core.EgressPolicy;
+pub const EgressConfigError = egress_core.EgressConfigError;
+pub const EgressEnvelope = egress_core.EgressEnvelope;
+pub const EgressRetry = egress_core.EgressRetry;
+pub const EgressClaim = egress_core.EgressClaim;
+pub const EgressAck = egress_core.EgressAck;
+pub const EgressFailure = egress_core.EgressFailure;
+pub const EgressRetryAction = egress_core.EgressRetryAction;
+pub const EgressReconnect = egress_core.EgressReconnect;
+pub const EgressChange = egress_core.EgressChange;
+pub const egress = @import("./lazily/egress.zig");
+pub const EgressCell = egress.EgressCell;
+pub const EgressVersions = egress.EgressVersions;
+pub const thread_safe_egress = @import("./lazily/thread_safe_egress.zig");
+pub const ThreadSafeEgressCell = thread_safe_egress.ThreadSafeEgressCell;
+pub const async_egress = @import("./lazily/async_egress.zig");
+pub const AsyncEgressCell = async_egress.AsyncEgressCell;
+pub const AsyncEgressRead = async_egress.AsyncEgressRead;
+pub const egress_family_conformance = @import("./lazily/egress_family_conformance.zig");
+pub const effect_cas_core = @import("./lazily/effect_cas_core.zig");
+pub const EffectCasCore = effect_cas_core.EffectCasCore;
+pub const EffectAttemptIdentity = effect_cas_core.EffectAttemptIdentity;
+pub const EffectTerminalKind = effect_cas_core.EffectTerminalKind;
+pub const EffectCasChange = effect_cas_core.EffectCasChange;
+pub const EffectCasUpsert = effect_cas_core.EffectCasUpsert;
+pub const EffectCasApplied = effect_cas_core.EffectCasApplied;
+pub const EffectCasFailure = effect_cas_core.EffectCasFailure;
+pub const EffectCasReconnect = effect_cas_core.EffectCasReconnect;
+pub const effect_cas_conformance = @import("./lazily/effect_cas_conformance.zig");
+
 // The transport-agnostic reactive ingress family (`#designimplementtransport`).
 // `ingress_core` is the graph-agnostic admission algebra; the three shells own
 // the graph and clear exactly the reader-kind set the core reports.
