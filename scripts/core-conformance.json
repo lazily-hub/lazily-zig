@@ -25,6 +25,18 @@
       "reason": "AsyncContext has no lazy derived-slot mode, so the armed failure is consumed by the invalidating write instead of the fixture's read."
     },
     {
+      "fixture": "reactive-graph/effect_cleanup_is_optional.json",
+      "scenario": "*",
+      "execution_flavor": "thread_safe",
+      "reason": "ThreadSafeContext.effectClosure registers one cleanup_fn per effect lifetime, so a body cannot return a cleanup from some runs and none from others (cleanup: alternate)."
+    },
+    {
+      "fixture": "reactive-graph/effect_cleanup_is_optional.json",
+      "scenario": "*",
+      "execution_flavor": "async",
+      "reason": "AsyncContext.effectAsyncClosure registers one cleanup_fn per effect lifetime, so a body cannot return a cleanup from some runs and none from others (cleanup: alternate)."
+    },
+    {
       "fixture": "reactive-graph/dispose_signal_reverts_to_lazy.json",
       "scenario": "*",
       "execution_flavor": "async",

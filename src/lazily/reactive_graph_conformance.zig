@@ -118,6 +118,7 @@ const FIXTURES = [_][]const u8{
     "disposal_does_not_run_surviving_effects.json",
     "dispose_detaches_edges_both_directions.json",
     "dispose_signal_reverts_to_lazy.json",
+    "effect_cleanup_is_optional.json",
     "failed_compute_is_never_cached.json",
     "exact_fold_paths_stay_exact.json",
     "feedback_drain_bound_reports_exhaustion.json",
@@ -211,6 +212,28 @@ const EXPECTED_MODEL_SKIPS = [_]struct {
         .model = "ThreadSafeContext",
         .fixture = "failed_compute_is_never_cached.json",
         .reason = "ComputeFn(T) returns a plain T — a compute cannot fail on this context",
+    },
+    // `#lzeffectvoid`. Both closure contexts register ONE `cleanup_fn` for an
+    // effect's whole lifetime (`effectClosure` / `effectAsyncClosure`) and call
+    // it before every rerun and at disposal; the body returns a plain value, not
+    // a cleanup. So `none` is expressible (a null `cleanup_fn`) and `every_run`
+    // is the registered one, but `alternate` — a cleanup from some runs and none
+    // from others — has no spelling. A `cleanup_fn` that decides per run whether
+    // to log would be the runner simulating the library's cleanup slot, which is
+    // exactly what this fixture exists to test, so it is a named skip. The
+    // per-run return the fixture pins is replayed against `Context`, whose
+    // `Effect(Cleanup)` body returns `?Cleanup`.
+    .{
+        .model = "ThreadSafeContext",
+        .fixture = "effect_cleanup_is_optional.json",
+        .reason = "effectClosure registers one cleanup_fn per effect lifetime — a body cannot return a cleanup " ++
+            "from some runs and none from others, so `cleanup: alternate` is inexpressible",
+    },
+    .{
+        .model = "AsyncContext",
+        .fixture = "effect_cleanup_is_optional.json",
+        .reason = "effectAsyncClosure registers one cleanup_fn per effect lifetime — a body cannot return a " ++
+            "cleanup from some runs and none from others, so `cleanup: alternate` is inexpressible",
     },
     .{
         .model = "AsyncContext",
@@ -484,6 +507,42 @@ const ScopeTable = Table(MAX_SCOPES, error.TooManyScopes);
 /// identically, which is the whole reason `computes_of` exists.
 const Kind = enum { unset, cell, computed, effect, signal };
 
+/// What an effect body returns from each run (`#lzeffectvoid`), selected by the
+/// `effect` op's optional `cleanup` field. Absent means `every_run`.
+///
+/// `none` is the binding's idiomatic no-cleanup form, never a no-op cleanup: a
+/// cleanup that does nothing is observationally a cleanup, so it would test
+/// nothing about the library's no-cleanup path.
+const CleanupShape = enum {
+    /// Every run returns a cleanup.
+    every_run,
+    /// Every run returns no cleanup.
+    none,
+    /// Odd-numbered runs (the run at creation is run 1) return a cleanup;
+    /// even-numbered runs return none.
+    alternate,
+
+    /// An unknown shape is a hard runner failure, never a silent default.
+    fn parse(op: json.Value) !CleanupShape {
+        const raw = field(op, "cleanup") orelse return .every_run;
+        const s = try asString(raw);
+        if (std.mem.eql(u8, s, "every_run")) return .every_run;
+        if (std.mem.eql(u8, s, "none")) return .none;
+        if (std.mem.eql(u8, s, "alternate")) return .alternate;
+        std.debug.print("  unknown effect cleanup shape `{s}`\n", .{s});
+        return error.UnknownCleanupShape;
+    }
+
+    /// Whether 1-based run `run` of an effect of this shape returns a cleanup.
+    fn returnsCleanup(self: CleanupShape, run: usize) bool {
+        return switch (self) {
+            .every_run => true,
+            .none => false,
+            .alternate => run % 2 == 1,
+        };
+    }
+};
+
 /// Upper bound on `reads` per derived node. The corpus needs 2
 /// (`signal_materializes_once_per_batch.json` sums two cells).
 const MAX_DEPS = 4;
@@ -517,6 +576,13 @@ const Def = struct {
     ndeps: usize = 0,
     offset: V = 0,
     initial: V = 0,
+    /// An effect's body shape (`#lzeffectvoid`).
+    cleanup: CleanupShape = .every_run,
+    /// An effect's run count, ticked inside the body the library invokes — the
+    /// closure state `alternate` needs, held here because the synchronous
+    /// model's bodies are comptime functions with nothing else to close over.
+    /// Reset with the rest of the `Def` when the node is re-created.
+    effect_runs: usize = 0,
 
     /// The single dependency, for the ops that only ever have one.
     fn dep(self: Def) ?usize {
@@ -601,14 +667,34 @@ fn SyncNodeFns(comptime i: usize) type {
             return acc;
         }
 
-        fn effectBody(c: *Compute) anyerror!?SyncCleanup {
+        /// The shared part of every effect body: log the run, read the
+        /// dependency, and return this run's 1-based number.
+        fn effectRun(c: *Compute) usize {
             EffectLog.recordRun(i);
+            defs[i].effect_runs += 1;
             if (defs[i].dep()) |dep| {
                 // A read that fails because a dependency is gone is the
                 // contract, not a test failure: the effect simply observes it.
                 _ = syncReadTracked(c, dep) catch {};
             }
+            return defs[i].effect_runs;
+        }
+
+        /// `every_run` and `alternate`: an `Effect(SyncCleanup)` body. A run
+        /// that returns no cleanup returns `null` — the optional's own
+        /// no-cleanup form, which the library must treat exactly like
+        /// `effectNoCleanup`'s.
+        fn effectBody(c: *Compute) anyerror!?SyncCleanup {
+            const run = effectRun(c);
+            if (!defs[i].cleanup.returnsCleanup(run)) return null;
             return SyncCleanup{ .idx = i };
+        }
+
+        /// `none`: the binding's idiomatic no-cleanup effect, `Effect(void)` —
+        /// what `effectNoCleanup` builds, keyed like every other node here.
+        fn effectBodyNoCleanup(c: *Compute) anyerror!?void {
+            _ = effectRun(c);
+            return null;
         }
 
         fn setCell(ctx: *Context, value: V) anyerror!void {
@@ -671,7 +757,7 @@ const SyncModel = struct {
     scopes: [MAX_SCOPES]?Context.TeardownScope = @splat(null),
     /// Effect handles, so `isActive` and the allocator-owned `Effect` struct
     /// can both be reached. Indexed by node index.
-    effects: [MAX_NODES]?*EffectMod.Effect(SyncCleanup) = @splat(null),
+    effects: [MAX_NODES]?SyncEffect = @splat(null),
     /// Eager-signal handles (`#lzsignaleager`), also allocator-owned.
     signals: [MAX_NODES]?*CellMod.Computed(V) = @splat(null),
     handles: [MAX_NODES]?Context.NodeHandle = @splat(null),
@@ -689,7 +775,7 @@ const SyncModel = struct {
             maybe.* = null;
         }
         for (self.effects) |maybe| {
-            if (maybe) |e| self.ctx.allocator.destroy(e);
+            if (maybe) |e| e.destroy(self.ctx.allocator);
         }
         for (self.signals) |maybe| {
             if (maybe) |s| self.ctx.allocator.destroy(s);
@@ -767,14 +853,18 @@ const SyncModel = struct {
         if (staged_batch_failed) |e| return e;
     }
 
-    fn addEffect(self: *SyncModel, comptime_idx: usize, dep: ?usize) !void {
+    fn addEffect(self: *SyncModel, comptime_idx: usize, dep: ?usize, cleanup: CleanupShape) !void {
         try self.prepareKey(comptime_idx);
         defs[comptime_idx] = try Def.withDeps(.effect, if (dep) |d| &[_]usize{d} else &[_]usize{}, 0);
+        defs[comptime_idx].cleanup = cleanup;
         if (self.effects[comptime_idx]) |old| {
-            self.ctx.allocator.destroy(old);
+            old.destroy(self.ctx.allocator);
             self.effects[comptime_idx] = null;
         }
-        self.effects[comptime_idx] = try sync_effect_ctors[comptime_idx](self.ctx);
+        self.effects[comptime_idx] = switch (cleanup) {
+            .none => .{ .no_cleanup = try sync_effect_no_cleanup_ctors[comptime_idx](self.ctx) },
+            .every_run, .alternate => .{ .with_cleanup = try sync_effect_ctors[comptime_idx](self.ctx) },
+        };
         try self.captureHandle(comptime_idx, .effect);
     }
 
@@ -848,13 +938,44 @@ const SyncModel = struct {
     }
 };
 
+/// A synchronous effect handle of either body shape (`#lzeffectvoid`): a
+/// cleanup-returning `Effect(SyncCleanup)`, or the idiomatic no-cleanup
+/// `Effect(void)`.
+const SyncEffect = union(enum) {
+    with_cleanup: *EffectMod.Effect(SyncCleanup),
+    no_cleanup: *EffectMod.Effect(void),
+
+    fn isActive(self: SyncEffect) bool {
+        return switch (self) {
+            inline else => |e| e.isActive(),
+        };
+    }
+
+    fn destroy(self: SyncEffect, allocator: std.mem.Allocator) void {
+        switch (self) {
+            inline else => |e| allocator.destroy(e),
+        }
+    }
+};
+
 const SyncEffectCtor = *const fn (*Context) anyerror!*EffectMod.Effect(SyncCleanup);
+const SyncEffectNoCleanupCtor = *const fn (*Context) anyerror!*EffectMod.Effect(void);
 
 const sync_effect_ctors: [MAX_NODES]SyncEffectCtor = blk: {
     var a: [MAX_NODES]SyncEffectCtor = undefined;
     for (0..MAX_NODES) |i| a[i] = struct {
         fn call(ctx: *Context) anyerror!*EffectMod.Effect(SyncCleanup) {
             return EffectMod.effectKeyed(SyncCleanup, ctx, syncKey(i), SyncNodeFns(i).effectBody);
+        }
+    }.call;
+    break :blk a;
+};
+
+const sync_effect_no_cleanup_ctors: [MAX_NODES]SyncEffectNoCleanupCtor = blk: {
+    var a: [MAX_NODES]SyncEffectNoCleanupCtor = undefined;
+    for (0..MAX_NODES) |i| a[i] = struct {
+        fn call(ctx: *Context) anyerror!*EffectMod.Effect(void) {
+            return EffectMod.effectKeyed(void, ctx, syncKey(i), SyncNodeFns(i).effectBodyNoCleanup);
         }
     }.call;
     break :blk a;
@@ -996,10 +1117,19 @@ const TsModel = struct {
         if (body.failed) |e| return e;
     }
 
-    fn addEffect(self: *TsModel, idx: usize, dep: ?usize) !void {
+    /// `cleanup_fn` is registered once for the effect's lifetime, so `none` is
+    /// a null cleanup and `alternate` is inexpressible (see
+    /// `EXPECTED_MODEL_SKIPS`); reaching it is a hard failure, never a silent
+    /// `every_run`.
+    fn addEffect(self: *TsModel, idx: usize, dep: ?usize, cleanup: CleanupShape) !void {
         defs[idx] = try Def.withDeps(.effect, if (dep) |dd| &[_]usize{dd} else &[_]usize{}, 0);
+        defs[idx].cleanup = cleanup;
         const d = self.bindDesc(idx);
-        const h = try self.ctx.effectClosure(V, @ptrCast(d), effectCompute, @ptrCast(d), effectCleanup);
+        const h = switch (cleanup) {
+            .every_run => try self.ctx.effectClosure(V, @ptrCast(d), effectCompute, @ptrCast(d), effectCleanup),
+            .none => try self.ctx.effectClosure(V, @ptrCast(d), effectCompute, null, null),
+            .alternate => return error.CleanupShapeInexpressible,
+        };
         self.ids[idx] = h.id;
         self.handles[idx] = .{ .id = h.id, .generation = h.generation, .kind = h.kind };
         self.live[idx] = true;
@@ -1203,10 +1333,17 @@ const AsyncModel = struct {
         _ = try self.ctx.settle();
     }
 
-    fn addEffect(self: *AsyncModel, idx: usize, dep: ?usize) !void {
+    /// See `TsModel.addEffect`: one `cleanup_fn` per effect lifetime, so `none`
+    /// is a null cleanup and `alternate` is a hard failure.
+    fn addEffect(self: *AsyncModel, idx: usize, dep: ?usize, cleanup: CleanupShape) !void {
         defs[idx] = try Def.withDeps(.effect, if (dep) |dd| &[_]usize{dd} else &[_]usize{}, 0);
+        defs[idx].cleanup = cleanup;
         const d = self.bindDesc(idx);
-        self.ids[idx] = try self.ctx.effectAsyncClosure(@ptrCast(d), effectCompute, @ptrCast(d), effectCleanup);
+        self.ids[idx] = switch (cleanup) {
+            .every_run => try self.ctx.effectAsyncClosure(@ptrCast(d), effectCompute, @ptrCast(d), effectCleanup),
+            .none => try self.ctx.effectAsyncClosure(@ptrCast(d), effectCompute, null, null),
+            .alternate => return error.CleanupShapeInexpressible,
+        };
         self.handles[idx] = self.ctx.handleFor(self.ids[idx]) orelse return error.MissingNodeHandle;
         self.live[idx] = true;
         _ = try self.ctx.settle();
@@ -1476,7 +1613,7 @@ fn Engine(comptime Model: type) type {
             } else if (std.mem.eql(u8, op_type, "effect")) {
                 // Effects read at most one node in this corpus.
                 if (deps.len > 1) return error.MultiParentNodeUnsupported;
-                try self.model.addEffect(idx, if (deps.len == 1) deps[0] else null);
+                try self.model.addEffect(idx, if (deps.len == 1) deps[0] else null, try CleanupShape.parse(op));
             } else {
                 // `effect` used to be the bare `else` (#lzscenariobodyskip). The
                 // caller's four-way test and `SUPPORTED_OPS` both gate this
@@ -1604,7 +1741,7 @@ fn Engine(comptime Model: type) type {
         }
 
         fn addEffectAt(self: *Self, idx: usize, dep: usize) !void {
-            try self.model.addEffect(idx, dep);
+            try self.model.addEffect(idx, dep, .every_run);
         }
 
         fn runChurn(self: *Self, op: json.Value) !void {

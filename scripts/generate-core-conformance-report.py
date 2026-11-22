@@ -17,7 +17,14 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 BINDING_ID = "zig"
 WHOLE_FIXTURE_SKIP = "reactive-graph/feedback_drain_bound_reports_exhaustion.json"
-PARTIAL_FIXTURE = "reactive-graph/failed_compute_is_never_cached.json"
+# Fixtures replayed on `Context` only, each with a declared ThreadSafeContext +
+# AsyncContext runtime skip in scripts/core-conformance.json.
+PARTIAL_FIXTURES = (
+    "reactive-graph/failed_compute_is_never_cached.json",
+    # #lzeffectvoid: the closure contexts register one cleanup_fn per effect
+    # lifetime, so `cleanup: alternate` is inexpressible there.
+    "reactive-graph/effect_cleanup_is_optional.json",
+)
 ASYNC_DIVERGENCE_FIXTURE = "reactive-graph/dispose_signal_reverts_to_lazy.json"
 MODELS = ("Context", "ThreadSafeContext", "AsyncContext")
 
@@ -105,6 +112,25 @@ def mutated_scalar(value: object) -> object | None:
     if isinstance(value, str):
         return value + "__lazily_negative_control__"
     return None
+
+
+def declared_ids(document: object) -> list[str]:
+    """Every node id an `op` declares, in document order, without repeats."""
+    ids: list[str] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            op = value.get("op")
+            if isinstance(op, dict) and isinstance(op.get("id"), str) and op["id"] not in ids:
+                ids.append(op["id"])
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(document)
+    return ids
 
 
 def run_runner(command: list[str], spec_dir: Path, run_id: str, manifest_path: Path) -> subprocess.CompletedProcess[str]:
@@ -234,6 +260,63 @@ def kill_route(
                 "rejected_by": "other_failure",
                 "rejection_excerpt": failure_excerpt(output, fixture),
             })
+
+        # Second pass, only reached when every suffixed mutant above failed on
+        # bookkeeping. A route whose leaves are ALL node ids (`observed_by`,
+        # `cleanup_order`) cannot be killed by suffixing: the mutated id names
+        # no node, so the runner's own lookup aborts before any comparison.
+        # Replacing an id leaf with a DIFFERENT id the fixture declares keeps
+        # the lookup valid and leaves the library's observed list as the only
+        # thing that can reject it (#lzeffectvoid). The first declared id is
+        # used because it exists from the first step on.
+        ids = declared_ids(pristine)
+        swaps = 0
+        for attempt in range(leaf_count):
+            if swaps >= MAX_MUTANTS_PER_ROUTE:
+                break
+            document = json.loads(canonical)
+            leaves = [
+                leaf
+                for target, pointer in route_targets(document, route)
+                for leaf in assertion_leaves(target, pointer)
+            ]
+            container, key, leaf_pointer = leaves[attempt]
+            original = container[key]
+            if not isinstance(original, str) or original not in ids:
+                continue
+            mutated = next((candidate for candidate in ids if candidate != original), None)
+            if mutated is None:
+                continue
+            swaps += 1
+            container[key] = mutated
+            json_pointer = "/" + "/".join(pointer_token(token) for token in leaf_pointer)
+            fixture_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+            rejected = runner(command, mutation_root, f"{control_id}-swap-{attempt}", control_manifest)
+            output = rejected.stdout + rejected.stderr
+            if rejected.returncode == 0:
+                raise SystemExit(f"negative control survived for {fixture} {route} at {json_pointer}")
+            mutant = {
+                "mutated_pointer": json_pointer,
+                "original": original,
+                "mutated": mutated,
+                "mutation": "declared-id-swap",
+                "runner_exit_code": rejected.returncode,
+            }
+            findings = divergence_lines(output, fixture, baseline)
+            if findings:
+                return {
+                    "status": "mutation-killed",
+                    "route": route,
+                    **mutant,
+                    "rejected_by": "divergence",
+                    "rejection_excerpt": findings[:3],
+                    "non_discriminating_mutants": not_discriminating,
+                }
+            not_discriminating.append({
+                **mutant,
+                "rejected_by": "other_failure",
+                "rejection_excerpt": failure_excerpt(output, fixture),
+            })
     finally:
         fixture_path.write_text(canonical, encoding="utf-8")
     raise SystemExit(
@@ -298,18 +381,19 @@ def main() -> int:
     if absent:
         raise SystemExit(f"Core runner did not open required fixtures: {', '.join(absent)}")
     combined_output = result.stdout + result.stderr
-    for fixture in sorted(required - {WHOLE_FIXTURE_SKIP, PARTIAL_FIXTURE, ASYNC_DIVERGENCE_FIXTURE}):
+    for fixture in sorted(required - {WHOLE_FIXTURE_SKIP, ASYNC_DIVERGENCE_FIXTURE, *PARTIAL_FIXTURES}):
         name = Path(fixture).name
         for model in MODELS:
             marker = f"reactive-graph[{model}] {name}:"
             if marker not in combined_output:
                 raise SystemExit(f"Core runner did not prove {fixture} on {model}")
-    partial_name = Path(PARTIAL_FIXTURE).name
-    if f"reactive-graph[Context] {partial_name}:" not in combined_output:
-        raise SystemExit(f"Core runner did not prove {PARTIAL_FIXTURE} on Context")
-    for model in ("ThreadSafeContext", "AsyncContext"):
-        if f"SKIP reactive-graph[{model}] {partial_name}:" not in combined_output:
-            raise SystemExit(f"Core runner did not report the declared {model} skip for {PARTIAL_FIXTURE}")
+    for partial in PARTIAL_FIXTURES:
+        partial_name = Path(partial).name
+        if f"reactive-graph[Context] {partial_name}:" not in combined_output:
+            raise SystemExit(f"Core runner did not prove {partial} on Context")
+        for model in ("ThreadSafeContext", "AsyncContext"):
+            if f"SKIP reactive-graph[{model}] {partial_name}:" not in combined_output:
+                raise SystemExit(f"Core runner did not report the declared {model} skip for {partial}")
     divergence_name = Path(ASYNC_DIVERGENCE_FIXTURE).name
     for model in ("Context", "ThreadSafeContext", "AsyncContext"):
         if f"reactive-graph[{model}] {divergence_name}:" not in combined_output:
@@ -342,7 +426,7 @@ def main() -> int:
             "skipped"
             if fixture == WHOLE_FIXTURE_SKIP
             else "partial"
-            if fixture in {PARTIAL_FIXTURE, ASYNC_DIVERGENCE_FIXTURE}
+            if fixture in {ASYNC_DIVERGENCE_FIXTURE, *PARTIAL_FIXTURES}
             else "passed"
         )
         blocks = (
@@ -365,7 +449,7 @@ def main() -> int:
                 ["Context", "ThreadSafeContext"]
                 if fixture == ASYNC_DIVERGENCE_FIXTURE
                 else ["Context"]
-                if fixture == PARTIAL_FIXTURE
+                if fixture in PARTIAL_FIXTURES
                 else []
                 if status == "skipped"
                 else list(MODELS)
@@ -410,7 +494,11 @@ def main() -> int:
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {report_path} (13 passed, 2 partial, 1 skipped)")
+    counts = {status: sum(1 for item in fixtures if item["status"] == status) for status in ("passed", "partial", "skipped")}
+    print(
+        f"wrote {report_path} ({counts['passed']} passed, {counts['partial']} partial, "
+        f"{counts['skipped']} skipped)"
+    )
     return 0
 
 
@@ -508,6 +596,56 @@ def self_test() -> int:
         else:
             raise SystemExit("self-test: a route with no divergence kill was credited")
 
+    # An id-only route in a fixture that DECLARES its ids is killed by the
+    # declared-id swap, and only by a divergence on it (#lzeffectvoid).
+    def drive_steps(steps: list, verdict) -> dict:
+        def fake_runner(command, spec_dir, run_id, manifest_path):
+            document = json.loads((spec_dir / target).read_text(encoding="utf-8"))
+            output = verdict(document["steps"])
+            return subprocess.CompletedProcess(command, 0 if output is None else 1, stdout=output or "", stderr="")
+
+        with tempfile.TemporaryDirectory(prefix="core-report-self-test-") as raw:
+            root = Path(raw)
+            canonical = json.dumps({"steps": steps}, indent=2) + "\n"
+            (root / target).parent.mkdir(parents=True)
+            (root / target).write_text(canonical, encoding="utf-8")
+            try:
+                return kill_route(["fake"], root, target, "/steps/*/expect", canonical, "self-test",
+                                  root / "manifest.txt", documented, runner=fake_runner)
+            finally:
+                if (root / target).read_text(encoding="utf-8") != canonical:
+                    raise SystemExit("self-test: kill_route left a mutated fixture behind")
+
+    id_steps = [
+        {"op": {"type": "cell", "id": "a", "value": 1}},
+        {"op": {"type": "effect", "id": "e", "reads": ["a"]}, "expect": {"observed_by": ["e"]}},
+    ]
+
+    def by_id(steps: list) -> str:
+        got = steps[1]["expect"]["observed_by"][0]
+        if got.endswith("__lazily_negative_control__"):
+            return bookkeeping("target.json")
+        if got != "e":
+            return divergence("target.json")
+        return ""
+
+    swapped = drive_steps(id_steps, by_id)
+    if (
+        swapped["rejected_by"] != "divergence"
+        or swapped.get("mutation") != "declared-id-swap"
+        or swapped["mutated"] != "a"
+        or [item["mutated_pointer"] for item in swapped["non_discriminating_mutants"]]
+        != ["/steps/1/expect/observed_by/0"]
+    ):
+        raise SystemExit(f"self-test: declared-id swap not credited correctly: {swapped}")
+    try:
+        drive_steps(id_steps, lambda steps: bookkeeping("target.json"))
+    except SystemExit as error:
+        if "no mutated assertion leaf was rejected by a library divergence" not in str(error):
+            raise
+    else:
+        raise SystemExit("self-test: a declared-id swap without a divergence was credited")
+
     try:
         drive({"readable": {"topic": True}}, lambda expected: None)
     except SystemExit as error:
@@ -516,7 +654,7 @@ def self_test() -> int:
     else:
         raise SystemExit("self-test: a surviving mutant was not reported")
 
-    print(f"core report self-test OK ({len(classifier_cases)} classifier cases, 4 routes)")
+    print(f"core report self-test OK ({len(classifier_cases)} classifier cases, 6 routes)")
     return 0
 
 

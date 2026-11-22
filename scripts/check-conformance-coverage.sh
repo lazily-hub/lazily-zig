@@ -635,6 +635,12 @@ fi
 # +9 scenarios, all effect_cas.json's (the egress fixtures carry steps, not
 # scenarios). Exactness proven by probing 147/174 and 146/175: each fails.
 #
+# Re-pinned 2026-11-22 (#lzeffectvoid): 147 fixtures OPENED. +1 fixture,
+# `reactive-graph/effect_cleanup_is_optional.json`, replayed by
+# reactive_graph_conformance.zig against `Context` (the two closure contexts
+# open it and record a named model skip). It carries steps, not scenarios, so
+# MIN_SCENARIOS is unmoved.
+#
 # Re-verified 2026-09-11 against lazily-spec `4010d99` (#lzreplayframing): that
 # commit added three STEPS to `replay/canonical_encoding_equality.json` and no
 # fixture and no scenario, so both numbers are unmoved and neither was touched.
@@ -661,7 +667,7 @@ fi
 # An upstream fixture that lands without a zig runner raises `total` and leaves
 # `covered` alone, so it does not trip MIN_FIXTURES; only a replay that STOPS
 # running does.
-MIN_FIXTURES="${MIN_FIXTURES:-146}"
+MIN_FIXTURES="${MIN_FIXTURES:-147}"
 MIN_SCENARIOS="${MIN_SCENARIOS:-174}"
 
 if [ "$total" -eq 0 ]; then
