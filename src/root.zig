@@ -538,6 +538,7 @@ pub const CommandTransport = command_plane.CommandTransport;
 pub const CommandRpcClient = command_plane.CommandRpcClient;
 pub const CallState = command_plane.CallState;
 pub const CallStateKind = command_plane.CallStateKind;
+pub const graph_ir = @import("./lazily/graph_ir.zig");
 
 test {
     std.testing.refAllDecls(@This());

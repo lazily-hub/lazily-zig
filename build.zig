@@ -293,6 +293,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_ipc_mod_tests = b.addRunArtifact(ipc_mod_tests);
 
+    const graph_ir_mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lazily/graph_ir.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = filters,
+    });
+    const run_graph_ir_mod_tests = b.addRunArtifact(graph_ir_mod_tests);
+
     const lossless_tree_mod_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lazily/lossless_tree_test.zig"),
@@ -379,6 +389,7 @@ pub fn build(b: *std.Build) void {
     run_test.dependOn(&run_mod_tests.step);
     run_test.dependOn(&run_exe_tests.step);
     run_test.dependOn(&run_ipc_mod_tests.step);
+    run_test.dependOn(&run_graph_ir_mod_tests.step);
     run_test.dependOn(&run_lossless_tree_mod_tests.step);
     run_test.dependOn(&run_command_plane_mod_tests.step);
     run_test.dependOn(&run_reliable_sync_mod_tests.step);
