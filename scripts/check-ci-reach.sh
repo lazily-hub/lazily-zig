@@ -497,6 +497,97 @@ EXPECTED_JOB_MATRIX=(
 # no gate step is stale and refused. Empty: no gate step here is conditional.
 EXPECTED_STEP_ACTIVATION=()
 
+# --------------------------------------------------------------- the floors
+#
+# 6. WHAT A PIN CANNOT DO (lazily-go's finding, and it applies here unchanged).
+#    Every pin above fails when the workflow changes and the pin does not. It
+#    does NOTHING about the commit that changes BOTH — reduce `on:` to
+#    `workflow_dispatch` and "correct" EXPECTED_TRIGGERS to `workflow_dispatch`
+#    in the same diff, and the guard is green because the two agree. A pin
+#    detects drift; it does not state a requirement.
+#
+#    AND REDUCING `on:` IS SELF-CONCEALING, which is why this is not a
+#    hypothetical worth deferring. For a pull request GitHub reads the trigger
+#    set from the PR's own head, so the commit that reduces the triggers is
+#    evaluated UNDER the reduced set: CI does not run and therefore cannot
+#    object. Nothing in Actions can catch it. A rung inside `make check` — which
+#    is where this script already runs, as a `check` prerequisite — is the only
+#    thing that can, and it catches it on the author's machine before the commit
+#    exists.
+#
+# So below the pins sit FLOORS: requirements stated in this file, about nothing
+# in the workflow. A floor is not un-launderable — nothing in a tree is, this
+# script included — but removing one reads as "stop requiring that the gate
+# runs on every PR", not as "update a pin to match". The two diffs ask a
+# reviewer different questions, which is the whole benefit being claimed and all
+# of it.
+
+# Every counted workflow MUST fire on these, whatever EXPECTED_TRIGGERS says.
+REQUIRED_TRIGGERS=(
+	push
+	pull_request
+)
+
+# ...and must still fire for this branch, unfiltered by path. Not read from the
+# workflow: it is this repository's default branch, which is why a `branches:`
+# list that no longer matches it means the gate stopped running on the trunk.
+REQUIRED_TRIGGER_BRANCH="main"
+
+# Activation values that mean "never runs" or "cannot fail", refused as LITERALS
+# on any gate job regardless of what the pins say.
+#
+# CHECKED AGAINST THIS REPO BEFORE ADDING IT, because this is the binding whose
+# advisory leg makes a job-level `continue-on-error` legitimate: `test`'s value
+# is the EXPRESSION `${{ matrix.zig == 'master' }}`, not the literal `true`, so
+# the literal floor false-reds nothing here and the expression stays pinned by
+# value. A blanket "no job-level continue-on-error" rule would have red a healthy
+# tree; this does not.
+#
+# IT IS A FLOOR, NOT A SATISFIABILITY CHECK, and the difference is worth saying:
+# `if: ${{ github.event_name == 'schedule' }}` never runs on a push either and
+# is not on this list, because no list of literals can enumerate the never-true
+# expressions. What catches that one is EXPECTED_JOB_ACTIVATION, by value. This
+# list only closes the case where the pin itself was laundered.
+FORBIDDEN_ACTIVATION_LITERALS=(
+	"if=false"
+	"if=\${{ false }}"
+	"if=\${{false}}"
+	"if='false'"
+	"continue-on-error=true"
+	"continue-on-error=\${{ true }}"
+	"continue-on-error=\${{true}}"
+)
+
+# The matrix legs that MUST gate, as `job|axis|leg`.
+#
+# THIS IS THE ONE lazily-go RECORDED AS INVISIBLE TO ITS DESIGN, and in go it is
+# hypothetical because go has no matrix. Here it is live, so it gets a floor
+# rather than a note. Two shapes, both MEASURED on this tree:
+#
+#   - Delete the two blocking legs, leaving `zig: ['master']`. The
+#     continue-on-error expression is BYTE-IDENTICAL, so EXPECTED_JOB_ACTIVATION
+#     is satisfied and the job's every leg is advisory. EXPECTED_JOB_MATRIX sees
+#     it (the leg set changed) and this floor sees it too (the required legs are
+#     gone) — and the floor is the half that survives the laundering commit that
+#     rewrites the pin.
+#   - Retarget the expression at `'0.15.2'`. EXPECTED_JOB_ACTIVATION sees that
+#     one, because the value changed; this floor sees it independently, because
+#     `0.15.2` is then the advisory leg and is required to gate.
+#
+# So both halves are covered twice over, and the two mechanisms are independent:
+# one reads the leg set, the other reads which leg the predicate exempts.
+#
+# CHURN IS TOOLCHAIN-BUMP RATE, which is the answer to the objection that sank
+# the per-recipe pin two cycles ago. A recipe gains a flag often; a pinned zig
+# release changes when someone deliberately bumps it, and such a bump ALREADY
+# has to edit EXPECTED_JOB_MATRIX, the `zig:` matrix, and check-fmt.sh's two
+# installed `version:` literals in the same commit. This adds a fourth line to
+# an edit that already touches four places, and no new rate.
+REQUIRED_BLOCKING_LEGS=(
+	"test|zig|0.15.2"
+	"test|zig|0.16.0"
+)
+
 # Pin lookups. `|` is the field separator, so a step name containing one is
 # refused further down rather than silently splitting.
 pinned_step_for() {
@@ -1997,6 +2088,52 @@ job_matrix() {
 		sort -u | paste -sd';' -
 }
 
+# The legs of one axis of one job, one per line.
+job_axis_legs() {
+	awk -F'\t' -v j="$1" -v a="$2" \
+		'$2 == j && $3 == "matrix" && index($4, a "=") == 1 { print substr($4, length(a) + 2) }' \
+		"$wf_act" | tr ',' '\n' | sed '/^$/d'
+}
+
+# Which leg a job's `continue-on-error` exempts from gating, as `axis=leg`.
+#
+# RESTRICTED ON PURPOSE to `${{ matrix.<axis> == '<leg>' }}`, which is the one
+# shape in this workflow. An absent value means every leg gates. Any OTHER
+# non-empty value prints `?` and the caller refuses to conclude: "which legs
+# gate" would then be a question this guard cannot answer, and answering it
+# wrongly is worse than refusing, because the floor below would silently pass.
+advisory_leg_for() {
+	awk -F'\t' -v j="$1" '
+		$2 == j && $3 == "continue-on-error" { v = $4 }
+		END {
+			if (v == "") { print ""; exit }
+			s = v
+			gsub(/[[:space:]]+/, "", s)
+			if (match(s, /^\$\{\{matrix\.[A-Za-z0-9_-]+==('"'"'[^'"'"']*'"'"'|"[^"]*")\}\}$/) == 0) { print "?"; exit }
+			sub(/^\$\{\{matrix\./, "", s)
+			sub(/\}\}$/, "", s)
+			n = index(s, "==")
+			ax = substr(s, 1, n - 1)
+			lg = substr(s, n + 2)
+			gsub(/^['"'"'"]|['"'"'"]$/, "", lg)
+			print ax "=" lg
+		}
+	' "$wf_act"
+}
+
+# Does `main` match this GitHub branch pattern? `!`-negation inverts the test,
+# so it is refused by the caller rather than guessed at.
+branch_pattern_matches_main() {
+	case "$1" in
+	"$REQUIRED_TRIGGER_BRANCH") return 0 ;;
+	esac
+	# shellcheck disable=SC2254
+	case "$REQUIRED_TRIGGER_BRANCH" in
+	$1) return 0 ;;
+	esac
+	return 1
+}
+
 # EXPECTED_GATE_JOBS against the jobs the pins above RESOLVED to, both
 # directions. `gatejob_found_set` was filled in the loop: the job field of every
 # step pin that resolved to exactly one step, plus the job of every step CI
@@ -2257,6 +2394,162 @@ if [ "$mx_bad_count" -gt 0 ]; then
 	status=1
 fi
 
+# THE FLOORS. Everything above compares the workflow against a pin and so is
+# satisfied by a commit that edits both. These state a requirement instead.
+floor_bad=""
+floor_bad_count=0
+floor_refuse=""
+floor_refuse_count=0
+floor_trigger_ok=0
+floor_leg_ok=0
+floor_literal_ok=0
+
+for _wf in "${workflows[@]}"; do
+	for _rt in ${REQUIRED_TRIGGERS[@]+"${REQUIRED_TRIGGERS[@]}"}; do
+		_present="$(awk -F'\t' -v w="$_wf" -v t="$_rt" \
+			'$1 == w && $2 == t { n++ } END { print n + 0 }' "$wf_trig")"
+		if [ "$_present" -eq 0 ]; then
+			floor_bad="$floor_bad$_wf	on: $_rt	the workflow does not fire on it at all"$'\n'
+			floor_bad_count=$((floor_bad_count + 1))
+			continue
+		fi
+		_viol=""
+		while IFS= read -r _kv; do
+			[ -n "$_kv" ] || continue
+			_k="${_kv%%=*}"
+			_v="${_kv#*=}"
+			case "$_k" in
+			paths | paths-ignore)
+				_viol="$_viol a \`$_k:\` filter ($_v)"
+				;;
+			branches)
+				_hit=0
+				_old="$IFS"
+				IFS=','
+				for _b in $_v; do
+					case "$_b" in
+					'!'*)
+						floor_refuse="$floor_refuse$_wf	on: $_rt	branch pattern '$_b' is a negation, so 'does main still match' cannot be decided here"$'\n'
+						floor_refuse_count=$((floor_refuse_count + 1))
+						_hit=1
+						continue
+						;;
+					esac
+					if branch_pattern_matches_main "$_b"; then _hit=1; fi
+				done
+				IFS="$_old"
+				[ "$_hit" -eq 1 ] || _viol="$_viol a \`branches:\` list ($_v) that no longer matches '$REQUIRED_TRIGGER_BRANCH'"
+				;;
+			branches-ignore)
+				_old="$IFS"
+				IFS=','
+				for _b in $_v; do
+					case "$_b" in '!'*) continue ;; esac
+					if branch_pattern_matches_main "$_b"; then
+						_viol="$_viol a \`branches-ignore:\` entry ($_b) that excludes '$REQUIRED_TRIGGER_BRANCH'"
+					fi
+				done
+				IFS="$_old"
+				;;
+			esac
+		done < <(awk -F'\t' -v w="$_wf" -v t="$_rt" '$1 == w && $2 == t && $3 != "" { print $3 }' "$wf_trig")
+		if [ -n "$_viol" ]; then
+			floor_bad="$floor_bad$_wf	on: $_rt	it carries$_viol"$'\n'
+			floor_bad_count=$((floor_bad_count + 1))
+		else
+			floor_trigger_ok=$((floor_trigger_ok + 1))
+		fi
+	done
+done
+
+for _j in ${EXPECTED_GATE_JOBS[@]+"${EXPECTED_GATE_JOBS[@]}"}; do
+	case "$act_job_set" in
+	*" $_j "*) ;;
+	*) continue ;;
+	esac
+	for _lit in ${FORBIDDEN_ACTIVATION_LITERALS[@]+"${FORBIDDEN_ACTIVATION_LITERALS[@]}"}; do
+		_k="${_lit%%=*}"
+		_v="${_lit#*=}"
+		_got="$(awk -F'\t' -v j="$_j" -v k="$_k" '$2 == j && $3 == k { print $4 }' "$wf_act")"
+		if [ "$_got" = "$_v" ]; then
+			floor_bad="$floor_bad$_j	$_k	is the literal \`$_v\`, which means the gate cannot fail"$'\n'
+			floor_bad_count=$((floor_bad_count + 1))
+		else
+			floor_literal_ok=$((floor_literal_ok + 1))
+		fi
+	done
+done
+
+for _e in ${REQUIRED_BLOCKING_LEGS[@]+"${REQUIRED_BLOCKING_LEGS[@]}"}; do
+	_j="${_e%%|*}"
+	_rest="${_e#*|}"
+	_ax="${_rest%%|*}"
+	_lg="${_rest#*|}"
+	case "$pinned_gatejobs" in
+	*" $_j "*) ;;
+	*)
+		floor_bad="$floor_bad$_j	$_ax|$_lg	REQUIRED_BLOCKING_LEGS names a job that is not a gate job"$'\n'
+		floor_bad_count=$((floor_bad_count + 1))
+		continue
+		;;
+	esac
+	_adv="$(advisory_leg_for "$_j")"
+	if [ "$_adv" = "?" ]; then
+		floor_refuse="$floor_refuse$_j	$_ax|$_lg	its \`continue-on-error\` is not \`\${{ matrix.<axis> == '<leg>' }}\`, so which legs gate cannot be decided here"$'\n'
+		floor_refuse_count=$((floor_refuse_count + 1))
+		continue
+	fi
+	if ! job_axis_legs "$_j" "$_ax" | grep -qxF -- "$_lg"; then
+		floor_bad="$floor_bad$_j	$_ax|$_lg	the leg is not in the job's matrix any more"$'\n'
+		floor_bad_count=$((floor_bad_count + 1))
+		continue
+	fi
+	if [ "$_adv" = "$_ax=$_lg" ]; then
+		floor_bad="$floor_bad$_j	$_ax|$_lg	\`continue-on-error\` now exempts this leg, so it no longer gates"$'\n'
+		floor_bad_count=$((floor_bad_count + 1))
+		continue
+	fi
+	floor_leg_ok=$((floor_leg_ok + 1))
+done
+
+if [ "$floor_refuse_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $floor_refuse_count floor(s) cannot be decided on this workflow:" >&2
+	while IFS="$(printf '\t')" read -r a b c; do
+		[ -n "$a" ] || continue
+		echo "  - $a	$b" >&2
+		echo "      $c" >&2
+	done <<<"$floor_refuse"
+	echo >&2
+	echo "  A floor that cannot be evaluated is not a floor that passes. Spell the branch filter" >&2
+	echo "  without a negation, or the advisory predicate as \`\${{ matrix.<axis> == '<leg>' }}\`," >&2
+	echo "  or teach this script the shape — but do not leave it undecided, because 'undecided'" >&2
+	echo "  and 'satisfied' are the same verdict to everything downstream." >&2
+	status=1
+fi
+
+if [ "$floor_bad_count" -gt 0 ]; then
+	echo >&2
+	echo "check-ci-reach: $floor_bad_count floor(s) violated:" >&2
+	while IFS="$(printf '\t')" read -r a b c; do
+		[ -n "$a" ] || continue
+		echo "  - $a	$b	$c" >&2
+	done <<<"$floor_bad"
+	echo >&2
+	echo "  These are REQUIREMENTS, not pins: they are stated in this file and say nothing about" >&2
+	echo "  what the workflow currently contains, so unlike EXPECTED_TRIGGERS they are not" >&2
+	echo "  satisfied by a commit that edits the workflow and the pin together. That matters most" >&2
+	echo "  for \`on:\`, which is SELF-CONCEALING: for a pull request GitHub reads the trigger set" >&2
+	echo "  from the PR's own head, so the commit that reduces it is evaluated under the reduced" >&2
+	echo "  set and CI never runs to object. This rung runs inside \`make check\`, which is the" >&2
+	echo "  only place that can catch it." >&2
+	echo >&2
+	echo "  If a floor is genuinely wrong for this repository, the edit is to DELETE the" >&2
+	echo "  requirement and say why — a reviewable claim that this gate no longer has to run on" >&2
+	echo "  every push and PR — not to retune a value until it agrees." >&2
+	status=1
+fi
+
 if [ "$stale_count" -gt 0 ]; then
 	echo >&2
 	while IFS= read -r t; do
@@ -2373,6 +2666,8 @@ if [ "$status" -eq 0 ]; then
 		"$trig_total" "$workflow_count"
 	printf 'pinned   %s gate job(s) match EXPECTED_GATE_JOBS, each with its exact `if:`, `needs:`, `continue-on-error:` and matrix legs\n' \
 		"${#EXPECTED_GATE_JOBS[@]}"
+	printf 'floor    %s required trigger(s) fire unfiltered on `%s`; %s matrix leg(s) required to gate and gating; %s never-true activation literal(s) refused\n' \
+		"$floor_trigger_ok" "$REQUIRED_TRIGGER_BRANCH" "$floor_leg_ok" "${#FORBIDDEN_ACTIVATION_LITERALS[@]}"
 	echo "check-ci-reach: OK — $reached target(s) reached by CI, $excused_ok excused, $nogate_count carrying no gate"
 fi
 exit "$status"
