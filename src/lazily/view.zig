@@ -833,7 +833,7 @@ test "view conformance" {
     var found = listEmpty([]const u8);
     defer {
         for (found.items) |name| std.testing.allocator.free(name);
-        if (builtin.zig_version.minor < 16) found.deinit() else found.deinit(std.testing.allocator);
+        found.deinit(std.testing.allocator);
     }
     if (comptime builtin.zig_version.minor >= 16) {
         const io = std.testing.io;
