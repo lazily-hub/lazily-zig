@@ -116,6 +116,7 @@ pub const expectEventLog = @import("./lazily/test.zig").expectEventLog;
 pub const StateMachine = @import("./lazily/state_machine.zig").StateMachine;
 pub const StateChart = @import("./lazily/statechart.zig").StateChart;
 pub const ChartDef = @import("./lazily/statechart.zig").ChartDef;
+pub const view_conformance = @import("./lazily/view.zig");
 /// Deprecated: use `computed(...).eager()`. The standalone `Signal` handle type
 /// is retired (`#lzcellkernel`); this compatibility constructor already returns
 /// an eager `*Computed(T)`.
